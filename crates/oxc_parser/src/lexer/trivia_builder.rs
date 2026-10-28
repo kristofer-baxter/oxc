@@ -47,7 +47,7 @@ pub struct TriviaBuilder<'a> {
 const _: () = assert!(size_of::<Option<(u32, NonZeroU32)>>() == 8);
 
 impl<'a> TriviaBuilder<'a> {
-    pub fn new_in(allocator: &'a Allocator) -> Self {
+    pub fn new_in(allocator: &'a Allocator, _source_len: usize) -> Self {
         let mut previous_token = Token::default();
         previous_token.set_kind(Kind::Undetermined);
         Self {
@@ -130,25 +130,27 @@ impl<'a> TriviaBuilder<'a> {
 
     // For block comments only. This function is not called after line comments because the lexer skips
     // newline after line comments.
+    #[inline]
     pub fn handle_newline(&mut self) {
         // The last unprocessed comment is on a newline.
         let len = self.comments.len();
         if self.processed < len {
-            let becomes_trailing = {
-                let comment = &mut self.comments[len - 1];
-                comment.set_followed_by_newline(true);
-                !self.saw_newline && !Self::should_stay_leading(comment)
-            };
-            if becomes_trailing {
-                self.attach_pending_comments(
-                    CommentPosition::Trailing,
-                    self.previous_token.end(),
-                    len,
-                );
-            }
+            self.attach_pending_comments_on_newline(len);
         }
         self.saw_newline = true;
         self.saw_newline_for_comment = true;
+    }
+
+    #[cold]
+    fn attach_pending_comments_on_newline(&mut self, len: usize) {
+        let becomes_trailing = {
+            let comment = &mut self.comments[len - 1];
+            comment.set_followed_by_newline(true);
+            !self.saw_newline && !Self::should_stay_leading(comment)
+        };
+        if becomes_trailing {
+            self.attach_pending_comments(CommentPosition::Trailing, self.previous_token.end(), len);
+        }
     }
 
     #[inline]
@@ -161,6 +163,16 @@ impl<'a> TriviaBuilder<'a> {
         if self.processed < len {
             self.attach_pending_comments_to_token(token, len);
         }
+        self.previous_token = token;
+    }
+
+    /// Record a token read on the lexer fast path, which never skips comments.
+    #[expect(clippy::inline_always)]
+    #[inline(always)]
+    pub fn handle_fast_token(&mut self, token: Token) {
+        debug_assert_eq!(self.processed, self.comments.len());
+        self.saw_newline = false;
+        self.saw_newline_for_comment = false;
         self.previous_token = token;
     }
 
@@ -509,28 +521,24 @@ fn contains_license_or_preserve_comment(s: &str) -> bool {
     }
 
     let search_len = hay.len() - LICENSE_LEN + 1;
+    let ptr = hay.as_ptr();
 
     for i in memchr_iter(b'@', &hay[..search_len]) {
         debug_assert!(i < search_len);
         debug_assert!(hay.len() - i >= LICENSE_LEN);
-        // SAFETY: `search_len` only includes candidate starts with at least `LICENSE_LEN` bytes
-        // remaining, so `i + 1` and the full `@license` range are in bounds.
-        match unsafe { hay.get_unchecked(i + 1) } {
-            // spellchecker:off
-            b'l'
-                // SAFETY: The candidate bound proves the full `@license` range is in bounds.
-                if unsafe { hay.get_unchecked(i + 2..i + LICENSE_LEN) } == b"icense" =>
+        // SAFETY: `search_len` only includes candidate starts with at least `LICENSE_LEN` (8) bytes
+        // remaining, and when `hay.len() - i >= PRESERVE_LEN` (9), `ptr.add(i + 8)` is in bounds.
+        unsafe {
+            let word = ptr.add(i).cast::<u64>().read_unaligned();
+            if word == u64::from_le_bytes(*b"@license") {
+                return true;
+            }
+            if word == u64::from_le_bytes(*b"@preserv")
+                && hay.len() - i >= PRESERVE_LEN
+                && *ptr.add(i + 8) == b'e'
             {
                 return true;
             }
-            b'p' if hay.len() - i >= PRESERVE_LEN
-                    // SAFETY: The preceding guard proves the full `@preserve` range is in bounds.
-                    && unsafe { hay.get_unchecked(i + 2..i + PRESERVE_LEN) } == b"reserve" =>
-            {
-                return true;
-            }
-            // spellchecker:on
-            _ => {}
         }
     }
 

@@ -114,19 +114,44 @@ impl<'a> ModuleRecordBuilder<'a> {
     /// [ParseModule](https://tc39.es/ecma262/#sec-parsemodule)
     /// Step 10.
     fn resolve_export_entries(&mut self) {
-        // let export_entries = self.export_entries.drain(..).collect::<Vec<_>>();
+        if self.export_entries.is_empty() {
+            return;
+        }
         let export_entries =
             std::mem::replace(&mut self.export_entries, ArenaVec::new_in(&self.allocator));
+        let import_len = self.module_record.import_entries.len();
+
+        // Build a lookup table when `export_entries * import_entries` would otherwise be quadratic.
+        let import_map: Option<rustc_hash::FxHashMap<&'a str, usize>> =
+            if import_len > 8 && export_entries.len().saturating_mul(import_len) >= 64 {
+                let mut map = rustc_hash::FxHashMap::with_capacity_and_hasher(
+                    import_len,
+                    rustc_hash::FxBuildHasher,
+                );
+                for (idx, entry) in self.module_record.import_entries.iter().enumerate() {
+                    map.entry(entry.local_name.name.as_str()).or_insert(idx);
+                }
+                Some(map)
+            } else {
+                None
+            };
+
         // 10. For each ExportEntry Record ee of exportEntries, do
         for ee in export_entries {
             // a. If ee.[[ModuleRequest]] is null, then
             if ee.module_request.is_none() {
                 let found_import_entry = match &ee.local_name {
-                    ExportLocalName::Name(name) => self
-                        .module_record
-                        .import_entries
-                        .iter()
-                        .find(|entry| entry.local_name.name == name.name),
+                    ExportLocalName::Name(name) if import_len > 0 => {
+                        if let Some(map) = &import_map {
+                            map.get(name.name.as_str())
+                                .map(|&idx| &self.module_record.import_entries[idx])
+                        } else {
+                            self.module_record
+                                .import_entries
+                                .iter()
+                                .find(|entry| entry.local_name.name == name.name)
+                        }
+                    }
                     _ => None,
                 };
                 match found_import_entry {

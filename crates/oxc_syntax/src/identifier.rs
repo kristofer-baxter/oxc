@@ -85,11 +85,12 @@ const ID_CONTINUE: u8 = 2;
 #[repr(C, align(64))]
 pub struct Align64<T>(pub(crate) T);
 
-// Packed: ID_START | ID_CONTINUE per ASCII byte.
+// Packed: ID_START | ID_CONTINUE per byte.
 // `a`-`z`, `A`-`Z`, `$`, `_` get ID_START | ID_CONTINUE (3).
 // `0`-`9` get ID_CONTINUE only (2).
+// Non-ASCII bytes (`0x80..=0xFF`) are `0`, so indexing by `u8 as usize` needs no bounds check.
 #[rustfmt::skip]
-pub static ASCII_ID_FLAGS: Align64<[u8; 128]> = Align64([
+pub static ASCII_ID_FLAGS: Align64<[u8; 256]> = Align64([
 //  0  1  2  3  4  5  6  7  8  9  A  B  C  D  E  F  //
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 0
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 1
@@ -99,6 +100,14 @@ pub static ASCII_ID_FLAGS: Align64<[u8; 128]> = Align64([
     3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 0, 0, 0, 0, 3, // 5  _ = 3
     0, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, // 6  a-z = 3
     3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 0, 0, 0, 0, 0, // 7
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 8
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 9
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // A
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // B
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // C
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // D
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // E
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // F
 ]);
 
 /// Section 12.7 Detect `IdentifierStartChar`
@@ -112,7 +121,7 @@ pub fn is_identifier_start(c: char) -> bool {
 
 #[inline]
 pub fn is_identifier_start_ascii(c: char) -> bool {
-    ASCII_ID_FLAGS.0[c as usize] & ID_START != 0
+    (c as usize) < 128 && (ASCII_ID_FLAGS.0[c as usize] & ID_START != 0)
 }
 
 #[inline]
@@ -131,8 +140,8 @@ pub fn is_identifier_part(c: char) -> bool {
 }
 
 #[inline]
-pub fn is_identifier_part_ascii(c: char) -> bool {
-    ASCII_ID_FLAGS.0[c as usize] & ID_CONTINUE != 0
+pub const fn is_identifier_part_ascii(c: char) -> bool {
+    (c as usize) < 128 && (ASCII_ID_FLAGS.0[c as usize] & ID_CONTINUE != 0)
 }
 
 #[inline]
@@ -171,61 +180,39 @@ fn is_identifier_name_impl<const PATCHED: bool>(name: &str) -> bool {
     let bytes = name.as_bytes();
     let Some(&first_byte) = bytes.first() else { return false };
 
-    let mut chars = if first_byte.is_ascii() {
-        // First byte is ASCII
-        if ASCII_ID_FLAGS.0[first_byte as usize] & ID_START == 0 {
-            return false;
-        }
-
+    let mut chars = if ASCII_ID_FLAGS.0[first_byte as usize] & ID_START != 0 {
+        // First byte is valid ASCII identifier start
         let mut index = 1;
         'outer: loop {
             // Check blocks of 8 bytes, then 4 bytes, then single bytes
             let bytes_remaining = bytes.len() - index;
             if bytes_remaining >= 8 {
-                // Process block of 8 bytes.
-                // Check that next 8 bytes are all ASCII.
                 // SAFETY: We checked above that there are at least 8 bytes to read starting at `index`
-                #[expect(clippy::cast_ptr_alignment)]
-                let next8_as_u64 = unsafe {
-                    let ptr = bytes.as_ptr().add(index).cast::<u64>();
-                    ptr.read_unaligned()
+                let next8 = unsafe {
+                    bytes.as_ptr().add(index).cast::<u64>().read_unaligned().to_ne_bytes()
                 };
-                let high_bits = next8_as_u64 & 0x8080_8080_8080_8080;
-                if high_bits != 0 {
-                    // Some chars in this block are non-ASCII
-                    break;
-                }
-
-                let next8 = next8_as_u64.to_ne_bytes();
                 for b in next8 {
                     if ASCII_ID_FLAGS.0[b as usize] & ID_CONTINUE == 0 {
-                        return false;
+                        if b.is_ascii() {
+                            return false;
+                        }
+                        break 'outer;
                     }
                 }
-
                 index += 8;
             } else if bytes_remaining >= 4 {
-                // Process block of 4 bytes.
-                // Check that next 4 bytes are all ASCII.
                 // SAFETY: We checked above that there are at least 4 bytes to read starting at `index`
-                #[expect(clippy::cast_ptr_alignment)]
-                let next4_as_u32 = unsafe {
-                    let ptr = bytes.as_ptr().add(index).cast::<u32>();
-                    ptr.read_unaligned()
+                let next4 = unsafe {
+                    bytes.as_ptr().add(index).cast::<u32>().read_unaligned().to_ne_bytes()
                 };
-                let high_bits = next4_as_u32 & 0x8080_8080;
-                if high_bits != 0 {
-                    // Some chars in this block are non-ASCII
-                    break;
-                }
-
-                let next4 = next4_as_u32.to_ne_bytes();
                 for b in next4 {
                     if ASCII_ID_FLAGS.0[b as usize] & ID_CONTINUE == 0 {
-                        return false;
+                        if b.is_ascii() {
+                            return false;
+                        }
+                        break 'outer;
                     }
                 }
-
                 index += 4;
             } else {
                 loop {
@@ -234,12 +221,10 @@ fn is_identifier_name_impl<const PATCHED: bool>(name: &str) -> bool {
                         return true;
                     };
 
-                    if b.is_ascii() {
-                        if ASCII_ID_FLAGS.0[b as usize] & ID_CONTINUE == 0 {
+                    if ASCII_ID_FLAGS.0[b as usize] & ID_CONTINUE == 0 {
+                        if b.is_ascii() {
                             return false;
                         }
-                    } else {
-                        // Unicode byte found
                         break 'outer;
                     }
 
@@ -250,6 +235,8 @@ fn is_identifier_name_impl<const PATCHED: bool>(name: &str) -> bool {
 
         // Unicode byte found - search rest of string (from this byte onwards) as Unicode
         name[index..].chars()
+    } else if first_byte.is_ascii() {
+        return false;
     } else {
         // First char is Unicode.
         // NB: `unwrap()` cannot fail because we already checked the string is not empty.

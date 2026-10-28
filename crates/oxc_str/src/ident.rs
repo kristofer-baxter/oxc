@@ -381,7 +381,42 @@ impl PartialEq for Ident<'_> {
     /// Fast-reject equality: compare packed len+hash first, then bytes.
     #[inline]
     fn eq(&self, other: &Ident<'_>) -> bool {
-        self.len_and_hash == other.len_and_hash && self.as_str() == other.as_str()
+        if self.len_and_hash != other.len_and_hash {
+            return false;
+        }
+        let a = self.ptr.as_ptr();
+        let b = other.ptr.as_ptr();
+        if std::ptr::eq(a, b) {
+            return true;
+        }
+        let len = self.ident_len() as usize;
+        // SAFETY: `self` and `other` have identical length `len`, and `a` and `b` are valid for `len` bytes.
+        unsafe {
+            if len <= 8 {
+                if len >= 4 {
+                    let ha = a.cast::<u32>().read_unaligned();
+                    let hb = b.cast::<u32>().read_unaligned();
+                    let ta = a.add(len - 4).cast::<u32>().read_unaligned();
+                    let tb = b.add(len - 4).cast::<u32>().read_unaligned();
+                    ((ha ^ hb) | (ta ^ tb)) == 0
+                } else {
+                    // For len 0..=3, `ident_hash` packed all bytes of the string into a single u32
+                    // before mixing, and `len_and_hash` already matched. Verify the bytes directly.
+                    len == 0
+                        || (*a == *b
+                            && *a.add(len >> 1) == *b.add(len >> 1)
+                            && *a.add(len - 1) == *b.add(len - 1))
+                }
+            } else if len <= 16 {
+                let ha = a.cast::<u64>().read_unaligned();
+                let hb = b.cast::<u64>().read_unaligned();
+                let ta = a.add(len - 8).cast::<u64>().read_unaligned();
+                let tb = b.add(len - 8).cast::<u64>().read_unaligned();
+                ((ha ^ hb) | (ta ^ tb)) == 0
+            } else {
+                slice::from_raw_parts(a, len) == slice::from_raw_parts(b, len)
+            }
+        }
     }
 }
 

@@ -47,15 +47,40 @@ impl CloneIn<'_> for Redeclaration {
 multi_index_vec! {
     /// Scope tree stored as struct-of-arrays in a single allocation.
     ///
-    /// Contains parent IDs, node IDs, and flags for all scopes. Using a single
-    /// allocation with one `len`/`cap` instead of 3 separate `IndexVec`s saves
-    /// memory (no redundant len/cap) and CPU (one bounds check, one capacity
-    /// check on push).
+    /// Contains parent IDs, node IDs, flags, and a 64-bit binding bloom filter
+    /// for all scopes. Using a single allocation with one `len`/`cap` instead of
+    /// separate `IndexVec`s saves memory (no redundant len/cap) and CPU (one
+    /// bounds check, one capacity check on push).
     struct ScopeTable<ScopeId> {
         parent_ids => parent_ids_mut: Option<ScopeId>,
         node_ids => node_ids_mut: NodeId,
         flags => flags_mut: ScopeFlags,
+        bloom => bloom_mut: u64,
     }
+}
+
+/// Compute a 1-bit bloom mask from the top 6 bits of `name`'s precomputed hash.
+#[expect(clippy::inline_always)]
+#[inline(always)]
+pub fn ident_bloom_bit(name: Ident<'_>) -> u64 {
+    struct PackedExtractor(u64);
+    impl std::hash::Hasher for PackedExtractor {
+        #[inline(always)]
+        fn write(&mut self, _: &[u8]) {}
+
+        #[inline(always)]
+        fn write_u64(&mut self, i: u64) {
+            self.0 = i;
+        }
+
+        #[inline(always)]
+        fn finish(&self) -> u64 {
+            self.0
+        }
+    }
+    let mut h = PackedExtractor(0);
+    std::hash::Hash::hash(&name, &mut h);
+    1u64 << (h.0 >> 58)
 }
 
 multi_index_vec! {
@@ -489,6 +514,7 @@ impl Scoping {
         node_id: NodeId,
     ) -> SymbolId {
         let symbol_id = self.symbol_table.push(span, flags, symbol_scope_id, node_id);
+        *self.scope_table.bloom_mut(binding_scope_id) |= ident_bloom_bit(name);
         self.cell.with_dependent_mut(|allocator, cell| {
             let name = name.clone_in(allocator);
             cell.symbol_names.push(name);
@@ -639,6 +665,7 @@ impl Scoping {
     }
 
     /// Add a reference to a symbol.
+    #[inline]
     pub fn add_resolved_reference(&mut self, symbol_id: SymbolId, reference_id: ReferenceId) {
         self.cell.with_dependent_mut(|_allocator, cell| {
             cell.resolved_references[symbol_id.index()].push(reference_id);
@@ -892,8 +919,34 @@ impl Scoping {
     }
 
     /// Check if a symbol is declared in a certain scope.
+    #[inline]
     pub fn scope_has_binding(&self, scope_id: ScopeId, name: Ident<'_>) -> bool {
-        self.cell.borrow_dependent().bindings[scope_id].contains_key(&name)
+        (*self.scope_table.bloom(scope_id) & ident_bloom_bit(name)) != 0
+            && self.cell.borrow_dependent().bindings[scope_id].contains_key(&name)
+    }
+
+    /// Fast bloom filter check for whether `scope_id` may contain a binding with `bit`.
+    #[inline]
+    pub(crate) fn scope_may_have_binding(&self, scope_id: ScopeId, bit: u64) -> bool {
+        (*self.scope_table.bloom(scope_id) & bit) != 0
+    }
+
+    /// Look up a binding in `scope_id` after the bloom filter has already matched.
+    #[inline]
+    pub(crate) fn get_binding_unchecked_bloom(
+        &self,
+        scope_id: ScopeId,
+        name: Ident<'_>,
+    ) -> Option<SymbolId> {
+        self.cell.borrow_dependent().bindings[scope_id].get(&name).copied()
+    }
+
+    /// Move bloom filter bits from `from` scope to `to` scope when swapping catch parameter bindings.
+    #[inline]
+    pub(crate) fn move_scope_bloom(&mut self, from: ScopeId, to: ScopeId) {
+        let bits = *self.scope_table.bloom(from);
+        *self.scope_table.bloom_mut(from) = 0;
+        *self.scope_table.bloom_mut(to) |= bits;
     }
 
     /// Get the symbol bound to an identifier name in a scope.
@@ -906,6 +959,9 @@ impl Scoping {
     /// [`find_binding`]: Scoping::find_binding
     #[inline]
     pub fn get_binding(&self, scope_id: ScopeId, name: Ident<'_>) -> Option<SymbolId> {
+        if (*self.scope_table.bloom(scope_id) & ident_bloom_bit(name)) == 0 {
+            return None;
+        }
         self.cell.borrow_dependent().bindings[scope_id].get(&name).copied()
     }
 
@@ -914,9 +970,12 @@ impl Scoping {
     /// Bindings are resolved by walking up the scope tree until a binding is
     /// found. If no binding is found, [`None`] is returned.
     pub fn find_binding(&self, mut scope_id: ScopeId, name: Ident<'_>) -> Option<SymbolId> {
+        let bit = ident_bloom_bit(name);
         let cell = self.cell.borrow_dependent();
         loop {
-            if let Some(symbol_id) = cell.bindings[scope_id].get(&name) {
+            if (*self.scope_table.bloom(scope_id) & bit) != 0
+                && let Some(symbol_id) = cell.bindings[scope_id].get(&name)
+            {
                 return Some(*symbol_id);
             }
             let parent_scope_id = (*self.scope_table.parent_ids(scope_id))?;
@@ -964,7 +1023,7 @@ impl Scoping {
         node_id: NodeId,
         flags: ScopeFlags,
     ) -> ScopeId {
-        let scope_id = self.scope_table.push(parent_id, node_id, flags);
+        let scope_id = self.scope_table.push(parent_id, node_id, flags, 0);
         self.cell.with_dependent_mut(|allocator, cell| {
             cell.bindings.push(Bindings::new_in(allocator));
         });
@@ -973,6 +1032,7 @@ impl Scoping {
 
     /// Add a binding to a scope.
     pub fn add_binding(&mut self, scope_id: ScopeId, name: Ident<'_>, symbol_id: SymbolId) {
+        *self.scope_table.bloom_mut(scope_id) |= ident_bloom_bit(name);
         self.cell.with_dependent_mut(|allocator, cell| {
             let name = name.clone_in(allocator);
             cell.bindings[scope_id].insert(name, symbol_id);
@@ -988,6 +1048,7 @@ impl Scoping {
 
     /// Move a binding from one scope to another.
     pub fn move_binding(&mut self, from: ScopeId, to: ScopeId, name: Ident<'_>) {
+        *self.scope_table.bloom_mut(to) |= ident_bloom_bit(name);
         self.cell.with_dependent_mut(|_allocator, cell| {
             let from_map = &mut cell.bindings[from];
             if let Some((name, symbol_id)) = from_map.remove_entry(name.as_str()) {
@@ -1010,12 +1071,15 @@ impl Scoping {
     /// [`set_symbol_scope_id`]: Scoping::set_symbol_scope_id
     pub fn move_binding_by_symbol_id(&mut self, from: ScopeId, to: ScopeId, symbol_id: SymbolId) {
         debug_assert_ne!(from, to);
+        let mut bit = 0;
         self.cell.with_dependent_mut(|_allocator, cell| {
             let name = cell.symbol_names[symbol_id.index()];
             if let Some((name, sid)) = cell.bindings[from].remove_entry(&name) {
+                bit = ident_bloom_bit(name);
                 cell.bindings[to].insert(name, sid);
             }
         });
+        *self.scope_table.bloom_mut(to) |= bit;
         self.set_symbol_scope_id(symbol_id, to);
     }
 
@@ -1034,6 +1098,7 @@ impl Scoping {
         old_name: Ident<'_>,
         new_name: Ident<'_>,
     ) {
+        *self.scope_table.bloom_mut(scope_id) |= ident_bloom_bit(new_name);
         self.cell.with_dependent_mut(|allocator, cell| {
             let bindings = &mut cell.bindings[scope_id];
             let old_symbol_id = bindings.remove(old_name.as_str());
@@ -1052,6 +1117,7 @@ impl Scoping {
     ///
     /// Panics in debug mode if either of the above are not satisfied.
     pub fn rename_symbol(&mut self, symbol_id: SymbolId, scope_id: ScopeId, new_name: Ident<'_>) {
+        *self.scope_table.bloom_mut(scope_id) |= ident_bloom_bit(new_name);
         self.cell.with_dependent_mut(|allocator, cell| {
             // Rename symbol
             let new_name = new_name.clone_in(allocator);
@@ -1144,5 +1210,82 @@ impl Scoping {
                 })
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use oxc_span::SPAN;
+    use oxc_syntax::{node::NodeId, scope::ScopeFlags, symbol::SymbolFlags};
+
+    use super::{Ident, Scoping};
+
+    #[test]
+    fn bloom_filter_tracks_rename_and_move_binding() {
+        let mut scoping = Scoping::default();
+        let root_scope = scoping.add_scope(None, NodeId::ROOT, ScopeFlags::Top);
+        let child_scope = scoping.add_scope(Some(root_scope), NodeId::ROOT, ScopeFlags::Function);
+
+        let sym = scoping.create_symbol_with_binding(
+            SPAN,
+            Ident::from("alpha"),
+            SymbolFlags::FunctionScopedVariable,
+            root_scope,
+            root_scope,
+            NodeId::ROOT,
+        );
+        assert_eq!(scoping.get_binding(root_scope, Ident::from("alpha")), Some(sym));
+        assert!(scoping.scope_has_binding(root_scope, Ident::from("alpha")));
+
+        scoping.rename_binding(root_scope, sym, Ident::from("alpha"), Ident::from("zulu_renamed"));
+        assert_eq!(scoping.get_binding(root_scope, Ident::from("zulu_renamed")), Some(sym));
+        assert!(scoping.scope_has_binding(root_scope, Ident::from("zulu_renamed")));
+        scoping.rename_binding(root_scope, sym, Ident::from("zulu_renamed"), Ident::from("alpha"));
+
+        scoping.rename_symbol(sym, root_scope, Ident::from("quantum_sym"));
+        assert_eq!(scoping.get_binding(root_scope, Ident::from("quantum_sym")), Some(sym));
+
+        scoping.move_binding(root_scope, child_scope, Ident::from("quantum_sym"));
+        assert_eq!(scoping.get_binding(root_scope, Ident::from("quantum_sym")), None);
+        assert_eq!(scoping.get_binding(child_scope, Ident::from("quantum_sym")), Some(sym));
+        assert_eq!(scoping.find_binding(child_scope, Ident::from("quantum_sym")), Some(sym));
+
+        scoping.move_binding_by_symbol_id(child_scope, root_scope, sym);
+        assert_eq!(scoping.get_binding(child_scope, Ident::from("quantum_sym")), None);
+        assert_eq!(scoping.get_binding(root_scope, Ident::from("quantum_sym")), Some(sym));
+    }
+
+    #[test]
+    fn lone_surrogate_does_not_skip_strict_octal_and_merged_enum_evaluates() {
+        use oxc_allocator::Allocator;
+        use oxc_parser::Parser;
+        use oxc_span::SourceType;
+        use oxc_syntax::constant_value::ConstantValue;
+
+        use crate::SemanticBuilder;
+
+        let allocator = Allocator::default();
+        let parsed =
+            Parser::new(&allocator, "'use strict'; \"\\uD800\\1\";", SourceType::mjs()).parse();
+        assert!(parsed.diagnostics.is_empty());
+        let sem = SemanticBuilder::new().with_check_syntax_error(true).build(&parsed.program);
+        assert_eq!(sem.diagnostics.len(), 1);
+
+        let allocator2 = Allocator::default();
+        let parsed_enum = Parser::new(
+            &allocator2,
+            "enum E { A = 2 }\nenum E { B = E.A + E[\"A\"] }",
+            SourceType::ts(),
+        )
+        .parse();
+        assert!(parsed_enum.diagnostics.is_empty());
+        let sem_enum = SemanticBuilder::new().with_enum_eval(true).build(&parsed_enum.program);
+        assert!(sem_enum.diagnostics.is_empty());
+        let scoping = sem_enum.semantic.scoping();
+        let has_four = (0..scoping.symbols_len()).any(|i| {
+            let sym = oxc_index::Idx::from_usize(i);
+            scoping.get_enum_member_value(sym) == Some(&ConstantValue::Number(4.0))
+        });
+        assert!(has_four);
     }
 }

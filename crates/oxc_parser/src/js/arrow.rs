@@ -57,17 +57,7 @@ impl<'a, C: Config> ParserImpl<'a, C> {
 
     fn is_parenthesized_arrow_function_expression(&mut self) -> Tristate {
         match self.cur_kind() {
-            Kind::LParen => {
-                // `(1 + a)` can never be arrow parameters: the leading literal is not the start of
-                // a `BindingElement`, so the worker would bump past it and return `Tristate::False`
-                // (`!second.is_binding_identifier() && second != This`). Skip the lookahead.
-                if self.lexer.peek_token().kind().is_literal() {
-                    Tristate::False
-                } else {
-                    self.lookahead(Self::is_parenthesized_arrow_function_expression_worker)
-                }
-            }
-            Kind::LAngle | Kind::Async => {
+            Kind::LParen | Kind::LAngle | Kind::Async => {
                 self.lookahead(Self::is_parenthesized_arrow_function_expression_worker)
             }
             _ => Tristate::False,
@@ -131,6 +121,13 @@ impl<'a, C: Config> ParserImpl<'a, C> {
                         }
                     }
                     _ => {
+                        if !second.is_binding_identifier()
+                            && second != Kind::This
+                            && !second.is_modifier_kind()
+                        {
+                            return Tristate::False;
+                        }
+
                         self.bump_any();
                         let third = self.cur_kind();
 
@@ -170,8 +167,17 @@ impl<'a, C: Config> ParserImpl<'a, C> {
                                 }
                                 Tristate::False
                             }
-                            // If we have "(a," or "(a=" or "(a)" this *could* be an arrow function
-                            Kind::Comma | Kind::Eq | Kind::RParen => Tristate::Maybe,
+                            // If we have "(a," or "(a=" this *could* be an arrow function
+                            Kind::Comma | Kind::Eq => Tristate::Maybe,
+                            // If we have "(a)", check the token after `)`
+                            Kind::RParen => {
+                                self.bump_any();
+                                match self.cur_kind() {
+                                    Kind::Colon if self.is_ts => Tristate::Maybe,
+                                    Kind::Arrow => Tristate::True,
+                                    _ => Tristate::False,
+                                }
+                            }
                             // It is definitely not an arrow function
                             _ => Tristate::False,
                         }

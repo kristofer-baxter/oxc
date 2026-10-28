@@ -252,9 +252,15 @@ impl<'a, C: Config> Lexer<'a, C> {
         self.token.set_escaped(true);
     }
 
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn get_escaped_string(&self, token: Token) -> &'a str {
+        self.escaped_strings[&token.start()]
+    }
+
     pub(crate) fn get_string(&self, token: Token) -> &'a str {
         if token.escaped() {
-            return self.escaped_strings[&token.start()];
+            return self.get_escaped_string(token);
         }
 
         let source_text = self.source.whole();
