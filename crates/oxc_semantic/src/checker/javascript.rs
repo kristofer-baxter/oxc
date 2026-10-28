@@ -162,7 +162,41 @@ pub fn check_duplicate_class_elements(ctx: &SemanticBuilder<'_>) {
     });
 }
 
+const CHECKED_IDENT_MASK_BY_LEN: [u32; 11] = [
+    0,
+    0,
+    0,
+    1 << (b'l' - b'a'),                          // 3: "let"
+    0,                                           // 4: none
+    1 | (1 << (b'y' - b'a')),                    // 5: "await", "yield"
+    (1 << (b'p' - b'a')) | (1 << (b's' - b'a')), // 6: "public", "static"
+    1 << (b'p' - b'a'),                          // 7: "package", "private"
+    0,                                           // 8: none
+    (1 << (b'i' - b'a')) | (1 << (b'p' - b'a')), // 9: "interface", "protected"
+    1 << (b'i' - b'a'),                          // 10: "implements"
+];
+
+#[inline]
+fn may_be_checked_ident(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    let len = bytes.len();
+    if !(3..=10).contains(&len) {
+        return false;
+    }
+    let idx = bytes[0].wrapping_sub(b'a');
+    idx < 26 && (CHECKED_IDENT_MASK_BY_LEN[len] & (1 << idx)) != 0
+}
+
+#[inline]
 pub fn check_identifier(name: &str, span: Span, ctx: &SemanticBuilder<'_>) {
+    if may_be_checked_ident(name) {
+        check_identifier_slow(name, span, ctx);
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn check_identifier_slow(name: &str, span: Span, ctx: &SemanticBuilder<'_>) {
     match name {
         "await" => {
             if ctx.in_ambient_context() {
@@ -214,7 +248,21 @@ fn unexpected_identifier_assign_context(
     }
 }
 
+#[inline]
 pub fn check_binding_identifier(ident: &BindingIdentifier, ctx: &SemanticBuilder<'_>) {
+    let bytes = ident.name.as_bytes();
+    let len = bytes.len();
+    if (len == 3 && bytes[0] == b'l' && bytes[1] == b'e')
+        || (len == 4 && bytes[0] == b'e' && bytes[1] == b'v')
+        || (len == 9 && bytes[0] == b'a' && bytes[1] == b'r')
+    {
+        check_binding_identifier_slow(ident, ctx);
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn check_binding_identifier_slow(ident: &BindingIdentifier, ctx: &SemanticBuilder<'_>) {
     // `.d.ts` files do not generate runtime bindings, so TypeScript permits `eval` and
     // `arguments` as binding identifiers even when the declaration file is a module.
     if ctx.source_type.is_typescript_definition() {
@@ -285,7 +333,20 @@ pub fn check_binding_identifier(ident: &BindingIdentifier, ctx: &SemanticBuilder
     }
 }
 
+#[inline]
 pub fn check_identifier_reference(ident: &IdentifierReference, ctx: &SemanticBuilder<'_>) {
+    let bytes = ident.name.as_bytes();
+    let len = bytes.len();
+    if (len == 4 && bytes[0] == b'e' && bytes[1] == b'v')
+        || (len == 9 && bytes[0] == b'a' && bytes[1] == b'r')
+    {
+        check_identifier_reference_slow(ident, ctx);
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn check_identifier_reference_slow(ident: &IdentifierReference, ctx: &SemanticBuilder<'_>) {
     // `.d.ts` files are allowed to use `eval` and `arguments` as identifier references
     if ctx.source_type.is_typescript_definition() {
         return;
@@ -436,12 +497,15 @@ pub fn check_string_literal(lit: &StringLiteral, ctx: &SemanticBuilder<'_>) {
     //   legacy_octalEscapeSequence
     //   non_octal_decimal_escape_sequence
     // It is a Syntax Error if the source text matched by this production is strict mode code.
-    if !ctx.strict_mode() || matches!(ctx.ancestry().parent_kind(), AstKind::JSXAttribute(_)) {
+    if (lit.span.size() as usize) == lit.value.len() + 2 || !ctx.strict_mode() {
+        return;
+    }
+    if matches!(ctx.ancestry().parent_kind(), AstKind::JSXAttribute(_)) {
         return;
     }
     let raw = lit.span.source_text(ctx.source_text);
     let raw_len = raw.len();
-    if raw_len != lit.value.len() {
+    if raw_len != lit.value.len() + 2 {
         if raw_len >= MIN_STRING_SIZE_FOR_BATCH_CHECK {
             let raw_bytes = raw.as_bytes();
             // Exclude the last byte (closing quote) from the search haystack.

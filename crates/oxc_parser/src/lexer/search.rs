@@ -5,8 +5,23 @@
 //! * The `byte_search!` macro searches source text for the first byte matching a
 //!   `SafeByteMatchTable`.
 
-/// Batch size for searching
-pub const SEARCH_BATCH_SIZE: usize = 32;
+/// Batch size for searching (16 bytes = 1 SIMD vector width on NEON/SSE2/WASM SIMD128)
+pub const SEARCH_BATCH_SIZE: usize = 16;
+
+/// Compile-time classification of a [`SafeByteMatchTable`] for SIMD acceleration.
+#[derive(Clone, Copy)]
+pub enum SimdSearchKind {
+    /// Match any byte equal to one of `b0`, `b1`, `b2`, `b3`.
+    Any4(u8, u8, u8, u8),
+    /// Match any byte NOT equal to any of `b0`, `b1`, `b2`, `b3`.
+    Not4(u8, u8, u8, u8),
+    /// Match any byte that is NOT an ASCII identifier continuation (`a-z`, `A-Z`, `0-9`, `_`, `$`).
+    NotAsciiIdContinue,
+    /// Match any byte that is NOT an ASCII JSX identifier continuation (`a-z`, `A-Z`, `0-9`, `_`, `$`, `-`).
+    NotAsciiJsxIdContinue,
+    /// Fallback to scalar table lookup.
+    Table,
+}
 
 /// Safe byte matcher lookup table.
 ///
@@ -58,30 +73,57 @@ pub const SEARCH_BATCH_SIZE: usize = 32;
 /// }
 /// ```
 #[repr(C, align(64))]
-pub struct SafeByteMatchTable([bool; 256]);
+pub struct SafeByteMatchTable {
+    bytes: [bool; 256],
+    simd_kind: SimdSearchKind,
+}
 
 impl SafeByteMatchTable {
     // Create new `SafeByteMatchTable`.
     pub const fn new(bytes: [bool; 256]) -> Self {
-        let mut table = Self([false; 256]);
-
         // Check if contains either:
         // 1. `true` for all byte values 192..248
         // 2. `false` for all byte values 128..192
         let mut unicode_start_all_match = true;
         let mut unicode_cont_all_no_match = true;
 
+        let mut true_count = 0usize;
+        let mut false_count = 0usize;
+        let mut true_bytes = [0u8; 4];
+        let mut false_bytes = [0u8; 4];
+        let mut is_not_ascii_id_continue = true;
+        let mut is_not_ascii_jsx_id_continue = true;
+
         let mut i = 0;
         loop {
             let matches = bytes[i];
-            table.0[i] = matches;
+            #[expect(clippy::cast_possible_truncation)]
+            let b = i as u8;
 
             if matches {
+                if true_count < 4 {
+                    true_bytes[true_count] = b;
+                }
+                true_count += 1;
                 if i >= 128 && i < 192 {
                     unicode_cont_all_no_match = false;
                 }
-            } else if i >= 192 && i < 248 {
-                unicode_start_all_match = false;
+            } else {
+                if false_count < 4 {
+                    false_bytes[false_count] = b;
+                }
+                false_count += 1;
+                if i >= 192 && i < 248 {
+                    unicode_start_all_match = false;
+                }
+            }
+
+            let is_id_cont = b.is_ascii_alphanumeric() || b == b'_' || b == b'$';
+            if matches == is_id_cont {
+                is_not_ascii_id_continue = false;
+            }
+            if matches == (is_id_cont || b == b'-') {
+                is_not_ascii_jsx_id_continue = false;
             }
 
             i += 1;
@@ -95,7 +137,27 @@ impl SafeByteMatchTable {
             "Cannot create a `SafeByteMatchTable` with an unsafe pattern"
         );
 
-        table
+        let simd_kind = if true_count >= 1 && true_count <= 4 {
+            let b0 = true_bytes[0];
+            let b1 = if true_count > 1 { true_bytes[1] } else { b0 };
+            let b2 = if true_count > 2 { true_bytes[2] } else { b0 };
+            let b3 = if true_count > 3 { true_bytes[3] } else { b0 };
+            SimdSearchKind::Any4(b0, b1, b2, b3)
+        } else if false_count >= 1 && false_count <= 4 {
+            let b0 = false_bytes[0];
+            let b1 = if false_count > 1 { false_bytes[1] } else { b0 };
+            let b2 = if false_count > 2 { false_bytes[2] } else { b0 };
+            let b3 = if false_count > 3 { false_bytes[3] } else { b0 };
+            SimdSearchKind::Not4(b0, b1, b2, b3)
+        } else if is_not_ascii_id_continue {
+            SimdSearchKind::NotAsciiIdContinue
+        } else if is_not_ascii_jsx_id_continue {
+            SimdSearchKind::NotAsciiJsxIdContinue
+        } else {
+            SimdSearchKind::Table
+        };
+
+        Self { bytes, simd_kind }
     }
 
     /// Declare that using this table for searching is safe.
@@ -107,9 +169,280 @@ impl SafeByteMatchTable {
     /// Test a value against this `SafeByteMatchTable`.
     #[inline]
     pub const fn matches(&self, b: u8) -> bool {
-        self.0[b as usize]
+        self.bytes[b as usize]
+    }
+
+    /// Search a 16-byte batch starting at `batch` for the first matching byte offset `0..16`.
+    #[expect(clippy::inline_always)]
+    #[inline(always)]
+    pub fn search_batch(&self, batch: &[u8]) -> Option<usize> {
+        debug_assert!(batch.len() >= SEARCH_BATCH_SIZE);
+        match self.simd_kind {
+            SimdSearchKind::NotAsciiIdContinue => {
+                // SAFETY: `batch` has at least 16 bytes.
+                unsafe { simd::match_not_ascii_id_continue(batch.as_ptr(), false) }
+            }
+            SimdSearchKind::NotAsciiJsxIdContinue => {
+                // SAFETY: `batch` has at least 16 bytes.
+                unsafe { simd::match_not_ascii_id_continue(batch.as_ptr(), true) }
+            }
+            SimdSearchKind::Any4(b0, b1, b2, b3) => {
+                // SAFETY: `batch` has at least 16 bytes.
+                unsafe { simd::match_any4(batch.as_ptr(), b0, b1, b2, b3) }
+            }
+            SimdSearchKind::Not4(b0, b1, b2, b3) => {
+                // SAFETY: `batch` has at least 16 bytes.
+                unsafe { simd::match_not4(batch.as_ptr(), b0, b1, b2, b3) }
+            }
+            SimdSearchKind::Table => {
+                for (i, &byte) in batch[..SEARCH_BATCH_SIZE].iter().enumerate() {
+                    if self.matches(byte) {
+                        return Some(i);
+                    }
+                }
+                None
+            }
+        }
     }
 }
+
+#[cfg(target_arch = "aarch64")]
+mod simd {
+    use std::arch::aarch64::{
+        uint8x16_t, vandq_u8, vceqq_u8, vcltq_u8, vdupq_n_u8, vget_lane_u64, vld1q_u8, vmvnq_u8,
+        vorrq_u8, vreinterpret_u64_u8, vreinterpretq_u16_u8, vshrn_n_u16, vsubq_u8,
+    };
+
+    #[expect(clippy::inline_always)]
+    #[inline(always)]
+    unsafe fn load16(ptr: *const u8) -> uint8x16_t {
+        // SAFETY: Caller guarantees at least 16 bytes are readable at `ptr`.
+        unsafe { vld1q_u8(ptr) }
+    }
+
+    #[expect(clippy::inline_always)]
+    #[inline(always)]
+    unsafe fn first_true_lane(mask: uint8x16_t) -> Option<usize> {
+        // Pack 4 bits per lane with SHRN: aarch64 has no byte movemask.
+        // SAFETY: NEON is mandatory on aarch64.
+        let bits = unsafe {
+            let nibbles = vshrn_n_u16::<4>(vreinterpretq_u16_u8(mask));
+            vget_lane_u64::<0>(vreinterpret_u64_u8(nibbles))
+        };
+        if bits == 0 {
+            None
+        } else {
+            let lane = if cfg!(target_endian = "little") {
+                (bits.trailing_zeros() >> 2) as usize
+            } else {
+                (bits.leading_zeros() >> 2) as usize
+            };
+            Some(lane)
+        }
+    }
+
+    #[expect(clippy::inline_always)]
+    #[inline(always)]
+    pub unsafe fn match_any4(ptr: *const u8, b0: u8, b1: u8, b2: u8, b3: u8) -> Option<usize> {
+        // SAFETY: Caller guarantees at least 16 bytes are readable at `ptr`.
+        unsafe {
+            let chunk = load16(ptr);
+            let m0 = vceqq_u8(chunk, vdupq_n_u8(b0));
+            let m1 = vceqq_u8(chunk, vdupq_n_u8(b1));
+            let m2 = vceqq_u8(chunk, vdupq_n_u8(b2));
+            let m3 = vceqq_u8(chunk, vdupq_n_u8(b3));
+            let mask = vorrq_u8(vorrq_u8(m0, m1), vorrq_u8(m2, m3));
+            first_true_lane(mask)
+        }
+    }
+
+    #[expect(clippy::inline_always)]
+    #[inline(always)]
+    pub unsafe fn match_not4(ptr: *const u8, b0: u8, b1: u8, b2: u8, b3: u8) -> Option<usize> {
+        // SAFETY: Caller guarantees at least 16 bytes are readable at `ptr`.
+        unsafe {
+            let chunk = load16(ptr);
+            let m0 = vceqq_u8(chunk, vdupq_n_u8(b0));
+            let m1 = vceqq_u8(chunk, vdupq_n_u8(b1));
+            let m2 = vceqq_u8(chunk, vdupq_n_u8(b2));
+            let m3 = vceqq_u8(chunk, vdupq_n_u8(b3));
+            let eq = vorrq_u8(vorrq_u8(m0, m1), vorrq_u8(m2, m3));
+            first_true_lane(vmvnq_u8(eq))
+        }
+    }
+
+    #[expect(clippy::inline_always)]
+    #[inline(always)]
+    pub unsafe fn match_not_ascii_id_continue(ptr: *const u8, allow_hyphen: bool) -> Option<usize> {
+        // SAFETY: Caller guarantees at least 16 bytes are readable at `ptr`.
+        unsafe {
+            let chunk = load16(ptr);
+            let lower = vorrq_u8(chunk, vdupq_n_u8(0x20));
+            let alpha = vcltq_u8(vsubq_u8(lower, vdupq_n_u8(b'a')), vdupq_n_u8(26));
+            let digit = vcltq_u8(vsubq_u8(chunk, vdupq_n_u8(b'0')), vdupq_n_u8(10));
+            let under = vceqq_u8(chunk, vdupq_n_u8(b'_'));
+            let dollar = vceqq_u8(chunk, vdupq_n_u8(b'$'));
+            let mut valid = vorrq_u8(vorrq_u8(alpha, digit), vorrq_u8(under, dollar));
+            if allow_hyphen {
+                valid = vorrq_u8(valid, vceqq_u8(chunk, vdupq_n_u8(b'-')));
+            }
+            first_true_lane(vmvnq_u8(valid))
+        }
+    }
+
+    #[expect(clippy::inline_always)]
+    #[inline(always)]
+    pub unsafe fn match_star_slash(ptr: *const u8) -> Option<usize> {
+        // SAFETY: Caller guarantees at least 17 bytes are readable at `ptr`.
+        unsafe {
+            let stars = vceqq_u8(load16(ptr), vdupq_n_u8(b'*'));
+            let slashes = vceqq_u8(load16(ptr.add(1)), vdupq_n_u8(b'/'));
+            first_true_lane(vandq_u8(stars, slashes))
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+mod simd {
+    use std::arch::x86_64::{
+        __m128i, _mm_and_si128, _mm_cmpeq_epi8, _mm_cmpgt_epi8, _mm_loadu_si128, _mm_movemask_epi8,
+        _mm_or_si128, _mm_set1_epi8, _mm_sub_epi8,
+    };
+
+    #[expect(clippy::inline_always, clippy::cast_ptr_alignment)]
+    #[inline(always)]
+    unsafe fn load16(ptr: *const u8) -> __m128i {
+        // SAFETY: Caller guarantees at least 16 bytes are readable at `ptr`.
+        unsafe { _mm_loadu_si128(ptr.cast::<__m128i>()) }
+    }
+
+    #[expect(clippy::inline_always, clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+    #[inline(always)]
+    unsafe fn first_true_lane(mask: __m128i) -> Option<usize> {
+        // SAFETY: SSE2 is mandatory on x86_64.
+        let bits = unsafe { _mm_movemask_epi8(mask) } as u16;
+        if bits == 0 { None } else { Some(bits.trailing_zeros() as usize) }
+    }
+
+    #[expect(clippy::inline_always, clippy::cast_possible_wrap)]
+    #[inline(always)]
+    pub unsafe fn match_any4(ptr: *const u8, b0: u8, b1: u8, b2: u8, b3: u8) -> Option<usize> {
+        // SAFETY: Caller guarantees at least 16 bytes are readable at `ptr`, and SSE2 is mandatory on x86_64.
+        unsafe {
+            let chunk = load16(ptr);
+            let m0 = _mm_cmpeq_epi8(chunk, _mm_set1_epi8(b0 as i8));
+            let m1 = _mm_cmpeq_epi8(chunk, _mm_set1_epi8(b1 as i8));
+            let m2 = _mm_cmpeq_epi8(chunk, _mm_set1_epi8(b2 as i8));
+            let m3 = _mm_cmpeq_epi8(chunk, _mm_set1_epi8(b3 as i8));
+            let mask = _mm_or_si128(_mm_or_si128(m0, m1), _mm_or_si128(m2, m3));
+            first_true_lane(mask)
+        }
+    }
+
+    #[expect(
+        clippy::inline_always,
+        clippy::cast_possible_wrap,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_truncation
+    )]
+    #[inline(always)]
+    pub unsafe fn match_not4(ptr: *const u8, b0: u8, b1: u8, b2: u8, b3: u8) -> Option<usize> {
+        // SAFETY: Caller guarantees at least 16 bytes are readable at `ptr`, and SSE2 is mandatory on x86_64.
+        unsafe {
+            let chunk = load16(ptr);
+            let m0 = _mm_cmpeq_epi8(chunk, _mm_set1_epi8(b0 as i8));
+            let m1 = _mm_cmpeq_epi8(chunk, _mm_set1_epi8(b1 as i8));
+            let m2 = _mm_cmpeq_epi8(chunk, _mm_set1_epi8(b2 as i8));
+            let m3 = _mm_cmpeq_epi8(chunk, _mm_set1_epi8(b3 as i8));
+            let eq = _mm_or_si128(_mm_or_si128(m0, m1), _mm_or_si128(m2, m3));
+            let bits = (_mm_movemask_epi8(eq) as u16) ^ 0xFFFF;
+            if bits == 0 { None } else { Some(bits.trailing_zeros() as usize) }
+        }
+    }
+
+    #[expect(
+        clippy::inline_always,
+        clippy::cast_possible_wrap,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_truncation
+    )]
+    #[inline(always)]
+    pub unsafe fn match_not_ascii_id_continue(ptr: *const u8, allow_hyphen: bool) -> Option<usize> {
+        // SAFETY: Caller guarantees at least 16 bytes are readable at `ptr`, and SSE2 is mandatory on x86_64.
+        unsafe {
+            let chunk = load16(ptr);
+            let lower = _mm_or_si128(chunk, _mm_set1_epi8(0x20));
+            let alpha = _mm_cmpgt_epi8(
+                _mm_set1_epi8(-102),
+                _mm_sub_epi8(lower, _mm_set1_epi8((b'a' as i8).wrapping_sub(i8::MIN))),
+            );
+            let digit = _mm_cmpgt_epi8(
+                _mm_set1_epi8(-118),
+                _mm_sub_epi8(chunk, _mm_set1_epi8((b'0' as i8).wrapping_sub(i8::MIN))),
+            );
+            let under = _mm_cmpeq_epi8(chunk, _mm_set1_epi8(b'_' as i8));
+            let dollar = _mm_cmpeq_epi8(chunk, _mm_set1_epi8(b'$' as i8));
+            let mut valid = _mm_or_si128(_mm_or_si128(alpha, digit), _mm_or_si128(under, dollar));
+            if allow_hyphen {
+                valid = _mm_or_si128(valid, _mm_cmpeq_epi8(chunk, _mm_set1_epi8(b'-' as i8)));
+            }
+            let bits = (_mm_movemask_epi8(valid) as u16) ^ 0xFFFF;
+            if bits == 0 { None } else { Some(bits.trailing_zeros() as usize) }
+        }
+    }
+
+    #[expect(clippy::inline_always, clippy::cast_possible_wrap)]
+    #[inline(always)]
+    pub unsafe fn match_star_slash(ptr: *const u8) -> Option<usize> {
+        // SAFETY: Caller guarantees at least 17 bytes are readable at `ptr`, and SSE2 is mandatory on x86_64.
+        unsafe {
+            let stars = _mm_cmpeq_epi8(load16(ptr), _mm_set1_epi8(b'*' as i8));
+            let slashes = _mm_cmpeq_epi8(load16(ptr.add(1)), _mm_set1_epi8(b'/' as i8));
+            first_true_lane(_mm_and_si128(stars, slashes))
+        }
+    }
+}
+
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+mod simd {
+    use super::SEARCH_BATCH_SIZE;
+
+    #[expect(clippy::inline_always)]
+    #[inline(always)]
+    pub unsafe fn match_any4(ptr: *const u8, b0: u8, b1: u8, b2: u8, b3: u8) -> Option<usize> {
+        // SAFETY: Caller guarantees at least 16 bytes are readable at `ptr`.
+        let slice = unsafe { std::slice::from_raw_parts(ptr, SEARCH_BATCH_SIZE) };
+        slice.iter().position(|&b| b == b0 || b == b1 || b == b2 || b == b3)
+    }
+
+    #[expect(clippy::inline_always)]
+    #[inline(always)]
+    pub unsafe fn match_not4(ptr: *const u8, b0: u8, b1: u8, b2: u8, b3: u8) -> Option<usize> {
+        // SAFETY: Caller guarantees at least 16 bytes are readable at `ptr`.
+        let slice = unsafe { std::slice::from_raw_parts(ptr, SEARCH_BATCH_SIZE) };
+        slice.iter().position(|&b| b != b0 && b != b1 && b != b2 && b != b3)
+    }
+
+    #[expect(clippy::inline_always)]
+    #[inline(always)]
+    pub unsafe fn match_not_ascii_id_continue(ptr: *const u8, allow_hyphen: bool) -> Option<usize> {
+        // SAFETY: Caller guarantees at least 16 bytes are readable at `ptr`.
+        let slice = unsafe { std::slice::from_raw_parts(ptr, SEARCH_BATCH_SIZE) };
+        slice.iter().position(|&b| {
+            !(b.is_ascii_alphanumeric() || b == b'_' || b == b'$' || (allow_hyphen && b == b'-'))
+        })
+    }
+
+    #[expect(clippy::inline_always)]
+    #[inline(always)]
+    pub unsafe fn match_star_slash(ptr: *const u8) -> Option<usize> {
+        // SAFETY: Caller guarantees at least 17 bytes are readable at `ptr`.
+        let slice = unsafe { std::slice::from_raw_parts(ptr, SEARCH_BATCH_SIZE + 1) };
+        (0..SEARCH_BATCH_SIZE).find(|&i| slice[i] == b'*' && slice[i + 1] == b'/')
+    }
+}
+
+pub(super) use simd::{match_not_ascii_id_continue, match_star_slash};
 
 /// Macro to create a `SafeByteMatchTable` at compile time.
 ///
@@ -342,15 +675,12 @@ macro_rules! byte_search {
                 // at least `SEARCH_BATCH_SIZE` bytes remaining in `lexer.source`.
                 // So `$pos.add()` in this loop cannot go out of bounds.
                 let batch = unsafe { $pos.slice(crate::lexer::search::SEARCH_BATCH_SIZE) };
-                'inner: loop {
-                    for (i, &byte) in batch.iter().enumerate() {
-                        if $table.matches(byte) {
-                            // SAFETY: Cannot go out of bounds (see above).
-                            // Also see above about UTF-8 character boundaries invariant.
-                            $pos = unsafe { $pos.add(i) };
-                            break 'inner byte;
-                        }
-                    }
+                if let Some(i) = $table.search_batch(batch) {
+                    // SAFETY: `i < SEARCH_BATCH_SIZE`, so `$pos.add(i)` is in bounds.
+                    $pos = unsafe { $pos.add(i) };
+                    // SAFETY: `$pos` is in bounds of `lexer.source`.
+                    unsafe { $pos.read() }
+                } else {
                     // No match in batch - search next batch.
                     // SAFETY: Cannot go out of bounds (see above).
                     // Also see above about UTF-8 character boundaries invariant.

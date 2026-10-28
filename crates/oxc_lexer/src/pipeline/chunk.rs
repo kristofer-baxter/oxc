@@ -46,6 +46,50 @@ mod primitives_avx2 {
 #[cfg(target_arch = "x86_64")]
 pub(super) use primitives_avx2::*;
 
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+mod primitives_neon {
+    use std::arch::aarch64::*;
+
+    /// Load 128 bits starting at byte `i` as a `uint8x16_t`.
+    ///
+    /// # SAFETY
+    ///
+    /// - `src.add(i)` must be valid for reads of 16 bytes.
+    #[inline(always)]
+    pub unsafe fn load128(src: *const u8, i: usize) -> uint8x16_t {
+        vld1q_u8(src.add(i))
+    }
+
+    /// Compare every byte of chunk `v` against `c`.
+    #[inline(always)]
+    pub unsafe fn veq128(v: uint8x16_t, c: u8) -> uint8x16_t {
+        vceqq_u8(v, vdupq_n_u8(c))
+    }
+
+    /// Gather a 4-bit-per-byte mask of 16 `0xFF`/`0x00` bytes into a `u64`.
+    ///
+    /// `trailing_zeros() >> 2` gives the byte offset `0..16` of the first match.
+    #[inline(always)]
+    pub unsafe fn mm16_nibble(v: uint8x16_t) -> u64 {
+        let narrowed = vshrn_n_u16::<4>(vreinterpretq_u16_u8(v));
+        vget_lane_u64::<0>(vreinterpret_u64_u8(narrowed))
+    }
+
+    /// Gather the top bit of each byte of 4 chunks `a..d` into a 64-bit mask.
+    #[inline(always)]
+    pub unsafe fn mm64_neon(a: uint8x16_t, b: uint8x16_t, c: uint8x16_t, d: uint8x16_t) -> u64 {
+        const BITS: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
+        let m = vld1q_u8(BITS.as_ptr());
+        let ab = vpaddq_u8(vandq_u8(a, m), vandq_u8(b, m));
+        let cd = vpaddq_u8(vandq_u8(c, m), vandq_u8(d, m));
+        let s = vpaddq_u8(ab, cd);
+        vgetq_lane_u64::<0>(vreinterpretq_u64_u8(vpaddq_u8(s, s)))
+    }
+}
+
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+pub(super) use primitives_neon::*;
+
 mod primitives_generic {
     use std::ptr;
 

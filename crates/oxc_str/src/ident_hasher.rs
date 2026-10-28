@@ -10,9 +10,14 @@
 use std::hash::{BuildHasher, Hasher};
 
 /// Read 4 bytes from `s` at `offset` as a little-endian `u32`.
-#[inline]
-const fn read_u32(s: &[u8], i: usize) -> u32 {
-    (s[i] as u32) | ((s[i + 1] as u32) << 8) | ((s[i + 2] as u32) << 16) | ((s[i + 3] as u32) << 24)
+///
+/// # SAFETY
+/// Caller must ensure `i + 4 <= s.len()`.
+#[expect(clippy::inline_always)]
+#[inline(always)]
+const unsafe fn read_u32(s: &[u8], i: usize) -> u32 {
+    // SAFETY: Caller guarantees `i + 4 <= s.len()`.
+    unsafe { u32::from_le(s.as_ptr().add(i).cast::<u32>().read_unaligned()) }
 }
 
 /// Fold two `u32` values into one via 64-bit multiply + XOR-fold.
@@ -20,8 +25,8 @@ const fn read_u32(s: &[u8], i: usize) -> u32 {
 /// This is the core mixer from wyhash/rapidhash. The 64-bit multiply is non-linear,
 /// so every input bit influences many output bits. The XOR-fold combines the upper
 /// and lower halves for full avalanche.
-#[inline]
-#[expect(clippy::cast_possible_truncation)]
+#[expect(clippy::inline_always, clippy::cast_possible_truncation)]
+#[inline(always)]
 const fn mix(a: u32, b: u32) -> u32 {
     let m = (a as u64).wrapping_mul(b as u64);
     (m as u32) ^ ((m >> 32) as u32)
@@ -30,7 +35,8 @@ const fn mix(a: u32, b: u32) -> u32 {
 /// Compute a fast, high-quality hash of identifier bytes.
 ///
 /// Design:
-/// - **Read all bytes** for short strings (≤8), sample head+middle+tail for longer
+/// - **Single branch at `len >= 4`** — avoids unpredictable length-bucket branch mispredictions
+///   across identifiers of varying lengths (`4..=8`, `9..=16`, `17+`)
 /// - **wyhash-style mixing** — 64-bit multiply + XOR-fold provides non-linear
 ///   combination where every input bit affects many output bits
 /// - **Asymmetric seeds** — XOR with different constants before mixing, so even
@@ -44,34 +50,25 @@ pub const fn ident_hash(s: &[u8]) -> u32 {
     const SEED2: u32 = 0x85EB_CA6B;
 
     let len = s.len();
-    if len == 0 {
-        return 0;
-    }
-
-    if len < 4 {
+    if len >= 4 {
+        let rem = len - 4;
+        let q = rem >> 2;
+        // SAFETY: `len >= 4`, so `0 <= q <= rem = len - 4` and `0 <= rem - q <= rem = len - 4`.
+        let (head, mid1, mid2, tail) =
+            unsafe { (read_u32(s, 0), read_u32(s, q), read_u32(s, rem - q), read_u32(s, rem)) };
+        mix(head.wrapping_add(mid1 << 1) ^ SEED1, tail.wrapping_add(mid2 << 1) ^ SEED2)
+    } else if len > 0 {
         // 1-3 bytes: wyhash trick — read first, middle, last byte.
         // Captures all bytes regardless of length (middle overlaps for len=1,2).
-        let packed = ((s[0] as u32) << 16) | ((s[len >> 1] as u32) << 8) | (s[len - 1] as u32);
+        // SAFETY: `len` is 1, 2, or 3, so `0`, `len >> 1`, and `len - 1` are all `< len`.
+        let packed = unsafe {
+            ((*s.as_ptr() as u32) << 16)
+                | ((*s.as_ptr().add(len >> 1) as u32) << 8)
+                | (*s.as_ptr().add(len - 1) as u32)
+        };
         mix(packed ^ SEED1, packed ^ SEED2)
-    } else if len <= 8 {
-        // 4-8 bytes: read first 4 + last 4 (covers all bytes, may overlap).
-        // XOR with different seeds so even when head == tail (len=4), the mix inputs differ.
-        let head = read_u32(s, 0);
-        let tail = read_u32(s, len - 4);
-        mix(head ^ SEED1, tail ^ SEED2)
-    } else if len <= 16 {
-        // 9-16 bytes: head + middle + tail (12 bytes sampled).
-        let head = read_u32(s, 0);
-        let mid = read_u32(s, (len >> 1) - 2);
-        let tail = read_u32(s, len - 4);
-        mix(head ^ mid ^ SEED1, tail ^ SEED2)
     } else {
-        // 17+ bytes: 4 evenly-spaced samples (16 bytes total).
-        let head = read_u32(s, 0);
-        let mid1 = read_u32(s, len / 3);
-        let mid2 = read_u32(s, 2 * len / 3);
-        let tail = read_u32(s, len - 4);
-        mix(head ^ mid1 ^ SEED1, mid2 ^ tail ^ SEED2)
+        0
     }
 }
 
@@ -184,6 +181,11 @@ mod test {
         assert_ne!(ident_hash(b"fooBar"), ident_hash(b"fooBaz"));
         assert_ne!(ident_hash(b"a"), ident_hash(b"b"));
         assert_ne!(ident_hash(b"ab"), ident_hash(b"ba")); // spellchecker:disable-line
+        assert_ne!(ident_hash(b"name"), ident_hash(b"NAME"));
+        assert_ne!(ident_hash(b"data"), ident_hash(b"DATA"));
+        assert_ne!(ident_hash(b"this"), ident_hash(b"THIS"));
+        assert_ne!(ident_hash(b"value"), ident_hash(b"VALUE"));
+        assert_ne!(ident_hash(b"abcd"), ident_hash(b"`cbe")); // spellchecker:disable-line
     }
 
     #[test]

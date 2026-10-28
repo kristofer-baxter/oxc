@@ -1,5 +1,3 @@
-use memchr::memmem::Finder;
-
 use oxc_ast::CommentKind;
 use oxc_data_structures::branch_hints::cold_path;
 use oxc_syntax::line_terminator::is_line_terminator;
@@ -8,7 +6,9 @@ use crate::{config::LexerConfig as Config, diagnostics};
 
 use super::{
     Kind, Lexer,
-    search::{SafeByteMatchTable, byte_search, safe_byte_match_table},
+    search::{
+        SEARCH_BATCH_SIZE, SafeByteMatchTable, byte_search, match_star_slash, safe_byte_match_table,
+    },
     source::SourcePosition,
 };
 
@@ -160,30 +160,41 @@ impl<'a, C: Config> Lexer<'a, C> {
     }
 
     fn skip_multi_line_comment_after_line_break(&mut self, pos: SourcePosition<'a>) -> Kind {
-        // Can use `memchr` here as only searching for 1 pattern.
-        // Cache `Finder` instance on `Lexer` as there's a significant cost to creating it.
-        // `Finder::new` isn't a const function, so can't make it a `static`, and `lazy_static!`
-        // has a cost each time it's deref-ed. Creating `Finder` unconditionally in `Lexer::new`
-        // would be efficient for files containing multi-line comments, but would impose pointless
-        // cost on files which don't. So this is the fastest solution.
-        let finder = self.multi_line_comment_end_finder.get_or_insert_with(|| Finder::new("*/"));
-
         let remaining = self.source.str_from_pos_to_end(pos).as_bytes();
-        if let Some(index) = finder.find(remaining) {
-            // SAFETY: `pos + index + 2` is end of `*/`, so a valid `SourcePosition`
-            self.source.set_position(unsafe { pos.add(index + 2) });
-            self.trivia_builder.add_block_comment(
-                self.token.start(),
-                self.offset(),
-                CommentKind::MultiLineBlock,
-                self.source.whole(),
-            );
-            Kind::Skip
-        } else {
-            self.source.advance_to_end();
-            self.error(diagnostics::unterminated_multi_line_comment(self.unterminated_range()));
-            Kind::Eof
+        let mut offset = 0usize;
+        while offset + SEARCH_BATCH_SIZE < remaining.len() {
+            // SAFETY: `offset + 16 < remaining.len()`, so at least 17 bytes are readable at `ptr`.
+            if let Some(lane) = unsafe { match_star_slash(remaining.as_ptr().add(offset)) } {
+                // SAFETY: `pos + offset + lane + 2` is end of `*/`, so a valid `SourcePosition`.
+                self.source.set_position(unsafe { pos.add(offset + lane + 2) });
+                self.trivia_builder.add_block_comment(
+                    self.token.start(),
+                    self.offset(),
+                    CommentKind::MultiLineBlock,
+                    self.source.whole(),
+                );
+                return Kind::Skip;
+            }
+            offset += SEARCH_BATCH_SIZE;
         }
+        while offset + 1 < remaining.len() {
+            if remaining[offset] == b'*' && remaining[offset + 1] == b'/' {
+                // SAFETY: `pos + offset + 2` is end of `*/`, so a valid `SourcePosition`.
+                self.source.set_position(unsafe { pos.add(offset + 2) });
+                self.trivia_builder.add_block_comment(
+                    self.token.start(),
+                    self.offset(),
+                    CommentKind::MultiLineBlock,
+                    self.source.whole(),
+                );
+                return Kind::Skip;
+            }
+            offset += 1;
+        }
+
+        self.source.advance_to_end();
+        self.error(diagnostics::unterminated_multi_line_comment(self.unterminated_range()));
+        Kind::Eof
     }
 
     /// Section 12.5 Hashbang Comments.

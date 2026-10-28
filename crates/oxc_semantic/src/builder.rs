@@ -323,13 +323,19 @@ impl<'a> SemanticBuilder<'a> {
         // Avoiding this growth produces up to 30% perf boost on our benchmarks.
         //
         // If user did not provide existing `Stats`, calculate them by visiting AST.
-        #[cfg_attr(not(debug_assertions), expect(unused_variables))]
+        #[cfg(debug_assertions)]
         let (stats, check_stats) = if let Some(stats) = self.stats {
             (stats, None)
         } else {
             let stats = Stats::count(program);
             let stats_with_excess = stats.increase_by(self.excess_capacity);
             (stats_with_excess, Some(stats))
+        };
+        #[cfg(not(debug_assertions))]
+        let stats = if let Some(stats) = self.stats {
+            stats
+        } else {
+            Stats::count(program).increase_by(self.excess_capacity)
         };
         self.node_store.reserve(stats.nodes as usize);
         self.scoping.reserve(
@@ -426,7 +432,8 @@ impl<'a> SemanticBuilder<'a> {
         }
     }
 
-    fn create_ast_node(&mut self, kind: AstKind<'a>) {
+    #[inline]
+    fn create_ast_node(&mut self, node_id: NodeId, kind: AstKind<'a>) {
         #[cfg(not(feature = "jsdoc"))]
         let flags = NodeFlags::empty();
         #[cfg(feature = "jsdoc")]
@@ -436,9 +443,6 @@ impl<'a> SemanticBuilder<'a> {
             flags |= NodeFlags::JSDoc;
         }
 
-        // 1. Standalone node-id increment.
-        let node_id = self.node_store.alloc_node_id();
-        kind.set_node_id(node_id);
         let parent_node_id = self.node_store.current_node_id;
         self.node_store.current_node_id = node_id;
 
@@ -458,7 +462,7 @@ impl<'a> SemanticBuilder<'a> {
                     flags,
                 );
             }
-            AstNodeStoreKind::Ancestry(stack) => stack.push(kind),
+            AstNodeStoreKind::Ancestry(stack) => stack.push(kind, node_id),
         }
         self.record_ast_node();
     }
@@ -472,8 +476,7 @@ impl<'a> SemanticBuilder<'a> {
                 self.node_store.current_node_id = nodes.parent_id(self.node_store.current_node_id);
             }
             AstNodeStoreKind::Ancestry(stack) => {
-                stack.pop();
-                self.node_store.current_node_id = stack.current_node_id();
+                self.node_store.current_node_id = stack.pop();
             }
         }
     }
@@ -576,10 +579,11 @@ impl<'a> SemanticBuilder<'a> {
         name: Ident<'a>,
         excludes: SymbolFlags,
     ) -> Option<SymbolId> {
-        let symbol_id = self
-            .scoping
-            .get_binding(scope_id, name)
-            .or_else(|| self.hoisting_variables.get(&(scope_id, name)).copied())?;
+        let symbol_id = self.scoping.get_binding(scope_id, name).or_else(|| {
+            (!self.hoisting_variables.is_empty())
+                .then(|| self.hoisting_variables.get(&(scope_id, name)).copied())
+                .flatten()
+        })?;
 
         let flags = self.scoping.symbol_flags(symbol_id);
 
@@ -662,7 +666,7 @@ impl<'a> SemanticBuilder<'a> {
         unresolved: UnresolvedReference<'a>,
         last_scope_id: ScopeId,
     ) -> bool {
-        if unresolved.name == "arguments" {
+        if unresolved.name == oxc_str::static_ident!("arguments") {
             return self.resolve_arguments_reference(unresolved, last_scope_id);
         }
         self.walk_up_resolve_reference(unresolved, last_scope_id)
@@ -676,9 +680,12 @@ impl<'a> SemanticBuilder<'a> {
         unresolved: UnresolvedReference<'a>,
         last_scope_id: ScopeId,
     ) -> bool {
+        let bit = crate::scoping::ident_bloom_bit(unresolved.name);
         let mut current_scope_id = Some(unresolved.lookup_scope_id);
         while let Some(scope_id) = current_scope_id {
-            if let Some(symbol_id) = self.scoping.get_binding(scope_id, unresolved.name)
+            if self.scoping.scope_may_have_binding(scope_id, bit)
+                && let Some(symbol_id) =
+                    self.scoping.get_binding_unchecked_bloom(scope_id, unresolved.name)
                 && self.try_resolve_reference(unresolved.reference_id, symbol_id)
             {
                 return true;
@@ -736,10 +743,21 @@ impl<'a> SemanticBuilder<'a> {
     }
 
     /// Try to resolve a reference to a symbol. Returns `true` if resolved.
+    #[inline]
     fn try_resolve_reference(&mut self, reference_id: ReferenceId, symbol_id: SymbolId) -> bool {
         let symbol_flags = self.scoping.symbol_flags(symbol_id);
         let reference = &mut self.scoping.references[reference_id];
         let flags = reference.flags_mut();
+
+        // Fast path for normal value references (`Read`, `Write`, `Read | Write`) to value symbols.
+        if !flags.intersects(
+            ReferenceFlags::Namespace | ReferenceFlags::Type | ReferenceFlags::ValueAsType,
+        ) && symbol_flags.is_value()
+        {
+            reference.set_symbol_id(symbol_id);
+            self.scoping.add_resolved_reference(symbol_id, reference_id);
+            return true;
+        }
 
         // Determine whether the symbol can be referenced by this reference.
         // Namespace-qualified references must resolve to namespace-capable symbols
@@ -912,8 +930,15 @@ impl<'a> Visit<'a> for SemanticBuilder<'a> {
     }
 
     // NB: Not called for `Program`.
+    #[expect(
+        clippy::inline_always,
+        reason = "enables compile-time match elimination in AstKind::set_node_id"
+    )]
+    #[inline(always)]
     fn enter_node(&mut self, kind: AstKind<'a>) {
-        self.create_ast_node(kind);
+        let node_id = self.node_store.alloc_node_id();
+        kind.set_node_id(node_id);
+        self.create_ast_node(node_id, kind);
     }
 
     /// Both this function and `checker::check` must be inlined. Each `visit_*` method calls
@@ -967,7 +992,7 @@ impl<'a> Visit<'a> for SemanticBuilder<'a> {
                     flags,
                 );
             }
-            AstNodeStoreKind::Ancestry(stack) => stack.push(kind),
+            AstNodeStoreKind::Ancestry(stack) => stack.push(kind, node_id),
         }
 
         let is_ambient = self.source_type.is_typescript_definition();
@@ -1104,6 +1129,7 @@ impl<'a> Visit<'a> for SemanticBuilder<'a> {
                 }
             });
             if let Some(parent_bindings) = parent_bindings {
+                self.scoping.move_scope_bloom(parent_scope_id, self.current_scope_id);
                 for symbol_id in parent_bindings {
                     self.scoping.set_symbol_scope_id(symbol_id, self.current_scope_id);
                 }

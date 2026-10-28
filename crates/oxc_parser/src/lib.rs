@@ -800,7 +800,7 @@ impl<'a, C: ParserConfig> ParserImpl<'a, C> {
 
     pub fn parse_expression(mut self) -> Result<Expression<'a>, Diagnostics> {
         // initialize cur_token and prev_token by moving onto the first token
-        self.bump_any();
+        self.token = self.lexer.next_token_slow();
         let expr = self.parse_expr();
         if !self.at(Kind::Eof) {
             self.set_unexpected();
@@ -1473,5 +1473,24 @@ mod test {
 
         assert!(ret.fatal_error);
         assert!(ret.tokens.is_empty());
+    }
+
+    #[test]
+    fn import_alias_modifiers_and_interface_member_semicolons() {
+        let allocator = Allocator::default();
+        let declare_import =
+            Parser::new(&allocator, "declare import X = A.B;", SourceType::ts()).parse();
+        assert_eq!(declare_import.diagnostics.len(), 1);
+        assert!(declare_import.diagnostics[0].message.contains("declare"));
+
+        let abstract_import =
+            Parser::new(&allocator, "abstract import X = A.B;", SourceType::ts()).parse();
+        assert_eq!(abstract_import.diagnostics.len(), 1);
+        assert!(abstract_import.diagnostics[0].message.contains("abstract"));
+
+        let inline_interface =
+            Parser::new(&allocator, "interface A { a: string b: number }", SourceType::ts())
+                .parse();
+        assert!(inline_interface.fatal_error);
     }
 }

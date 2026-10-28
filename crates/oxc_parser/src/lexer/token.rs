@@ -82,6 +82,27 @@ impl fmt::Debug for Token {
 }
 
 impl Token {
+    /// Finish the lexer's scratch token without writing its fields back to memory first.
+    #[expect(clippy::inline_always)]
+    #[inline(always)]
+    pub(super) fn finish(self, kind: Kind, end: u32) -> Self {
+        debug_assert_eq!(self.kind(), Kind::Eof);
+        debug_assert_eq!(self.end(), 0);
+        debug_assert!(end >= self.start());
+        Self(self.0 | (u128::from(end) << END_SHIFT) | ((kind as u128) << KIND_SHIFT))
+    }
+
+    #[expect(clippy::inline_always)]
+    #[inline(always)]
+    pub(super) const fn new_fast(start: u32, end: u32, kind: Kind, is_on_new_line: bool) -> Self {
+        Self(
+            (start as u128)
+                | ((end as u128) << END_SHIFT)
+                | ((kind as u128) << KIND_SHIFT)
+                | ((is_on_new_line as u128) << IS_ON_NEW_LINE_SHIFT),
+        )
+    }
+
     #[inline]
     pub(super) fn new_on_new_line() -> Self {
         // Start with a default token, then set the flag

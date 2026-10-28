@@ -22,6 +22,9 @@ pub struct AncestryStack<'a> {
     /// Path from the root (`Program`) down to the node currently being visited.
     /// The last element is the current node.
     stack: Stack<AstKind<'a>>,
+    /// Parallel stack of [`NodeId`]s for `stack`, avoiding dynamic 130-arm
+    /// `AstKind::node_id` dispatches on `pop` and parent/ancestor lookups.
+    node_ids: Stack<NodeId>,
 }
 
 /// Iterator walking up the ancestry stack, yielding [`AstKind`]s.
@@ -31,41 +34,34 @@ impl Default for AncestryStack<'_> {
     fn default() -> Self {
         // Reserve enough frames for typical AST nesting depth so the stack does not reallocate
         // while traversing. `Stack`'s own default capacity is only 4 for a 16-byte `AstKind`.
-        Self { stack: Stack::with_capacity(64) }
+        Self { stack: Stack::with_capacity(64), node_ids: Stack::with_capacity(64) }
     }
 }
 
 impl<'a> AncestryStack<'a> {
     /// Push the node currently being entered onto the stack.
     #[inline]
-    pub(crate) fn push(&mut self, kind: AstKind<'a>) {
+    pub(crate) fn push(&mut self, kind: AstKind<'a>, node_id: NodeId) {
         self.stack.push(kind);
+        self.node_ids.push(node_id);
     }
 
-    /// Pop the current node when leaving it.
+    /// Pop the current node when leaving it, returning the new current [`NodeId`].
     #[inline]
-    pub(crate) fn pop(&mut self) {
+    pub(crate) fn pop(&mut self) -> NodeId {
         self.stack.pop();
-    }
-
-    /// [`NodeId`] of the node currently being visited, or [`NodeId::ROOT`] when
-    /// the stack is empty.
-    ///
-    /// Used by the builder to restore `current_node_id` on `leave_node` without
-    /// consulting the full node store.
-    #[inline]
-    pub(crate) fn current_node_id(&self) -> NodeId {
-        self.stack.last().map_or(NodeId::ROOT, AstKind::node_id)
+        self.node_ids.pop();
+        self.node_ids.last().copied().unwrap_or(NodeId::ROOT)
     }
 
     /// [`NodeId`] of the parent of the node currently being visited, or
     /// [`NodeId::ROOT`] when the current node is the root (`Program`).
     #[inline]
     pub(crate) fn parent_node_id(&self) -> NodeId {
-        let stack = self.stack.as_slice();
+        let ids = self.node_ids.as_slice();
         // `Program` is its own parent.
-        let parent_index = stack.len().saturating_sub(2);
-        stack.get(parent_index).map_or(NodeId::ROOT, AstKind::node_id)
+        let parent_index = ids.len().saturating_sub(2);
+        ids.get(parent_index).copied().unwrap_or(NodeId::ROOT)
     }
 
     /// [`AstKind`] of the node currently being visited (top of the stack).
@@ -122,7 +118,7 @@ impl<'a> AncestryStack<'a> {
         let end = match from {
             None => stack.len(),
             Some(node_id) => {
-                stack.iter().rposition(|kind| kind.node_id() == node_id).map_or(0, |i| i + 1)
+                self.node_ids.as_slice().iter().rposition(|&id| id == node_id).map_or(0, |i| i + 1)
             }
         };
         stack[..end].iter().rev().copied()
@@ -139,13 +135,13 @@ impl<'a> AncestryStack<'a> {
     /// Panics if no ancestor has the given `node_id`.
     #[inline]
     pub fn find_kind_by_node_id(&self, node_id: NodeId) -> AstKind<'a> {
-        self.stack
+        let idx = self
+            .node_ids
             .as_slice()
             .iter()
-            .rev()
-            .find(|kind| kind.node_id() == node_id)
-            .copied()
-            .expect("node id not found on the ancestry stack")
+            .rposition(|&id| id == node_id)
+            .expect("node id not found on the ancestry stack");
+        self.stack.as_slice()[idx]
     }
 }
 
