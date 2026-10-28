@@ -103,17 +103,16 @@ impl<'a, C: Config> ParserImpl<'a, C> {
             } else {
                 let comma_span = self.cur_token().span();
                 if kind != Kind::Comma {
-                    let error = diagnostics::expect_closing_or_separator(
-                        Kind::RParen.to_str(),
-                        Kind::Comma.to_str(),
-                        kind.to_str(),
+                    self.handle_expect_closing_or_separator_failure(
+                        Kind::RParen,
+                        Kind::Comma,
+                        kind,
                         comma_span,
                         opening_span,
                     );
-                    self.set_fatal_error(error);
                     break;
                 }
-                self.bump_any();
+                self.advance(Kind::Comma);
                 let kind = self.cur_kind();
                 if kind == Kind::RParen {
                     if rest.is_some() && !self.ctx.has_ambient() {
@@ -131,6 +130,72 @@ impl<'a, C: Config> ParserImpl<'a, C> {
                     ),
                 ));
                 break;
+            }
+
+            // Fast path for plain identifier parameters (`function foo(a, b, c)` or `(x: T, y?: U)`)
+            // which cannot have decorators or parameter modifiers.
+            if self.cur_kind() == Kind::Ident {
+                let ident = self.parse_plain_binding_identifier();
+                let ident_span = ident.span;
+                let pattern = BindingPattern::BindingIdentifier(self.alloc(ident));
+                if matches!(self.cur_kind(), Kind::Comma | Kind::RParen) {
+                    if has_optional {
+                        self.error(diagnostics::required_parameter_after_optional_parameter(
+                            ident_span,
+                        ));
+                    }
+                    list.push(FormalParameter::new(
+                        ident_span,
+                        ArenaVec::new_in(self),
+                        pattern,
+                        None,
+                        None,
+                        false,
+                        None,
+                        false,
+                        false,
+                        self,
+                    ));
+                    continue;
+                }
+                let optional = self.is_ts && self.eat(Kind::Question);
+                let type_annotation =
+                    if self.is_ts { self.parse_ts_type_annotation() } else { None };
+                let init = if self.eat(Kind::Eq) {
+                    let init = self.context_add(
+                        Context::In,
+                        ParserImpl::parse_assignment_expression_or_higher,
+                    );
+                    if optional {
+                        self.error(
+                            diagnostics::a_parameter_cannot_have_question_mark_and_initializer(
+                                ident_span,
+                            ),
+                        );
+                    }
+                    Some(ArenaBox::new_in(init, self))
+                } else {
+                    None
+                };
+                let span = self.end_span(ident_span.start);
+                if optional {
+                    has_optional = true;
+                } else if has_optional && init.is_none() {
+                    self.error(diagnostics::required_parameter_after_optional_parameter(span));
+                }
+                list.push(FormalParameter::new(
+                    span,
+                    ArenaVec::new_in(self),
+                    pattern,
+                    type_annotation,
+                    init,
+                    optional,
+                    None,
+                    false,
+                    false,
+                    self,
+                ));
+                continue;
             }
 
             let start = self.cur_start();

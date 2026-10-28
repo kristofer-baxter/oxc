@@ -15,18 +15,31 @@ pub(super) use avx2::{
     scan_block_comment_avx2 as scan_block_comment, scan_line_comment_avx2 as scan_line_comment,
 };
 
-#[cfg(not(all(
-    target_arch = "x86_64",
-    target_feature = "avx2",
-    target_feature = "bmi2",
-    target_feature = "popcnt"
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+mod neon;
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+pub(super) use neon::{
+    scan_block_comment_neon as scan_block_comment, scan_line_comment_neon as scan_line_comment,
+};
+
+#[cfg(not(any(
+    all(
+        target_arch = "x86_64",
+        target_feature = "avx2",
+        target_feature = "bmi2",
+        target_feature = "popcnt"
+    ),
+    all(target_arch = "aarch64", target_feature = "neon")
 )))]
 mod generic;
-#[cfg(not(all(
-    target_arch = "x86_64",
-    target_feature = "avx2",
-    target_feature = "bmi2",
-    target_feature = "popcnt"
+#[cfg(not(any(
+    all(
+        target_arch = "x86_64",
+        target_feature = "avx2",
+        target_feature = "bmi2",
+        target_feature = "popcnt"
+    ),
+    all(target_arch = "aarch64", target_feature = "neon")
 )))]
 pub(super) use generic::{
     scan_block_comment_generic as scan_block_comment,

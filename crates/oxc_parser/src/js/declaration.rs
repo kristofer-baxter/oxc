@@ -81,7 +81,7 @@ impl<'a, C: Config> ParserImpl<'a, C> {
         decl_parent: VariableDeclarationParent,
         declare: bool,
     ) -> ArenaBox<'a, VariableDeclaration<'a>> {
-        let mut declarations = ArenaVec::new_in(self);
+        let mut declarations = ArenaVec::with_capacity_in(1, self);
         loop {
             let declaration = self.parse_variable_declarator(decl_parent, kind);
             declarations.push(declaration);

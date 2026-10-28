@@ -49,7 +49,7 @@ impl<'a, C: Config> ParserImpl<'a, C> {
         // syntax commits to the Module goal.
         let track_await_reparse = is_top_level && self.source_type.is_unambiguous();
 
-        let mut expecting_directives = true;
+        let mut expecting_directives = self.at(Kind::Str);
         while !self.has_fatal_error() {
             if !is_top_level && self.at(Kind::RCurly) {
                 break;
@@ -266,14 +266,15 @@ impl<'a, C: Config> ParserImpl<'a, C> {
     fn parse_expression_or_labeled_statement(&mut self) -> Statement<'a> {
         let start = self.cur_start();
         let expr = self.parse_expr();
-        if let Expression::Identifier(ident) = &expr {
-            // Section 14.13 Labelled Statement
-            // Avoids lookahead for a labeled statement, which is on a hot path
-            if self.eat(Kind::Colon) {
-                let label = LabelIdentifier::new(ident.span, ident.name, self);
-                let body = self.parse_statement_list_item(StatementContext::Label);
-                return Statement::new_labeled_statement(self.end_span(start), label, body, self);
-            }
+        // Section 14.13 Labelled Statement
+        // Avoids lookahead for a labeled statement, which is on a hot path
+        if self.at(Kind::Colon)
+            && let Expression::Identifier(ident) = &expr
+        {
+            self.bump_any(); // bump `:`
+            let label = LabelIdentifier::new(ident.span, ident.name, self);
+            let body = self.parse_statement_list_item(StatementContext::Label);
+            return Statement::new_labeled_statement(self.end_span(start), label, body, self);
         }
         self.parse_expression_statement(start, expr)
     }

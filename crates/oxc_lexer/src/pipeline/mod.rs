@@ -103,7 +103,7 @@ impl Lexer {
             "lexer: src must have >= {PAD} bytes of padding past len {n} (got {})",
             src.len()
         );
-        self.ensure(n);
+        self.ensure_output(n);
         let kinds = self.sig_kinds.as_mut_ptr();
         let spans = self.spans.as_mut_ptr();
         unsafe {
@@ -161,7 +161,7 @@ impl Lexer {
         cpu: impl Cpu,
     ) -> usize {
         debug_assert!(src.len() >= n + PAD, "source must extend PAD zeroed bytes past n");
-        self.ensure(n);
+        self.ensure_scratch(n);
         self.lanes.clear();
         self.lanes.module = module;
         self.lanes.disambiguate.begin(n, module);
@@ -208,7 +208,7 @@ impl Lexer {
         sig_len
     }
 
-    fn ensure(&mut self, n: usize) {
+    fn ensure_scratch(&mut self, n: usize) {
         let nb = n.div_ceil(64) + 1;
         if self.nb_cap < nb {
             self.word.resize(nb, 0);
@@ -224,6 +224,10 @@ impl Lexer {
         if self.kwpos.is_empty() {
             self.kwpos.resize(KWB * 64 + 8, 0);
         }
+    }
+
+    fn ensure_output(&mut self, n: usize) {
+        self.ensure_scratch(n);
         let need = n + PAD;
         if self.out_cap < need {
             self.spans.resize(need + SPAN_SENTINELS, Span::new(0, 0));
@@ -236,9 +240,10 @@ impl Lexer {
     /// [`SPAN_SENTINELS`] EOF entries.
     #[must_use]
     pub fn kinds(&self) -> &[TokenKind] {
-        let bytes = &self.sig_kinds[..self.sig_len + SPAN_SENTINELS];
+        let end = self.sig_len + SPAN_SENTINELS;
+        let bytes = self.sig_kinds.get(..end).unwrap_or(&[]);
         debug_assert_kind_bytes(bytes);
-        // SAFETY: `lex_raw` wrote `sig_len` kinds plus the sentinels, all of
+        // SAFETY: `lex` wrote `sig_len` kinds plus the sentinels, all of
         // them declared discriminants.
         unsafe { kinds_from_bytes(bytes) }
     }

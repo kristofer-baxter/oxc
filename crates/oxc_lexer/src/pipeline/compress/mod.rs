@@ -12,6 +12,11 @@ mod avx2;
 #[cfg(target_arch = "x86_64")]
 use avx2::{build_spans_avx2, compress_blocks_avx2, init_pair_luts_avx2, lanes_post_avx2};
 
+#[cfg(target_arch = "aarch64")]
+mod neon;
+#[cfg(target_arch = "aarch64")]
+use neon::{build_spans_neon, compress_blocks_neon, init_pair_luts_neon, lanes_post_neon};
+
 mod generic;
 use generic::{build_spans_generic, compress_blocks_generic, lanes_post_generic};
 
@@ -74,7 +79,7 @@ pub unsafe fn write_sentinels(n: u32, spans: *mut Span, sig_kinds: *mut u8) {
 pub(super) fn init_pair_luts(cpu: DynCpu) {
     cpu_select!(cpu, {
         Avx2(cpu) => init_pair_luts_avx2(cpu),
-        Neon(_) => {}
+        Neon(cpu) => init_pair_luts_neon(cpu),
         Generic(_) => {}
     });
 }
@@ -91,7 +96,7 @@ unsafe fn compress_blocks(
 ) -> usize {
     cpu_select!(cpu, {
         Avx2(cpu) => compress_blocks_avx2(st, kind, b0, b1, starts, kinds, cpu),
-        Neon(_) => compress_blocks_generic(st, kind, b0, b1, starts, kinds),
+        Neon(cpu) => compress_blocks_neon(st, kind, b0, b1, starts, kinds, cpu),
         Generic(_) => compress_blocks_generic(st, kind, b0, b1, starts, kinds),
     })
 }
@@ -107,7 +112,7 @@ unsafe fn build_spans(
 ) -> usize {
     cpu_select!(cpu, {
         Avx2(cpu) => build_spans_avx2(stage_kind, stage_pos, m, spans, sig_kinds, cpu),
-        Neon(_) => build_spans_generic(stage_kind, stage_pos, m, spans, sig_kinds),
+        Neon(cpu) => build_spans_neon(stage_kind, stage_pos, m, spans, sig_kinds, cpu),
         Generic(_) => build_spans_generic(stage_kind, stage_pos, m, spans, sig_kinds),
     })
 }
@@ -124,7 +129,7 @@ unsafe fn lanes_post(
 ) {
     cpu_select!(cpu, {
         Avx2(cpu) => lanes_post_avx2(src, out_kinds, out_spans, m, nn, lanes, cpu),
-        Neon(_) => lanes_post_generic(src, out_kinds, out_spans, m, nn, lanes),
+        Neon(cpu) => lanes_post_neon(src, out_kinds, out_spans, m, nn, lanes, cpu),
         Generic(_) => lanes_post_generic(src, out_kinds, out_spans, m, nn, lanes),
     });
 }

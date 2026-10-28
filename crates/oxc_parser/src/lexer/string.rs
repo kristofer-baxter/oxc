@@ -198,13 +198,19 @@ impl<'a, C: Config> Lexer<'a, C> {
         self.token.set_escaped(true);
     }
 
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn get_escaped_string(&self, token: Token) -> &'a str {
+        self.escaped_strings[&token.start()]
+            .as_str()
+            .expect("identifier escape must be valid UTF-8")
+    }
+
     pub(crate) fn get_string(&self, token: Token) -> &'a str {
         if token.escaped() {
             // Identifiers only save validated Unicode scalar values.
             // Decoded string literals and templates use `get_js_string` instead.
-            return self.escaped_strings[&token.start()]
-                .as_str()
-                .expect("identifier escape must be valid UTF-8");
+            return self.get_escaped_string(token);
         }
 
         let source_text = self.source.whole();

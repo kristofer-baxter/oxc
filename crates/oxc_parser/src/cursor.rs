@@ -9,7 +9,7 @@ use crate::{
     Context, ParserConfig as Config, ParserImpl,
     diagnostics::{self, ParserDiagnostic},
     error_handler::FatalError,
-    lexer::{Kind, LexerCheckpoint, Token, cold_branch},
+    lexer::{Kind, LexerCheckpoint, Token},
 };
 
 pub struct ParserCheckpoint<'a> {
@@ -72,16 +72,19 @@ impl<'a, C: Config> ParserImpl<'a, C> {
     }
 
     /// Get current string
+    #[inline]
     pub(crate) fn cur_string(&self) -> &'a str {
         self.lexer.get_string(self.token)
     }
 
     /// Get the decoded value of the current string literal.
+    #[inline]
     pub(crate) fn cur_js_string(&self) -> JSStr<'a> {
         self.lexer.get_js_string(self.token)
     }
 
     /// Get current template string
+    #[inline]
     pub(crate) fn cur_template_string(&self) -> Option<JSStr<'a>> {
         self.lexer.get_template_string(self.token.start())
     }
@@ -104,8 +107,7 @@ impl<'a, C: Config> ParserImpl<'a, C> {
     /// Checks if the current token is escaped if it is a keyword
     #[inline]
     pub(crate) fn advance(&mut self, kind: Kind) {
-        // Manually inlined escaped keyword check - escaped identifiers are extremely rare
-        if self.token.escaped() && kind.is_any_keyword() {
+        if kind.is_any_keyword() && self.token.escaped() {
             self.report_escaped_keyword(self.token.span());
         }
         self.prev_token_end = self.token.end();
@@ -144,20 +146,26 @@ impl<'a, C: Config> ParserImpl<'a, C> {
         self.advance(self.cur_kind());
     }
 
+    #[cold]
+    #[inline(never)]
+    fn handle_asi_failure(&mut self) {
+        let span = Span::empty(self.prev_token_end);
+        let error = diagnostics::auto_semicolon_insertion(span);
+        self.set_fatal_error(error);
+    }
+
     /// [Automatic Semicolon Insertion](https://tc39.es/ecma262/#sec-automatic-semicolon-insertion)
     /// # Errors
+    #[inline]
     pub(crate) fn asi(&mut self) {
-        if self.eat(Kind::Semicolon) || self.can_insert_semicolon() {
+        let token = self.cur_token();
+        let kind = token.kind();
+        if kind == Kind::Semicolon {
+            self.advance(Kind::Semicolon);
+        } else if matches!(kind, Kind::RCurly | Kind::Eof) || token.is_on_new_line() {
             /* no op */
         } else {
-            // ASI failure is a syntax error (cold). Build the diagnostic out of line so the
-            // ~232-byte `OxcDiagnostic` buffer does not inflate `asi`'s stack frame on the
-            // common (valid) path.
-            cold_branch(|| {
-                let span = Span::empty(self.prev_token_end);
-                let error = diagnostics::auto_semicolon_insertion(span);
-                self.set_fatal_error(error);
-            });
+            self.handle_asi_failure();
         }
     }
 
@@ -174,6 +182,51 @@ impl<'a, C: Config> ParserImpl<'a, C> {
         let range = self.cur_token().span();
         let error =
             diagnostics::expect_token(expected_kind.to_str(), self.cur_kind().to_str(), range);
+        self.set_fatal_error(error);
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn handle_expect_closing_failure(&mut self, kind: Kind, opening_span: Span) {
+        let range = self.cur_token().span();
+        let error = diagnostics::expect_closing(
+            kind.to_str(),
+            self.cur_kind().to_str(),
+            range,
+            opening_span,
+        );
+        self.set_fatal_error(error);
+    }
+
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn handle_expect_closing_or_separator_failure(
+        &mut self,
+        close: Kind,
+        separator: Kind,
+        kind: Kind,
+        span: Span,
+        opening_span: Span,
+    ) {
+        let error = diagnostics::expect_closing_or_separator(
+            close.to_str(),
+            separator.to_str(),
+            kind.to_str(),
+            span,
+            opening_span,
+        );
+        self.set_fatal_error(error);
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn handle_expect_conditional_alternative_failure(&mut self, question_span: Span) {
+        let range = self.cur_token().span();
+        let error = diagnostics::expect_conditional_alternative(
+            self.cur_kind().to_str(),
+            range,
+            question_span,
+        );
         self.set_fatal_error(error);
     }
 
@@ -198,14 +251,7 @@ impl<'a, C: Config> ParserImpl<'a, C> {
     #[inline]
     pub(crate) fn expect_closing(&mut self, kind: Kind, opening_span: Span) {
         if !self.at(kind) {
-            let range = self.cur_token().span();
-            let error = diagnostics::expect_closing(
-                kind.to_str(),
-                self.cur_kind().to_str(),
-                range,
-                opening_span,
-            );
-            self.set_fatal_error(error);
+            self.handle_expect_closing_failure(kind, opening_span);
         }
         self.advance(kind);
     }
@@ -213,15 +259,9 @@ impl<'a, C: Config> ParserImpl<'a, C> {
     #[inline]
     pub(crate) fn expect_conditional_alternative(&mut self, question_span: Span) {
         if !self.at(Kind::Colon) {
-            let range = self.cur_token().span();
-            let error = diagnostics::expect_conditional_alternative(
-                self.cur_kind().to_str(),
-                range,
-                question_span,
-            );
-            self.set_fatal_error(error);
+            self.handle_expect_conditional_alternative_failure(question_span);
         }
-        self.bump_any(); // bump `:`
+        self.advance(Kind::Colon);
     }
 
     /// Expect the next next token to be a `JsxChild`, i.e. `<` or `{` or `JSXText`
@@ -509,13 +549,13 @@ impl<'a, C: Config> ParserImpl<'a, C> {
                 return None;
             }
             if kind != separator {
-                self.set_fatal_error(diagnostics::expect_closing_or_separator(
-                    close.to_str(),
-                    separator.to_str(),
-                    kind.to_str(),
+                self.handle_expect_closing_or_separator_failure(
+                    close,
+                    separator,
+                    kind,
                     self.cur_token().span(),
                     opening_span,
-                ));
+                );
                 return None;
             }
             self.advance(separator);

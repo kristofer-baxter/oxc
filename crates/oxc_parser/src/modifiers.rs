@@ -534,8 +534,19 @@ impl<C: Config> ParserImpl<'_, C> {
         permit_const_as_modifier: bool,
         stop_on_start_of_class_static_block: bool,
     ) -> Modifiers {
-        let mut modifiers = Modifiers::empty();
+        self.parse_modifiers_from(
+            Modifiers::empty(),
+            permit_const_as_modifier,
+            stop_on_start_of_class_static_block,
+        )
+    }
 
+    pub(crate) fn parse_modifiers_from(
+        &mut self,
+        mut modifiers: Modifiers,
+        permit_const_as_modifier: bool,
+        stop_on_start_of_class_static_block: bool,
+    ) -> Modifiers {
         while let Some(modifier) = self.try_parse_modifier(
             modifiers.kinds(),
             permit_const_as_modifier,
@@ -635,7 +646,7 @@ impl<C: Config> ParserImpl<'_, C> {
         !next.is_on_new_line() && Self::can_follow_modifier(next.kind())
     }
 
-    fn can_follow_modifier(kind: Kind) -> bool {
+    pub(crate) fn can_follow_modifier(kind: Kind) -> bool {
         match kind {
             Kind::PrivateIdentifier | Kind::LBrack | Kind::LCurly | Kind::Star | Kind::Dot3 => true,
             kind => kind.is_identifier_or_keyword(),
