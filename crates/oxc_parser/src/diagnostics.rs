@@ -469,11 +469,6 @@ parser_diagnostics! {
         .with_label(span)
     };
 
-    new_optional_chain(span: Span) => {
-        OxcDiagnostic::error("Optional chaining cannot appear in the callee of new expressions")
-            .with_label(span)
-    };
-
     invalid_new_optional_chain(span: Span) => {
         OxcDiagnostic::error("Invalid optional chain from new expression.").with_label(span)
     };
@@ -834,10 +829,6 @@ parser_diagnostics! {
         OxcDiagnostic::error("Unexpected import.meta expression")
             .with_help("import.meta is only allowed in module code")
             .with_label(span)
-    };
-
-    private_in_private(span: Span) => {
-        OxcDiagnostic::error("Unexpected right-hand side of private-in expression").with_label(span)
     };
 
     unexpected_private_identifier(span: Span) => {

@@ -10,17 +10,17 @@ pub mod arena;
 #[cfg(feature = "oxc_diagnostics")]
 pub mod diagnostics;
 pub mod error;
-mod lanes;
 pub mod options;
 mod pipeline;
 pub mod token;
 
 pub use arena::{Arena, LexResult, LineEntry};
 pub use error::{DiagCode, DiagSeverity, Diagnostic};
-pub use lanes::Lanes;
 pub use options::LexOptions;
 pub use pipeline::Lexer;
 pub use token::{KW_KIND_BASE, TRIVIA_MAX, TRIVIA_MIN, TokenKind, token_flags};
+
+use pipeline::{Lanes, decode_char_at};
 
 pub const PAD: usize = 64;
 
@@ -183,7 +183,7 @@ fn resolve_unicode_leads(
         {
             continue;
         }
-        let Some(ch) = lanes::decode_char_at(src, off as usize) else { continue };
+        let Some(ch) = decode_char_at(src, off as usize) else { continue };
         let name_start = spans_all[ti].start
             + u32::from(matches!(
                 kinds_all[ti],

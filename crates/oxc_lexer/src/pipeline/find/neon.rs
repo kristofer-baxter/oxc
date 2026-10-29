@@ -2,88 +2,23 @@ use std::arch::aarch64::*;
 
 use crate::pipeline::chunk::{load128, mm16_nibble, mm64_neon, veq128};
 
+/// First byte at or after `i` that is one of `needles`, or `n`.
 #[inline]
-pub unsafe fn find1_neon(src: *const u8, n: usize, mut i: usize, a: u8) -> usize {
-    while i + 16 <= n {
-        let m = mm16_nibble(veq128(load128(src, i), a));
-        if m != 0 {
-            return i + (m.trailing_zeros() >> 2) as usize;
-        }
-        i += 16;
-    }
-    while i < n {
-        if *src.add(i) == a {
-            return i;
-        }
-        i += 1;
-    }
-    n
-}
-
-#[inline]
-pub unsafe fn find2_neon(src: *const u8, n: usize, mut i: usize, a: u8, b: u8) -> usize {
-    while i + 16 <= n {
-        let v = load128(src, i);
-        let m = mm16_nibble(vorrq_u8(veq128(v, a), veq128(v, b)));
-        if m != 0 {
-            return i + (m.trailing_zeros() >> 2) as usize;
-        }
-        i += 16;
-    }
-    while i < n {
-        let c = *src.add(i);
-        if c == a || c == b {
-            return i;
-        }
-        i += 1;
-    }
-    n
-}
-
-#[inline]
-pub unsafe fn find3_neon(src: *const u8, n: usize, mut i: usize, a: u8, b: u8, c: u8) -> usize {
-    while i + 16 <= n {
-        let v = load128(src, i);
-        let m = mm16_nibble(vorrq_u8(vorrq_u8(veq128(v, a), veq128(v, b)), veq128(v, c)));
-        if m != 0 {
-            return i + (m.trailing_zeros() >> 2) as usize;
-        }
-        i += 16;
-    }
-    while i < n {
-        let ch = *src.add(i);
-        if ch == a || ch == b || ch == c {
-            return i;
-        }
-        i += 1;
-    }
-    n
-}
-
-#[inline]
-pub unsafe fn find4_neon(
+pub unsafe fn find_neon<const K: usize>(
     src: *const u8,
     n: usize,
     mut i: usize,
-    a: u8,
-    b: u8,
-    c: u8,
-    d: u8,
+    needles: [u8; K],
 ) -> usize {
     while i + 16 <= n {
-        let v = load128(src, i);
-        let m = mm16_nibble(vorrq_u8(
-            vorrq_u8(veq128(v, a), veq128(v, b)),
-            vorrq_u8(veq128(v, c), veq128(v, d)),
-        ));
+        let m = mm16_nibble(any_of(load128(src, i), needles));
         if m != 0 {
             return i + (m.trailing_zeros() >> 2) as usize;
         }
         i += 16;
     }
     while i < n {
-        let x = *src.add(i);
-        if x == a || x == b || x == c || x == d {
+        if needles.contains(&*src.add(i)) {
             return i;
         }
         i += 1;
@@ -91,43 +26,23 @@ pub unsafe fn find4_neon(
     n
 }
 
-macro_rules! define_find_function_neon {
-    ($(#[$attr:meta])* $name:ident: $($needle:expr),+ $(,)?) => {
-        $(#[$attr])*
-        #[inline]
-        pub unsafe fn $name(src: *const u8, n: usize, mut i: usize) -> usize {
-            use std::arch::aarch64::vorrq_u8;
-            use crate::pipeline::{find::neon::vor128, chunk::{load128, veq128, mm16_nibble}};
-
-            while i + 16 <= n {
-                let v = load128(src, i);
-                let m = mm16_nibble(vor128!($(veq128(v, $needle)),+));
-                if m != 0 {
-                    return i + (m.trailing_zeros() >> 2) as usize;
-                }
-                i += 16;
-            }
-            while i < n {
-                let c = *src.add(i);
-                if $(c == $needle)||+ {
-                    return i;
-                }
-                i += 1;
-            }
-            n
+// The compares are OR-folded pairwise, level by level, so the tree stays shallow for 7 needles.
+#[inline(always)]
+unsafe fn any_of<const N: usize>(v: uint8x16_t, needles: [u8; N]) -> uint8x16_t {
+    let mut m = needles.map(|c| veq128(v, c));
+    let mut len = N;
+    while len > 1 {
+        let half = len / 2;
+        for j in 0..half {
+            m[j] = vorrq_u8(m[2 * j], m[2 * j + 1]);
         }
-    };
+        if len % 2 == 1 {
+            m[half] = m[len - 1];
+        }
+        len = half + len % 2;
+    }
+    m[0]
 }
-pub(super) use define_find_function_neon;
-
-macro_rules! vor128 {
-    ($a:expr) => { $a };
-    ($a:expr, $b:expr) => { vorrq_u8($a, $b) };
-    ($a:expr, $b:expr, $($rest:expr),+) => {
-        vorrq_u8(vor128!($a, $b), vor128!($($rest),+))
-    };
-}
-pub(super) use vor128;
 
 #[inline(always)]
 unsafe fn bracket_mask16(v: uint8x16_t) -> uint8x16_t {

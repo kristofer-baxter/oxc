@@ -1,12 +1,14 @@
 use oxc_ast::{Comment, CommentContent, CommentKind};
 
-use crate::{error::DiagCode, lanes::Lanes, token::tk};
+use crate::{error::DiagCode, token::tk};
 
 use crate::pipeline::{
     bitmap::{bm_clear_range, bm_set},
-    find::find_line_terminator,
+    lanes::Lanes,
     scan::{scan_block_comment, scan_line_comment},
 };
+
+use super::common::find_line_terminator;
 
 /// Lex the `//` line comment at `s`. Returns the resume index.
 #[inline(always)]
