@@ -51,11 +51,11 @@ multi_index_vec! {
     /// for all scopes. Using a single allocation with one `len`/`cap` instead of
     /// separate `IndexVec`s saves memory (no redundant len/cap) and CPU (one
     /// bounds check, one capacity check on push).
-    struct ScopeTable<ScopeId> {
-        parent_ids => parent_ids_mut: Option<ScopeId>,
-        node_ids => node_ids_mut: NodeId,
-        flags => flags_mut: ScopeFlags,
-        bloom => bloom_mut: u64,
+    pub struct ScopeTable<ScopeId> {
+        pub parent_ids => parent_ids_mut: Option<ScopeId>,
+        pub node_ids => node_ids_mut: NodeId,
+        pub flags => flags_mut: ScopeFlags,
+        pub bloom => bloom_mut: u64,
     }
 }
 
@@ -89,11 +89,11 @@ multi_index_vec! {
     /// Contains spans, flags, scope IDs, and declaration node IDs for all symbols.
     /// Using a single allocation with one `len`/`cap` instead of 4 separate `IndexVec`s
     /// saves memory and CPU.
-    struct SymbolTable<SymbolId> {
-        symbol_spans => symbol_spans_mut: Span,
-        symbol_flags => symbol_flags_mut: SymbolFlags,
-        symbol_scope_ids => symbol_scope_ids_mut: ScopeId,
-        symbol_declarations => symbol_declarations_mut: NodeId,
+    pub struct SymbolTable<SymbolId> {
+        pub symbol_spans => symbol_spans_mut: Span,
+        pub symbol_flags => symbol_flags_mut: SymbolFlags,
+        pub symbol_scope_ids => symbol_scope_ids_mut: ScopeId,
+        pub symbol_declarations => symbol_declarations_mut: NodeId,
     }
 }
 
@@ -119,7 +119,7 @@ use crate::ts_enum::EnumData;
 /// - Nodes that create a scope store the [`ScopeId`] of the scope they create.
 pub struct Scoping {
     /* Symbol Table - single allocation for all symbol-indexed flat fields */
-    symbol_table: SymbolTable,
+    pub(crate) symbol_table: SymbolTable,
 
     pub(crate) references: IndexVec<ReferenceId, Reference>,
 
@@ -130,7 +130,7 @@ pub struct Scoping {
     pub(crate) enum_data: EnumData,
 
     /* Scope Tree - single allocation for all scope-indexed flat fields */
-    scope_table: ScopeTable,
+    pub(crate) scope_table: ScopeTable,
 
     pub(crate) cell: ScopingCell,
 }
@@ -305,15 +305,15 @@ use scoping_cell::ScopingCell;
 
 pub struct ScopingInner<'cell> {
     /* Symbol Table Fields */
-    symbol_names: ArenaVec<'cell, Ident<'cell>>,
-    resolved_references: ArenaVec<'cell, ArenaVec<'cell, ReferenceId>>,
+    pub(crate) symbol_names: ArenaVec<'cell, Ident<'cell>>,
+    pub(crate) resolved_references: ArenaVec<'cell, ArenaVec<'cell, ReferenceId>>,
     /// Redeclarations of a symbol.
     ///
     /// NOTE:
     /// Once a symbol is redeclared, there are at least two entries here. The first
     /// entry is the original symbol information, and the rest are redeclarations.
     /// i.e. `symbol_redeclarations[symbol_id].len() >= 2` always.
-    symbol_redeclarations: FxHashMap<SymbolId, ArenaVec<'cell, Redeclaration>>,
+    pub(crate) symbol_redeclarations: FxHashMap<SymbolId, ArenaVec<'cell, Redeclaration>>,
     /* Scope Tree Fields */
     /// Symbol bindings in a scope.
     ///
@@ -717,14 +717,11 @@ impl Scoping {
         additional_scopes: usize,
     ) {
         self.symbol_table.reserve(additional_symbols);
+        self.references.reserve(additional_references);
+        self.scope_table.reserve(additional_scopes);
         self.cell.with_dependent_mut(|_allocator, cell| {
             cell.symbol_names.reserve_exact(additional_symbols);
             cell.resolved_references.reserve_exact(additional_symbols);
-        });
-        self.references.reserve(additional_references);
-
-        self.scope_table.reserve(additional_scopes);
-        self.cell.with_dependent_mut(|_allocator, cell| {
             cell.bindings.reserve(additional_scopes);
         });
     }
@@ -891,6 +888,7 @@ impl Scoping {
     }
 
     /// Get [`ScopeFlags`] for a new child scope under `parent_scope_id`.
+    #[inline]
     pub fn get_new_scope_flags(&self, flags: ScopeFlags, parent_scope_id: ScopeId) -> ScopeFlags {
         // https://tc39.es/ecma262/#sec-strict-mode-code
         flags | self.scope_flags(parent_scope_id) & ScopeFlags::StrictMode
@@ -936,22 +934,6 @@ impl Scoping {
     pub fn scope_has_binding(&self, scope_id: ScopeId, name: Ident<'_>) -> bool {
         (*self.scope_table.bloom(scope_id) & ident_bloom_bit(name)) != 0
             && self.cell.borrow_dependent().bindings[scope_id].contains_key(&name)
-    }
-
-    /// Fast bloom filter check for whether `scope_id` may contain a binding with `bit`.
-    #[inline]
-    pub(crate) fn scope_may_have_binding(&self, scope_id: ScopeId, bit: u64) -> bool {
-        (*self.scope_table.bloom(scope_id) & bit) != 0
-    }
-
-    /// Look up a binding in `scope_id` after the bloom filter has already matched.
-    #[inline]
-    pub(crate) fn get_binding_unchecked_bloom(
-        &self,
-        scope_id: ScopeId,
-        name: Ident<'_>,
-    ) -> Option<SymbolId> {
-        self.cell.borrow_dependent().bindings[scope_id].get(&name).copied()
     }
 
     /// Move bloom filter bits from `from` scope to `to` scope when swapping catch parameter bindings.

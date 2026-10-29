@@ -32,6 +32,15 @@ impl<'a, C: Config> ParserImpl<'a, C> {
         let start = self.cur_start();
         let opening_span = self.cur_token().span();
         self.expect(Kind::LCurly);
+        if self.at(Kind::RCurly) {
+            self.advance(Kind::RCurly);
+            return FunctionBody::boxed(
+                self.end_span(start),
+                ArenaVec::new_in(self),
+                ArenaVec::new_in(self),
+                self,
+            );
+        }
 
         // Add Return context, remove TopLevel context
         let (directives, statements) = self.context(Context::Return, Context::TopLevel, |p| {
@@ -50,6 +59,17 @@ impl<'a, C: Config> ParserImpl<'a, C> {
         let start = self.cur_start();
         let opening_span = self.cur_token().span();
         self.expect(Kind::LParen);
+        if self.at(Kind::RParen) {
+            self.advance(Kind::RParen);
+            let formal_parameters = FormalParameters::boxed(
+                self.end_span(start),
+                params_kind,
+                ArenaVec::new_in(self),
+                None,
+                self,
+            );
+            return (None, formal_parameters);
+        }
         let this_param = if self.is_ts && self.at(Kind::This) {
             let param = self.parse_ts_this_parameter();
             if !self.at(Kind::RParen) {

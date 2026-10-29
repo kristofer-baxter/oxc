@@ -94,6 +94,22 @@ impl Stats {
         counter.stats
     }
 
+    /// Estimate [`Stats`] in O(1) from source text length and top-level statement count
+    /// when exact node capacity is not required (e.g. `Ancestry` mode).
+    #[inline]
+    pub fn estimate_from_source(program: &Program) -> Self {
+        let len = program.source_text.len();
+        #[expect(clippy::cast_possible_truncation)]
+        let nodes = ((len / 8) + 32).min(u32::MAX as usize) as u32;
+        #[expect(clippy::cast_possible_truncation)]
+        let references = ((len / 32) + 32).min(u32::MAX as usize) as u32;
+        #[expect(clippy::cast_possible_truncation)]
+        let symbols = ((len / 112) + 16).min(u32::MAX as usize) as u32;
+        #[expect(clippy::cast_possible_truncation)]
+        let scopes = ((len / 180) + program.body.len() + 8).min(u32::MAX as usize) as u32;
+        Stats { nodes, scopes, symbols, references }
+    }
+
     /// Increase scope, symbol, and reference counts by provided `excess`.
     ///
     /// `excess` is provided as a fraction.

@@ -4,7 +4,7 @@ use rustc_hash::{FxBuildHasher, FxHashMap};
 use oxc_allocator::GetAddress;
 use oxc_ast::{AstKind, ast::*};
 use oxc_ecmascript::{BoundNames, IsSimpleParameterList, PropName};
-use oxc_span::{Span, best_match};
+use oxc_span::{GetSpan, Span, best_match};
 use oxc_str::Ident;
 use oxc_syntax::{
     class::{ClassId, ElementKind},
@@ -190,13 +190,20 @@ fn may_be_checked_ident(name: &str) -> bool {
 #[inline]
 pub fn check_identifier(name: &str, span: Span, ctx: &SemanticBuilder<'_>) {
     if may_be_checked_ident(name) {
-        check_identifier_slow(name, span, ctx);
+        check_identifier_slow(name, span, ctx, false);
+    }
+}
+
+#[inline]
+pub fn check_identifier_leaf(name: &str, span: Span, ctx: &SemanticBuilder<'_>) {
+    if may_be_checked_ident(name) {
+        check_identifier_slow(name, span, ctx, true);
     }
 }
 
 #[cold]
 #[inline(never)]
-fn check_identifier_slow(name: &str, span: Span, ctx: &SemanticBuilder<'_>) {
+fn check_identifier_slow(name: &str, span: Span, ctx: &SemanticBuilder<'_>, leaf_not_pushed: bool) {
     match name {
         "await" => {
             if ctx.in_ambient_context() {
@@ -222,14 +229,18 @@ fn check_identifier_slow(name: &str, span: Span, ctx: &SemanticBuilder<'_>) {
                 return;
             }
             // It is a Syntax Error if this phrase is contained in strict mode code and the StringValue of IdentifierName is: "implements", "interface", "let", "package", "private", "protected", "public", "static", or "yield".
-            let context =
-                if ctx.ancestry().ancestor_kinds().any(|kind| matches!(kind, AstKind::Class(_))) {
-                    diagnostics::ReservedKeywordContext::Class
-                } else if ctx.source_type.is_module() {
-                    diagnostics::ReservedKeywordContext::Module
-                } else {
-                    diagnostics::ReservedKeywordContext::StrictMode
-                };
+            let start = if leaf_not_pushed { None } else { Some(ctx.ancestry().parent_node_id()) };
+            let context = if ctx
+                .ancestry()
+                .ancestor_kinds_from(start)
+                .any(|kind| matches!(kind, AstKind::Class(_)))
+            {
+                diagnostics::ReservedKeywordContext::Class
+            } else if ctx.source_type.is_module() {
+                diagnostics::ReservedKeywordContext::Module
+            } else {
+                diagnostics::ReservedKeywordContext::StrictMode
+            };
             ctx.error(diagnostics::reserved_keyword(name, span, context));
         }
         _ => {}
@@ -238,8 +249,10 @@ fn check_identifier_slow(name: &str, span: Span, ctx: &SemanticBuilder<'_>) {
 
 fn unexpected_identifier_assign_context(
     ctx: &SemanticBuilder<'_>,
+    leaf_not_pushed: bool,
 ) -> diagnostics::UnexpectedIdentifierAssignContext {
-    if ctx.ancestry().ancestor_kinds().any(|kind| matches!(kind, AstKind::Class(_))) {
+    let start = if leaf_not_pushed { None } else { Some(ctx.ancestry().parent_node_id()) };
+    if ctx.ancestry().ancestor_kinds_from(start).any(|kind| matches!(kind, AstKind::Class(_))) {
         diagnostics::UnexpectedIdentifierAssignContext::Class
     } else if ctx.source_type.is_module() {
         diagnostics::UnexpectedIdentifierAssignContext::Module
@@ -256,13 +269,29 @@ pub fn check_binding_identifier(ident: &BindingIdentifier, ctx: &SemanticBuilder
         || (len == 4 && bytes[0] == b'e' && bytes[1] == b'v')
         || (len == 9 && bytes[0] == b'a' && bytes[1] == b'r')
     {
-        check_binding_identifier_slow(ident, ctx);
+        check_binding_identifier_slow(ident, ctx, false);
+    }
+}
+
+#[inline]
+pub fn check_binding_identifier_leaf(ident: &BindingIdentifier, ctx: &SemanticBuilder<'_>) {
+    let bytes = ident.name.as_bytes();
+    let len = bytes.len();
+    if (len == 3 && bytes[0] == b'l' && bytes[1] == b'e')
+        || (len == 4 && bytes[0] == b'e' && bytes[1] == b'v')
+        || (len == 9 && bytes[0] == b'a' && bytes[1] == b'r')
+    {
+        check_binding_identifier_slow(ident, ctx, true);
     }
 }
 
 #[cold]
 #[inline(never)]
-fn check_binding_identifier_slow(ident: &BindingIdentifier, ctx: &SemanticBuilder<'_>) {
+fn check_binding_identifier_slow(
+    ident: &BindingIdentifier,
+    ctx: &SemanticBuilder<'_>,
+    leaf_not_pushed: bool,
+) {
     // `.d.ts` files do not generate runtime bindings, so TypeScript permits `eval` and
     // `arguments` as binding identifiers even when the declaration file is a module.
     if ctx.source_type.is_typescript_definition() {
@@ -284,11 +313,19 @@ fn check_binding_identifier_slow(ident: &BindingIdentifier, ctx: &SemanticBuilde
             // declare function g({eval, arguments}: {eval: number, arguments: number}): number; // Error
             // declare function h([eval, arguments]: [number, number]): number; // Error
 
-            let parent = ctx.ancestry().parent_kind();
+            let parent = if leaf_not_pushed {
+                ctx.ancestry().current_kind()
+            } else {
+                ctx.ancestry().parent_kind()
+            };
             // Direct rest parameters and destructuring rest elements share the same AST kind.
             let is_direct_rest_parameter = matches!(parent, AstKind::BindingRestElement(_))
                 && matches!(
-                    ctx.ancestry().ancestor_kinds().nth(1),
+                    if leaf_not_pushed {
+                        ctx.ancestry().ancestor_kinds().next()
+                    } else {
+                        ctx.ancestry().ancestor_kinds().nth(1)
+                    },
                     Some(AstKind::FormalParameterRest(_))
                 );
             let is_ok = ctx.in_ambient_context()
@@ -306,14 +343,18 @@ fn check_binding_identifier_slow(ident: &BindingIdentifier, ctx: &SemanticBuilde
                 ctx.error(diagnostics::unexpected_identifier_assign(
                     &ident.name,
                     ident.span,
-                    unexpected_identifier_assign_context(ctx),
+                    unexpected_identifier_assign_context(ctx, leaf_not_pushed),
                 ));
             }
         }
         "let" if !ctx.strict_mode() => {
             // LexicalDeclaration : LetOrConst BindingList ;
             // * It is a Syntax Error if the BoundNames of BindingList contains "let".
-            for node_kind in ctx.ancestry().ancestor_kinds() {
+            for node_kind in ctx.ancestry().ancestor_kinds_from(if leaf_not_pushed {
+                None
+            } else {
+                Some(ctx.ancestry().parent_node_id())
+            }) {
                 match node_kind {
                     AstKind::VariableDeclaration(decl) => {
                         if decl.kind.is_lexical() {
@@ -340,22 +381,39 @@ pub fn check_identifier_reference(ident: &IdentifierReference, ctx: &SemanticBui
     if (len == 4 && bytes[0] == b'e' && bytes[1] == b'v')
         || (len == 9 && bytes[0] == b'a' && bytes[1] == b'r')
     {
-        check_identifier_reference_slow(ident, ctx);
+        check_identifier_reference_slow(ident, ctx, false);
+    }
+}
+
+#[inline]
+pub fn check_identifier_reference_leaf(ident: &IdentifierReference, ctx: &SemanticBuilder<'_>) {
+    let bytes = ident.name.as_bytes();
+    let len = bytes.len();
+    if (len == 4 && bytes[0] == b'e' && bytes[1] == b'v')
+        || (len == 9 && bytes[0] == b'a' && bytes[1] == b'r')
+    {
+        check_identifier_reference_slow(ident, ctx, true);
     }
 }
 
 #[cold]
 #[inline(never)]
-fn check_identifier_reference_slow(ident: &IdentifierReference, ctx: &SemanticBuilder<'_>) {
+fn check_identifier_reference_slow(
+    ident: &IdentifierReference,
+    ctx: &SemanticBuilder<'_>,
+    leaf_not_pushed: bool,
+) {
     // `.d.ts` files are allowed to use `eval` and `arguments` as identifier references
     if ctx.source_type.is_typescript_definition() {
         return;
     }
 
+    let start = if leaf_not_pushed { None } else { Some(ctx.ancestry().parent_node_id()) };
+
     //  Static Semantics: AssignmentTargetType
     //  1. If this IdentifierReference is contained in strict mode code and StringValue of Identifier is "eval" or "arguments", return invalid.
     if matches!(ident.name.as_str(), "arguments" | "eval") && ctx.strict_mode() {
-        for node_kind in ctx.ancestry().ancestor_kinds() {
+        for node_kind in ctx.ancestry().ancestor_kinds_from(start) {
             match node_kind {
                 // Only check for actual assignment contexts, not member expression access
                 AstKind::ObjectAssignmentTarget(_)
@@ -365,7 +423,7 @@ fn check_identifier_reference_slow(ident: &IdentifierReference, ctx: &SemanticBu
                     return ctx.error(diagnostics::unexpected_identifier_assign(
                         &ident.name,
                         ident.span,
-                        unexpected_identifier_assign_context(ctx),
+                        unexpected_identifier_assign_context(ctx, leaf_not_pushed),
                     ));
                 }
                 AstKind::AssignmentExpression(assign_expr) => {
@@ -377,7 +435,7 @@ fn check_identifier_reference_slow(ident: &IdentifierReference, ctx: &SemanticBu
                         return ctx.error(diagnostics::unexpected_identifier_assign(
                             &ident.name,
                             ident.span,
-                            unexpected_identifier_assign_context(ctx),
+                            unexpected_identifier_assign_context(ctx, leaf_not_pushed),
                         ));
                     }
                 }
@@ -395,8 +453,13 @@ fn check_identifier_reference_slow(ident: &IdentifierReference, ctx: &SemanticBu
     //   It is a Syntax Error if ContainsArguments of ClassStaticBlockStatementList is true.
 
     if ident.name == "arguments" {
-        let mut previous_node_address = ctx.ancestry().current_address();
-        for node_kind in ctx.ancestry().ancestor_kinds() {
+        let mut previous_node_address = if leaf_not_pushed {
+            use oxc_allocator::UnstableAddress;
+            ident.unstable_address()
+        } else {
+            ctx.ancestry().current_address()
+        };
+        for node_kind in ctx.ancestry().ancestor_kinds_from(start) {
             match node_kind {
                 AstKind::Function(_) => break,
                 AstKind::PropertyDefinition(prop)
@@ -492,6 +555,20 @@ pub fn check_number_literal(lit: &NumericLiteral, ctx: &SemanticBuilder<'_>) {
 const MIN_STRING_SIZE_FOR_BATCH_CHECK: usize = 16;
 
 pub fn check_string_literal(lit: &StringLiteral, ctx: &SemanticBuilder<'_>) {
+    check_string_literal_impl(lit, ctx, false);
+}
+
+#[inline]
+pub fn check_string_literal_leaf(lit: &StringLiteral, ctx: &SemanticBuilder<'_>) {
+    check_string_literal_impl(lit, ctx, true);
+}
+
+#[inline]
+fn check_string_literal_impl(
+    lit: &StringLiteral,
+    ctx: &SemanticBuilder<'_>,
+    leaf_not_pushed: bool,
+) {
     // 12.9.4.1 Static Semantics: Early Errors
     // EscapeSequence ::
     //   legacy_octalEscapeSequence
@@ -500,7 +577,9 @@ pub fn check_string_literal(lit: &StringLiteral, ctx: &SemanticBuilder<'_>) {
     if (lit.span.size() as usize) == lit.value.len() + 2 || !ctx.strict_mode() {
         return;
     }
-    if matches!(ctx.ancestry().parent_kind(), AstKind::JSXAttribute(_)) {
+    let parent_kind =
+        if leaf_not_pushed { ctx.ancestry().current_kind() } else { ctx.ancestry().parent_kind() };
+    if matches!(parent_kind, AstKind::JSXAttribute(_)) {
         return;
     }
     let raw = lit.span.source_text(ctx.source_text);
@@ -1018,8 +1097,12 @@ pub fn check_class(class: &Class, ctx: &SemanticBuilder<'_>) {
 pub fn check_super(sup: &Super, ctx: &SemanticBuilder<'_>) {
     // `Some` for `super()`, `None` for `super.foo` / `super.bar()` etc
     let super_call_span = match ctx.ancestry().parent_kind() {
-        AstKind::CallExpression(expr) => Some(expr.span),
-        AstKind::NewExpression(expr) => Some(expr.span),
+        AstKind::CallExpression(expr) if matches!(&expr.callee, Expression::Super(s) if s.span == sup.span) => {
+            Some(expr.span)
+        }
+        AstKind::NewExpression(expr) if matches!(&expr.callee, Expression::Super(s) if s.span == sup.span) => {
+            Some(expr.span)
+        }
         _ => None,
     };
 
@@ -1302,12 +1385,20 @@ pub fn check_object_expression(obj_expr: &ObjectExpression, ctx: &SemanticBuilde
         if let ObjectPropertyKind::ObjectProperty(obj_prop) = prop {
             // Skip if not a property definition production:
             // PropertyDefinition : PropertyName : AssignmentExpression
-            if obj_prop.kind != PropertyKind::Init || obj_prop.method {
+            if obj_prop.kind != PropertyKind::Init
+                || obj_prop.method
+                || obj_prop.shorthand
+                || obj_prop.computed
+            {
                 continue;
             }
-            if let Some((prop_name, span)) = prop.prop_name()
-                && prop_name == "__proto__"
-            {
+            let is_proto = match &obj_prop.key {
+                PropertyKey::StaticIdentifier(id) => id.name == oxc_str::static_ident!("__proto__"),
+                PropertyKey::StringLiteral(s) => s.value == "__proto__",
+                _ => false,
+            };
+            if is_proto {
+                let span = obj_prop.key.span();
                 if let Some(prev_span) = prev_proto {
                     ctx.error(diagnostics::redeclaration("__proto__", prev_span, span));
                 }

@@ -42,10 +42,96 @@ impl<'a, C: Config> ParserImpl<'a, C> {
     }
 
     fn parse_object_expression_property(&mut self) -> ObjectPropertyKind<'a> {
-        match self.cur_kind() {
+        let cur = self.cur_kind();
+        if matches!(cur, Kind::Ident | Kind::Str) {
+            let start = self.cur_start();
+            let key = if cur == Kind::Ident {
+                let ident = self.parse_known_identifier_name();
+                PropertyKey::StaticIdentifier(self.alloc(ident))
+            } else {
+                let lit = self.parse_known_literal_string();
+                PropertyKey::StringLiteral(self.alloc(lit))
+            };
+            if self.at(Kind::Colon) {
+                self.advance(Kind::Colon);
+                let value = self.parse_assignment_expression_or_higher();
+                return ObjectPropertyKind::ObjectProperty(ObjectProperty::boxed(
+                    self.end_span(start),
+                    PropertyKind::Init,
+                    key,
+                    value,
+                    /* method */ false,
+                    /* shorthand */ false,
+                    /* computed */ false,
+                    self,
+                ));
+            }
+            return ObjectPropertyKind::ObjectProperty(
+                self.parse_object_literal_element_after_key(start, key, cur == Kind::Ident),
+            );
+        }
+        match cur {
             Kind::Dot3 => ObjectPropertyKind::SpreadProperty(self.parse_spread_element()),
             _ => ObjectPropertyKind::ObjectProperty(self.parse_object_literal_element()),
         }
+    }
+
+    #[inline(never)]
+    fn parse_object_literal_element_after_key(
+        &mut self,
+        start: u32,
+        key: PropertyKey<'a>,
+        token_is_identifier: bool,
+    ) -> ArenaBox<'a, ObjectProperty<'a>> {
+        if matches!(self.cur_kind(), Kind::LParen | Kind::LAngle) {
+            let method = self.parse_method(false, None, FunctionKind::ObjectMethod);
+            return ObjectProperty::boxed(
+                self.end_span(start),
+                PropertyKind::Init,
+                key,
+                Expression::FunctionExpression(method),
+                /* method */ true,
+                /* shorthand */ false,
+                /* computed */ false,
+                self,
+            );
+        }
+        let shorthand = token_is_identifier;
+        let value = if shorthand {
+            let PropertyKey::StaticIdentifier(identifier_name) = &key else {
+                return self.unexpected();
+            };
+            if self.eat(Kind::Eq) {
+                let right = self.parse_assignment_expression_or_higher();
+                let left = AssignmentTarget::new_assignment_target_identifier(
+                    identifier_name.span,
+                    identifier_name.name,
+                    self,
+                );
+                let expr = AssignmentExpression::new(
+                    self.end_span(start),
+                    AssignmentOperator::Assign,
+                    left,
+                    right,
+                    self,
+                );
+                self.state.cover_initialized_name.insert(start, expr);
+            }
+            Expression::new_identifier(identifier_name.span, identifier_name.name, self)
+        } else {
+            self.expect(Kind::Colon);
+            self.parse_assignment_expression_or_higher()
+        };
+        ObjectProperty::boxed(
+            self.end_span(start),
+            PropertyKind::Init,
+            key,
+            value,
+            /* method */ false,
+            shorthand,
+            /* computed */ false,
+            self,
+        )
     }
 
     /// `PropertyDefinition`[Yield, Await]

@@ -493,6 +493,9 @@ pub use modifier_kinds::ModifierKinds;
 impl<C: Config> ParserImpl<'_, C> {
     pub(crate) fn eat_modifiers_before_declaration(&mut self) -> Modifiers {
         let mut modifiers = Modifiers::empty();
+        if !self.cur_kind().is_modifier_kind() {
+            return modifiers;
+        }
         while let Some(modifier_kind) = self.get_modifier() {
             let modifier = Modifier::new(self.cur_start(), modifier_kind);
             self.bump_any();
@@ -529,11 +532,15 @@ impl<C: Config> ParserImpl<'_, C> {
         Modifier::new(start, modifier_kind)
     }
 
+    #[inline]
     pub(crate) fn parse_modifiers(
         &mut self,
         permit_const_as_modifier: bool,
         stop_on_start_of_class_static_block: bool,
     ) -> Modifiers {
+        if !self.cur_kind().is_modifier_kind() {
+            return Modifiers::empty();
+        }
         self.parse_modifiers_from(
             Modifiers::empty(),
             permit_const_as_modifier,
@@ -541,6 +548,7 @@ impl<C: Config> ParserImpl<'_, C> {
         )
     }
 
+    #[inline(never)]
     pub(crate) fn parse_modifiers_from(
         &mut self,
         mut modifiers: Modifiers,

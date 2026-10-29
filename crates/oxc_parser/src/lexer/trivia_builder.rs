@@ -125,7 +125,22 @@ impl<'a> TriviaBuilder<'a> {
         kind: CommentKind,
         source_text: &str,
     ) {
-        self.add_comment(Comment::new(start, end, kind), source_text);
+        self.add_comment_with_license_hint(Comment::new(start, end, kind), source_text, None);
+    }
+
+    pub fn add_block_comment_with_license_hint(
+        &mut self,
+        start: u32,
+        end: u32,
+        kind: CommentKind,
+        source_text: &str,
+        has_license_or_preserve: bool,
+    ) {
+        self.add_comment_with_license_hint(
+            Comment::new(start, end, kind),
+            source_text,
+            Some(has_license_or_preserve),
+        );
     }
 
     // For block comments only. This function is not called after line comments because the lexer skips
@@ -315,7 +330,16 @@ impl<'a> TriviaBuilder<'a> {
         }
     }
 
-    fn add_comment(&mut self, mut comment: Comment, source_text: &str) {
+    fn add_comment(&mut self, comment: Comment, source_text: &str) {
+        self.add_comment_with_license_hint(comment, source_text, None);
+    }
+
+    fn add_comment_with_license_hint(
+        &mut self,
+        mut comment: Comment,
+        source_text: &str,
+        has_license_or_preserve: Option<bool>,
+    ) {
         // The comments array is an ordered vec, only add the comment if its not added before,
         // to avoid situations where the parser needs to rewind and tries to reinsert the comment.
         if let Some(last_comment) = self.comments.last()
@@ -338,7 +362,11 @@ impl<'a> TriviaBuilder<'a> {
             return;
         }
 
-        Self::parse_annotation(&mut comment, source_text);
+        Self::parse_annotation_with_license_hint(
+            &mut comment,
+            source_text,
+            has_license_or_preserve,
+        );
 
         // This newly added comment may be preceded by a newline.
         // Use `saw_newline_for_comment` which tracks newlines since the last comment or token,
@@ -373,7 +401,11 @@ impl<'a> TriviaBuilder<'a> {
     }
 
     /// Parse Notation
-    fn parse_annotation(comment: &mut Comment, source_text: &str) {
+    fn parse_annotation_with_license_hint(
+        comment: &mut Comment,
+        source_text: &str,
+        has_license_or_preserve: Option<bool>,
+    ) {
         let s = comment.content_span().source_text(source_text);
         let bytes = s.as_bytes();
 
@@ -381,6 +413,9 @@ impl<'a> TriviaBuilder<'a> {
         if bytes.is_empty() {
             return;
         }
+
+        let check_license =
+            || has_license_or_preserve.unwrap_or_else(|| contains_license_or_preserve_comment(s));
 
         // Check first byte for quick routing
         match bytes[0] {
@@ -390,8 +425,8 @@ impl<'a> TriviaBuilder<'a> {
             }
             b'*' if comment.is_block() => {
                 // Ignore webpack comment `/*****/`
-                if !bytes.iter().all(|&c| c == b'*') {
-                    if contains_license_or_preserve_comment(s) {
+                if bytes.iter().any(|&c| c != b'*') {
+                    if check_license() {
                         comment.content = CommentContent::JsdocLegal;
                     } else {
                         comment.content = CommentContent::Jsdoc;
@@ -412,17 +447,13 @@ impl<'a> TriviaBuilder<'a> {
             return;
         }
 
-        let rest = &bytes[start..];
-        if (rest.starts_with(b"@__KEY__") || rest.starts_with(b"#__KEY__") || !rest[0].is_ascii())
-            && is_property_key_annotation(s)
-        {
-            comment.content = CommentContent::PropertyKey;
-            return;
-        }
-
         // Fast path: check first non-whitespace byte
         match bytes[start] {
             b'@' => {
+                if bytes[start..].starts_with(b"@__KEY__") && is_property_key_annotation(s) {
+                    comment.content = CommentContent::PropertyKey;
+                    return;
+                }
                 start += 1;
                 if start >= bytes.len() {
                     return;
@@ -442,8 +473,22 @@ impl<'a> TriviaBuilder<'a> {
                 // Continue to check for __PURE__ or __NO_SIDE_EFFECTS__ after @
             }
             b'#' => {
+                if bytes[start..].starts_with(b"#__KEY__") && is_property_key_annotation(s) {
+                    comment.content = CommentContent::PropertyKey;
+                    return;
+                }
                 start += 1;
                 // Continue to check for __PURE__ or __NO_SIDE_EFFECTS__ after #
+            }
+            b if !b.is_ascii() => {
+                if is_property_key_annotation(s) {
+                    comment.content = CommentContent::PropertyKey;
+                    return;
+                }
+                if check_license() {
+                    comment.content = CommentContent::Legal;
+                }
+                return;
             }
             b'w' => {
                 // Check for webpack comments
@@ -486,7 +531,7 @@ impl<'a> TriviaBuilder<'a> {
             }
             _ => {
                 // Check for license/preserve comments in remaining cases
-                if contains_license_or_preserve_comment(s) {
+                if check_license() {
                     comment.content = CommentContent::Legal;
                 }
                 return;
@@ -507,7 +552,7 @@ impl<'a> TriviaBuilder<'a> {
 
         // Fallback: check for @license or @preserve anywhere in the comment
         // This handles cases like /* @foo @preserve */ where the first @ doesn't match known patterns
-        if contains_license_or_preserve_comment(s) {
+        if check_license() {
             comment.content = CommentContent::Legal;
         }
     }
@@ -518,6 +563,8 @@ fn is_property_key_annotation(source: &str) -> bool {
     matches!(source.trim().strip_prefix(['@', '#']), Some("__KEY__"))
 }
 
+/// Check for `@license` or `@preserve` in a single-line comment (`//` or `/* ... */`).
+/// Single-line comments are usually short, so scan directly with `memchr`.
 #[inline(always)]
 fn contains_license_or_preserve_comment(s: &str) -> bool {
     const LICENSE_LEN: usize = b"@license".len();

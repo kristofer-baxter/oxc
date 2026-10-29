@@ -210,7 +210,8 @@ impl SafeByteMatchTable {
 mod simd {
     use std::arch::aarch64::{
         uint8x16_t, vandq_u8, vceqq_u8, vcltq_u8, vdupq_n_u8, vget_lane_u64, vld1q_u8, vmvnq_u8,
-        vorrq_u8, vreinterpret_u64_u8, vreinterpretq_u16_u8, vshrn_n_u16, vsubq_u8,
+        vorrq_u8, vreinterpret_u64_u8, vreinterpretq_u16_u8, vreinterpretq_u64_u8, vshrn_n_u16,
+        vsubq_u8,
     };
 
     #[expect(clippy::inline_always)]
@@ -258,6 +259,49 @@ mod simd {
 
     #[expect(clippy::inline_always)]
     #[inline(always)]
+    pub unsafe fn match_any4_64(ptr: *const u8, b0: u8, b1: u8, b2: u8, b3: u8) -> Option<usize> {
+        // SAFETY: Caller guarantees at least 64 bytes are readable at `ptr`.
+        unsafe {
+            let v_b0 = vdupq_n_u8(b0);
+            let v_b1 = vdupq_n_u8(b1);
+            let v_b2 = vdupq_n_u8(b2);
+            let v_b3 = vdupq_n_u8(b3);
+            macro_rules! mask16 {
+                ($off:expr) => {{
+                    let c = load16(ptr.add($off));
+                    vorrq_u8(
+                        vorrq_u8(vceqq_u8(c, v_b0), vceqq_u8(c, v_b1)),
+                        vorrq_u8(vceqq_u8(c, v_b2), vceqq_u8(c, v_b3)),
+                    )
+                }};
+            }
+            let m0 = mask16!(0);
+            let m1 = mask16!(16);
+            let m2 = mask16!(32);
+            let m3 = mask16!(48);
+            let any = vorrq_u8(vorrq_u8(m0, m1), vorrq_u8(m2, m3));
+            let any64 = crate::lexer::search::simd::vreinterpretq_u64_u8(any);
+            if (std::arch::aarch64::vgetq_lane_u64::<0>(any64)
+                | std::arch::aarch64::vgetq_lane_u64::<1>(any64))
+                == 0
+            {
+                return None;
+            }
+            if let Some(i) = first_true_lane(m0) {
+                return Some(i);
+            }
+            if let Some(i) = first_true_lane(m1) {
+                return Some(16 + i);
+            }
+            if let Some(i) = first_true_lane(m2) {
+                return Some(32 + i);
+            }
+            first_true_lane(m3).map(|i| 48 + i)
+        }
+    }
+
+    #[expect(clippy::inline_always)]
+    #[inline(always)]
     pub unsafe fn match_not4(ptr: *const u8, b0: u8, b1: u8, b2: u8, b3: u8) -> Option<usize> {
         // SAFETY: Caller guarantees at least 16 bytes are readable at `ptr`.
         unsafe {
@@ -292,12 +336,18 @@ mod simd {
 
     #[expect(clippy::inline_always)]
     #[inline(always)]
-    pub unsafe fn match_star_slash(ptr: *const u8) -> Option<usize> {
+    pub unsafe fn match_star_slash_and_at(ptr: *const u8) -> (Option<usize>, u64) {
         // SAFETY: Caller guarantees at least 17 bytes are readable at `ptr`.
         unsafe {
-            let stars = vceqq_u8(load16(ptr), vdupq_n_u8(b'*'));
+            let chunk = load16(ptr);
+            let stars = vceqq_u8(chunk, vdupq_n_u8(b'*'));
             let slashes = vceqq_u8(load16(ptr.add(1)), vdupq_n_u8(b'/'));
-            first_true_lane(vandq_u8(stars, slashes))
+            let end = first_true_lane(vandq_u8(stars, slashes));
+            let at_mask = vceqq_u8(chunk, vdupq_n_u8(b'@'));
+            let at_bits = vget_lane_u64::<0>(vreinterpret_u64_u8(vshrn_n_u16::<4>(
+                vreinterpretq_u16_u8(at_mask),
+            )));
+            (end, at_bits)
         }
     }
 }
@@ -336,6 +386,20 @@ mod simd {
             let m3 = _mm_cmpeq_epi8(chunk, _mm_set1_epi8(b3 as i8));
             let mask = _mm_or_si128(_mm_or_si128(m0, m1), _mm_or_si128(m2, m3));
             first_true_lane(mask)
+        }
+    }
+
+    #[expect(clippy::inline_always, clippy::cast_possible_wrap)]
+    #[inline(always)]
+    pub unsafe fn match_any4_64(ptr: *const u8, b0: u8, b1: u8, b2: u8, b3: u8) -> Option<usize> {
+        // SAFETY: Caller guarantees at least 64 bytes are readable at `ptr`, and SSE2 is mandatory on x86_64.
+        unsafe {
+            for chunk_idx in 0..4 {
+                if let Some(i) = match_any4(ptr.add(chunk_idx * 16), b0, b1, b2, b3) {
+                    return Some(chunk_idx * 16 + i);
+                }
+            }
+            None
         }
     }
 
@@ -391,14 +455,18 @@ mod simd {
         }
     }
 
-    #[expect(clippy::inline_always, clippy::cast_possible_wrap)]
+    #[expect(clippy::inline_always, clippy::cast_possible_wrap, clippy::cast_sign_loss)]
     #[inline(always)]
-    pub unsafe fn match_star_slash(ptr: *const u8) -> Option<usize> {
+    pub unsafe fn match_star_slash_and_at(ptr: *const u8) -> (Option<usize>, u64) {
         // SAFETY: Caller guarantees at least 17 bytes are readable at `ptr`, and SSE2 is mandatory on x86_64.
         unsafe {
-            let stars = _mm_cmpeq_epi8(load16(ptr), _mm_set1_epi8(b'*' as i8));
+            let chunk = load16(ptr);
+            let stars = _mm_cmpeq_epi8(chunk, _mm_set1_epi8(b'*' as i8));
             let slashes = _mm_cmpeq_epi8(load16(ptr.add(1)), _mm_set1_epi8(b'/' as i8));
-            first_true_lane(_mm_and_si128(stars, slashes))
+            let end = first_true_lane(_mm_and_si128(stars, slashes));
+            let at_bits =
+                _mm_movemask_epi8(_mm_cmpeq_epi8(chunk, _mm_set1_epi8(b'@' as i8))) as u32 as u64;
+            (end, at_bits)
         }
     }
 }
@@ -412,6 +480,14 @@ mod simd {
     pub unsafe fn match_any4(ptr: *const u8, b0: u8, b1: u8, b2: u8, b3: u8) -> Option<usize> {
         // SAFETY: Caller guarantees at least 16 bytes are readable at `ptr`.
         let slice = unsafe { std::slice::from_raw_parts(ptr, SEARCH_BATCH_SIZE) };
+        slice.iter().position(|&b| b == b0 || b == b1 || b == b2 || b == b3)
+    }
+
+    #[expect(clippy::inline_always)]
+    #[inline(always)]
+    pub unsafe fn match_any4_64(ptr: *const u8, b0: u8, b1: u8, b2: u8, b3: u8) -> Option<usize> {
+        // SAFETY: Caller guarantees at least 64 bytes are readable at `ptr`.
+        let slice = unsafe { std::slice::from_raw_parts(ptr, SEARCH_BATCH_SIZE * 4) };
         slice.iter().position(|&b| b == b0 || b == b1 || b == b2 || b == b3)
     }
 
@@ -435,14 +511,21 @@ mod simd {
 
     #[expect(clippy::inline_always)]
     #[inline(always)]
-    pub unsafe fn match_star_slash(ptr: *const u8) -> Option<usize> {
+    pub unsafe fn match_star_slash_and_at(ptr: *const u8) -> (Option<usize>, u64) {
         // SAFETY: Caller guarantees at least 17 bytes are readable at `ptr`.
         let slice = unsafe { std::slice::from_raw_parts(ptr, SEARCH_BATCH_SIZE + 1) };
-        (0..SEARCH_BATCH_SIZE).find(|&i| slice[i] == b'*' && slice[i + 1] == b'/')
+        let end = (0..SEARCH_BATCH_SIZE).find(|&i| slice[i] == b'*' && slice[i + 1] == b'/');
+        let mut at_bits = 0u64;
+        for (i, &b) in slice[..SEARCH_BATCH_SIZE].iter().enumerate() {
+            if b == b'@' {
+                at_bits |= 1u64 << i;
+            }
+        }
+        (end, at_bits)
     }
 }
 
-pub(super) use simd::{match_not_ascii_id_continue, match_star_slash};
+pub(super) use simd::{match_any4_64, match_not_ascii_id_continue, match_star_slash_and_at};
 
 /// Macro to create a `SafeByteMatchTable` at compile time.
 ///

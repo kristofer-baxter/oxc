@@ -43,10 +43,21 @@ impl<'a> Binder<'a> for VariableDeclarator<'a> {
         }
 
         if kind.is_lexical() {
-            self.id.bound_names(&mut |ident| {
+            if let BindingPattern::BindingIdentifier(ident) = &self.id {
                 let symbol_id = builder.declare_symbol(ident.span, ident.name, includes, excludes);
                 ident.symbol_id.set(Some(symbol_id));
-            });
+            } else {
+                self.id.bound_names(&mut |ident| {
+                    let symbol_id =
+                        builder.declare_symbol(ident.span, ident.name, includes, excludes);
+                    ident.symbol_id.set(Some(symbol_id));
+                });
+            }
+        } else if builder.current_scope_flags().is_var()
+            && let BindingPattern::BindingIdentifier(ident) = &self.id
+        {
+            let symbol_id = builder.declare_symbol(ident.span, ident.name, includes, excludes);
+            ident.symbol_id.set(Some(symbol_id));
         } else {
             // ------------------ var hosting ------------------
             let mut target_scope_id = builder.current_scope_id;
@@ -216,7 +227,7 @@ impl<'a> Binder<'a> for Function<'a> {
             //
             // { set [function() {}](val) {} }
             //        ^^^^^^^^^^^^^
-            if prop.key.address() == self.unstable_address() {
+            if prop.value.address() != self.unstable_address() {
                 return;
             }
             let flags = builder.scoping.scope_flags_mut(builder.current_scope_id);

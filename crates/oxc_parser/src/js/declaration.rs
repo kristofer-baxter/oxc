@@ -103,8 +103,56 @@ impl<'a, C: Config> ParserImpl<'a, C> {
     ) -> VariableDeclarator<'a> {
         let start = self.cur_start();
 
-        let id = self.parse_binding_pattern();
+        if self.at(Kind::Ident) {
+            let ident = self.parse_plain_binding_identifier();
+            let id = BindingPattern::BindingIdentifier(self.alloc(ident));
+            if !self.is_ts || !matches!(self.cur_kind(), Kind::Colon | Kind::Bang | Kind::Question)
+            {
+                let init = if self.at(Kind::Eq) {
+                    self.advance(Kind::Eq);
+                    Some(self.parse_assignment_expression_or_higher())
+                } else {
+                    None
+                };
+                let decl =
+                    VariableDeclarator::new(self.end_span(start), id, None, init, false, self);
+                if self.ctx.has_ambient()
+                    && let Some(init) = &decl.init
+                    && !kind.is_using()
+                    && !kind.is_const()
+                {
+                    self.error(diagnostics::initializers_not_allowed_in_ambient_contexts(
+                        init.span(),
+                    ));
+                }
+                if decl_parent == VariableDeclarationParent::Statement
+                    && decl.init.is_none()
+                    && !self.ctx.has_ambient()
+                {
+                    if kind == VariableDeclarationKind::Const {
+                        self.error(diagnostics::missing_initializer_in_const(decl.id.span()));
+                    } else if kind.is_using() {
+                        self.error(diagnostics::using_declarations_must_be_initialized(
+                            decl.id.span(),
+                        ));
+                    }
+                }
+                return decl;
+            }
+            return self.parse_variable_declarator_after_id(start, id, decl_parent, kind);
+        }
 
+        let id = self.parse_binding_pattern();
+        self.parse_variable_declarator_after_id(start, id, decl_parent, kind)
+    }
+
+    fn parse_variable_declarator_after_id(
+        &mut self,
+        start: u32,
+        id: BindingPattern<'a>,
+        decl_parent: VariableDeclarationParent,
+        kind: VariableDeclarationKind,
+    ) -> VariableDeclarator<'a> {
         let (type_annotation, definite_start) = if self.is_ts {
             // const x!: number = 1
             //        ^ definite

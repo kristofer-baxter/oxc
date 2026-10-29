@@ -33,10 +33,24 @@ macro_rules! handle_string_literal {
         let after_opening_quote = $lexer.source.position().add(1);
 
         // Consume bytes which are part of string
+        let mut search_start = after_opening_quote;
+        while $lexer.source.end().offset_from(search_start) >= 64 {
+            if let Some(i) = crate::lexer::search::match_any4_64(
+                search_start.slice(64).as_ptr(),
+                $delimiter,
+                b'\\',
+                b'\r',
+                b'\n',
+            ) {
+                search_start = search_start.add(i);
+                break;
+            }
+            search_start = search_start.add(64);
+        }
         let next_byte = byte_search! {
             lexer: $lexer,
             table: $table,
-            start: after_opening_quote,
+            start: search_start,
             handle_eof: {
                 // Unterminated string is invalid JS, so a cold path. Building the diagnostic
                 // out-of-line keeps the `OxcDiagnostic` return buffer out of this handler's

@@ -63,19 +63,22 @@ impl<'a> ModuleRecordBuilder<'a> {
             // Multiple default exports
             // `export default foo`
             // `export { default }`
-            let default_exports = module_record
-                .local_export_entries
-                .iter()
-                .filter_map(|export_entry| export_entry.export_name.default_export_span())
-                .chain(
+            if !module_record.local_export_entries.is_empty()
+                || !module_record.indirect_export_entries.is_empty()
+                || !self.skipped_default_exports.is_empty()
+            {
+                let default_exports =
                     module_record
-                        .indirect_export_entries
+                        .local_export_entries
                         .iter()
-                        .filter_map(|export_entry| export_entry.export_name.default_export_span()),
-                )
-                .chain(self.skipped_default_exports.iter().copied());
-            if default_exports.clone().count() > 1 {
-                errors.push(diagnostics::duplicate_default_export(default_exports.collect()));
+                        .filter_map(|export_entry| export_entry.export_name.default_export_span())
+                        .chain(module_record.indirect_export_entries.iter().filter_map(
+                            |export_entry| export_entry.export_name.default_export_span(),
+                        ))
+                        .chain(self.skipped_default_exports.iter().copied());
+                if default_exports.clone().nth(1).is_some() {
+                    errors.push(diagnostics::duplicate_default_export(default_exports.collect()));
+                }
             }
         }
 
