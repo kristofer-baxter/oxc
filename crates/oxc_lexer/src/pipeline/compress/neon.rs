@@ -7,8 +7,7 @@ use std::{
 use oxc_span::Span;
 
 use crate::{
-    lanes::Lanes,
-    pipeline::cpu::Neon,
+    pipeline::{cpu::Neon, lanes::Lanes},
     token::{TRIVIA_MAX, TRIVIA_MIN, is_trivia_byte, matches_tk, tk},
 };
 
