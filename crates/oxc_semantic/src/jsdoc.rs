@@ -92,6 +92,17 @@ mod test {
             get_jsdocs(&allocator, source_text, symbol, source_type).is_some(),
             "JSDoc should found for\n  {symbol} \nin\n  {source_text}"
         );
+        let ret = Parser::new(&allocator, source_text, source_type.unwrap_or_default()).parse();
+        let semantic_ancestry = SemanticBuilder::new()
+            .with_build_nodes(false)
+            .build(allocator.alloc(ret.program))
+            .semantic;
+        let start = u32::try_from(source_text.find(symbol).unwrap_or(0)).unwrap();
+        let span = Span::sized(start, u32::try_from(symbol.len()).unwrap());
+        assert!(
+            semantic_ancestry.jsdoc().get_all_by_span(span).is_some(),
+            "JSDoc should found in ancestry mode for\n  {symbol} \nin\n  {source_text}"
+        );
     }
 
     fn test_jsdoc_not_found(source_text: &str, symbol: &str) {
@@ -196,6 +207,7 @@ mod test {
                 "f12() {}",
             ),
             ("/** test */ (() => {})", "(() => {})"),
+            ("const x = /** @type {Foo} */ (value);", "(value)"),
             ("/** test */ let v1 = 1", "let v1 = 1"),
             ("let v2a = 1, /** for v2b */ v2b = 2", "v2b = 2"),
             ("/** for v3a */ const v3a = 1, v3b = 2;", "const v3a = 1, v3b = 2;"),

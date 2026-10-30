@@ -350,8 +350,8 @@ impl<'a, C: Config> Lexer<'a, C> {
     }
 
     /// Fast path for common tokens (ASCII identifiers/keywords, single-byte punctuation,
-    /// dots, decimal integers, and common operators) preceded by at most a single space or
-    /// a line break with spaces/tabs/blank lines.
+    /// dots, decimal integers, strings, and common operators) preceded by horizontal spaces/tabs
+    /// or line breaks (`\n` / `\r\n`) with spaces/tabs/blank lines.
     ///
     /// On `None`, lexer state and `self.token` are unchanged so `read_next_token` runs normally.
     #[expect(clippy::inline_always)]

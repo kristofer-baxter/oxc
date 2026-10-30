@@ -7,7 +7,8 @@ use crate::{config::LexerConfig as Config, diagnostics};
 use super::{
     Kind, Lexer,
     search::{
-        SEARCH_BATCH_SIZE, SafeByteMatchTable, byte_search, match_star_slash, safe_byte_match_table,
+        SEARCH_BATCH_SIZE, SafeByteMatchTable, byte_search, match_star_slash_and_at,
+        safe_byte_match_table,
     },
     source::SourcePosition,
 };
@@ -161,33 +162,54 @@ impl<'a, C: Config> Lexer<'a, C> {
 
     fn skip_multi_line_comment_after_line_break(&mut self, pos: SourcePosition<'a>) -> Kind {
         let remaining = self.source.str_from_pos_to_end(pos).as_bytes();
+        // Check if `@license` or `@preserve` occurred before the first line break.
+        let comment_content_start = (self.token.start() + 2) as usize;
+        let first_line_end = self.source.offset_of(pos) as usize;
+        let mut has_license = check_license_in_slice(
+            &self.source.whole().as_bytes()[comment_content_start..first_line_end],
+        );
+
         let mut offset = 0usize;
         while offset + SEARCH_BATCH_SIZE < remaining.len() {
             // SAFETY: `offset + 16 < remaining.len()`, so at least 17 bytes are readable at `ptr`.
-            if let Some(lane) = unsafe { match_star_slash(remaining.as_ptr().add(offset)) } {
+            let (end_lane, at_bits) =
+                unsafe { match_star_slash_and_at(remaining.as_ptr().add(offset)) };
+            if let Some(lane) = end_lane {
+                if !has_license && at_bits != 0 {
+                    has_license = check_at_bits(remaining, offset, lane, at_bits);
+                }
                 // SAFETY: `pos + offset + lane + 2` is end of `*/`, so a valid `SourcePosition`.
                 self.source.set_position(unsafe { pos.add(offset + lane + 2) });
-                self.trivia_builder.add_block_comment(
+                self.trivia_builder.add_block_comment_with_license_hint(
                     self.token.start(),
                     self.offset(),
                     CommentKind::MultiLineBlock,
                     self.source.whole(),
+                    has_license,
                 );
                 return Kind::Skip;
+            }
+            if !has_license && at_bits != 0 {
+                has_license = check_at_bits(remaining, offset, SEARCH_BATCH_SIZE, at_bits);
             }
             offset += SEARCH_BATCH_SIZE;
         }
         while offset + 1 < remaining.len() {
-            if remaining[offset] == b'*' && remaining[offset + 1] == b'/' {
+            let b = remaining[offset];
+            if b == b'*' && remaining[offset + 1] == b'/' {
                 // SAFETY: `pos + offset + 2` is end of `*/`, so a valid `SourcePosition`.
                 self.source.set_position(unsafe { pos.add(offset + 2) });
-                self.trivia_builder.add_block_comment(
+                self.trivia_builder.add_block_comment_with_license_hint(
                     self.token.start(),
                     self.offset(),
                     CommentKind::MultiLineBlock,
                     self.source.whole(),
+                    has_license,
                 );
                 return Kind::Skip;
+            }
+            if !has_license && b == b'@' && matches_license_or_preserve_at(remaining, offset) {
+                has_license = true;
             }
             offset += 1;
         }
@@ -218,4 +240,66 @@ impl<'a, C: Config> Lexer<'a, C> {
         }
         Kind::HashbangComment
     }
+}
+
+#[inline]
+fn matches_license_or_preserve_at(bytes: &[u8], i: usize) -> bool {
+    const LICENSE_LEN: usize = b"@license".len();
+    const PRESERVE_LEN: usize = b"@preserve".len();
+    if bytes.len() - i < LICENSE_LEN {
+        return false;
+    }
+    // SAFETY: `bytes.len() - i >= 8`, and `bytes.len() - i >= 9` is checked before reading byte 8.
+    unsafe {
+        let ptr = bytes.as_ptr().add(i);
+        let word = ptr.cast::<u64>().read_unaligned();
+        word == u64::from_ne_bytes(*b"@license")
+            || (word == u64::from_ne_bytes(*b"@preserv")
+                && bytes.len() - i >= PRESERVE_LEN
+                && *ptr.add(8) == b'e')
+    }
+}
+
+#[inline]
+fn check_license_in_slice(slice: &[u8]) -> bool {
+    for i in memchr::memchr_iter(b'@', slice) {
+        if matches_license_or_preserve_at(slice, i) {
+            return true;
+        }
+    }
+    false
+}
+
+#[inline]
+fn check_at_bits(
+    remaining: &[u8],
+    base_offset: usize,
+    limit_lane: usize,
+    mut at_bits: u64,
+) -> bool {
+    if cfg!(all(target_arch = "aarch64", target_endian = "big")) {
+        // Normalize the four-bit lanes to the little-endian mask layout.
+        at_bits = at_bits.reverse_bits();
+    }
+    while at_bits != 0 {
+        let lane = if cfg!(target_arch = "aarch64") {
+            (at_bits.trailing_zeros() >> 2) as usize
+        } else {
+            at_bits.trailing_zeros() as usize
+        };
+        if lane >= limit_lane {
+            break;
+        }
+        // Check against `remaining` (which includes characters up to `*/`, and `*/` cannot match
+        // `icense` or `preserve`).
+        if matches_license_or_preserve_at(remaining, base_offset + lane) {
+            return true;
+        }
+        if cfg!(target_arch = "aarch64") {
+            at_bits &= !(0xFu64 << (lane * 4));
+        } else {
+            at_bits &= at_bits - 1;
+        }
+    }
+    false
 }

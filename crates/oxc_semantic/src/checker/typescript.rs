@@ -3,6 +3,7 @@ use std::{borrow::Cow, collections::hash_map::Entry};
 use itertools::Itertools;
 use rustc_hash::FxHashMap;
 
+use oxc_allocator::{GetAddress, UnstableAddress};
 use oxc_ast::{AstKind, ast::*};
 use oxc_ecmascript::BoundNames;
 use oxc_span::{GetSpan, Span};
@@ -54,9 +55,17 @@ fn is_allowed_type_predicate_position(ctx: &SemanticBuilder<'_>) -> bool {
     };
 
     match ancestors.next() {
-        Some(AstKind::Function(_)) => match ancestors.next() {
-            Some(AstKind::MethodDefinition(method)) => method.kind.is_method(),
-            Some(AstKind::ObjectProperty(property)) => !property.kind.is_accessor(),
+        Some(AstKind::Function(func)) => match ancestors.next() {
+            Some(AstKind::MethodDefinition(method))
+                if method.value.address() == func.unstable_address() =>
+            {
+                method.kind.is_method()
+            }
+            Some(AstKind::ObjectProperty(property))
+                if property.value.address() == func.unstable_address() =>
+            {
+                !property.kind.is_accessor()
+            }
             _ => true,
         },
         Some(
