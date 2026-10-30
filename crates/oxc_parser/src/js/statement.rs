@@ -122,6 +122,12 @@ impl<'a, C: Config> ParserImpl<'a, C> {
                 self.error(diagnostics::statement_in_ambient_context(stmt.span()));
                 reported_ambient_statement = true;
             }
+            if statements.is_empty()
+                && !is_top_level
+                && (self.at(Kind::RCurly) || self.has_fatal_error())
+            {
+                return (directives, ArenaVec::from_value_in(stmt, self));
+            }
             statements.push(stmt);
         }
 
@@ -282,9 +288,24 @@ impl<'a, C: Config> ParserImpl<'a, C> {
     /// Section 14.2 Block Statement
     pub(crate) fn parse_block(&mut self) -> ArenaBox<'a, BlockStatement<'a>> {
         let start = self.cur_start();
-        let body = self.parse_normal_list(Kind::LCurly, Kind::RCurly, |p| {
-            p.parse_statement_list_item(StatementContext::StatementList)
-        });
+        let opening_span = self.cur_token().span();
+        self.expect(Kind::LCurly);
+        let body = if self.at(Kind::RCurly) || self.has_fatal_error() {
+            ArenaVec::new_in(self)
+        } else {
+            let first = self.parse_statement_list_item(StatementContext::StatementList);
+            if self.at(Kind::RCurly) || self.has_fatal_error() {
+                ArenaVec::from_value_in(first, self)
+            } else {
+                let mut list = ArenaVec::with_capacity_in(4, self);
+                list.push(first);
+                self.parse_normal_list_into(&mut list, Kind::RCurly, |p| {
+                    p.parse_statement_list_item(StatementContext::StatementList)
+                });
+                list
+            }
+        };
+        self.expect_closing(Kind::RCurly, opening_span);
         BlockStatement::boxed(self.end_span(start), body, self)
     }
 

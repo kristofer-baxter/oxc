@@ -330,6 +330,61 @@ Tests are TypeScript files in each package's `test/` directory.
 
 When changing linter codegen files such as `tasks/linter_codegen/**` or generated linter rule runner files under `crates/oxc_linter/src/generated/`, run `cargo lintgen` and `cargo lint-timings` so generated rule metadata and linter timing data stay in sync.
 
+## Performance Engineering & Benchmarking Rules (Lessons Learned)
+
+Every performance optimization in `oxc_parser`, `oxc_lexer`, and `oxc_semantic` must pass the automated Performance & Benchmark Integrity Gate (`just perf-gate` / `.github/scripts/perf-gate.js`) and adhere to the following rules:
+
+### 1. Canonical Benchmark Isolation (Never Time Setup or Pre-Passes)
+
+- **Exclude `Stats::count` from `oxc_semantic` timings (`oxc-project/oxc#28467`)**: `SemanticBuilder::build` calls `Stats::count(program)` when `self.stats` is `None`. In semantic benchmarks (`tasks/benchmark/benches/semantic.rs` and `tasks/benchmark/examples/perf_gate.rs`), always precompute `let stats = Stats::count(&program);` outside the timed section and pass `.with_stats(stats)` so the benchmark measures semantic analysis alone rather than an AST-counting pre-pass.
+- **Never replace `Stats::count` with source-length heuristics**: Heuristic capacity estimators (e.g., dividing `source_text.len()` by fixed constants) appear to speed up `SemanticBuilder::build` only when `with_stats(stats)` is omitted, while inflating heap allocations by >2x (`5.51 MB` -> `11.99 MB` on `antd.js`) and introducing heap reallocations on `pdf.mjs`.
+- **Fresh AST per semantic iteration**: `SemanticBuilder` mutates AST `Cell`s (`node_id`, `scope_id`, `symbol_id`, `reference_id`) in place. Benchmarks must parse a fresh `Program` outside the timed block before each iteration and drop `diagnostics` outside the timed block.
+- **Canonical parser options**: Always benchmark `oxc_parser` with `ParseOptions { parse_regular_expression: true, .. }` across both `enable_ident_hashes: true` and `enable_ident_hashes: false`.
+
+### 2. Memory Allocation & Zero-Reallocation Gate (`cargo allocs`)
+
+- Run `cargo allocs` (`cargo run --release -p oxc_track_memory_allocations`) after any parser, lexer, or semantic change and inspect `tasks/track_memory_allocations/allocs_*.yaml`.
+- **`allocs_semantic.yaml` must maintain `sys reallocs: 0` and `arena reallocs: 0`** on every fixture.
+- Any optimization that increases `sys reallocs`, `arena reallocs`, or grows `sys alloc bytes` / `sys peak growth` by >2% without a corresponding reduction in `arena size` is rejected by `just perf-gate`.
+
+### 3. Instruction-Cache & Code-Size Discipline in `oxc_parser`
+
+- **`Lexer::try_next_token` and `ParserImpl::advance` are instruction-cache critical**: `next_token` is inlined into `advance` / `bump_any` across hundreds of parser call sites. Adding extra token arms or branches inside `try_next_token` bloats `advance` and causes 3-6% parser regressions across large files.
+- **Do not duplicate grammar branches into "fast path + outlined slow path"**: In mutually recursive parser functions (`parse_primary_expression`, `parse_object_expression_property`, `parse_variable_declarator`), duplicating AST construction for common cases increases `.text` instruction bytes and regresses control fixtures (`yui.js`, `kitchen-sink.tsx`, `antd.js`).
+- **Prefer work-reducing transformations**:
+  - Factor shared prefixes so tokens are consumed once (e.g., `#28430`).
+  - Fuse multi-pass scans into a single SIMD pass (e.g., single-pass `match_star_slash_and_at` in `lexer/comment.rs`).
+  - Avoid unnecessary arena allocations on empty constructs (e.g., empty `{}` function bodies in `parse_function_body` returning `ArenaVec::new_in(self)` instead of pre-allocating 4 statements, saving 3,286 arena allocations on `antd.js`).
+  - Track `.text` instruction byte deltas via `just perf-gate --base <ref>`.
+
+### 4. `AncestryStack` Bypasses & `Full`-vs-`Ancestry` Parity in `oxc_semantic`
+
+- **Bypass `AncestryStack` push/pop only on true leaf nodes**: Leaf AST nodes (`IdentifierReference`, `BindingIdentifier`, `IdentifierName`, literals, `ThisExpression`, `TS*Keyword`, `JSXText`, `JSXIdentifier`) have no children and never sit on the ancestry stack during child visitation.
+- **Avoid conditional `AncestryStack` elision on intermediate expression/statement nodes**: Conditionally skipping stack pushes on `StaticMemberExpression`, `BinaryExpression`, `ExpressionStatement`, or `ParenthesizedExpression` adds branch overhead and breaks `AstNodeStoreKind::Full` vs `AstNodeStoreKind::Ancestry` parity (such as JSDoc attachment on `ExpressionStatement`/`ParenthesizedExpression` or TypeScript type-predicate parent checks inside computed accessor keys).
+- **Leaf checker parent indexing**: Because `AncestryStack::ancestor_kinds()` skips `stack.last()` assuming the current node is on top of the stack, any syntax checker called from an unpushed leaf node must start ancestor walks from `None` (top of stack = parent) in `Ancestry` mode and must be covered by `with_build_nodes(false)` vs `with_build_nodes(true)` parity tests in `crates/oxc_semantic/tests/integration/classes.rs` and `crates/oxc_semantic/src/jsdoc.rs`.
+
+### 5. Downstream Bundler Reality Check (`developer-bundler` / HMR / 10k-Module Workloads)
+
+When vendoring `oxc_parser`, `oxc_semantic`, and `oxc_str` into downstream bundlers (`shared-internal-tools/developer-bundler#773` vs `#751`), end-to-end benchmarks across `tldraw` (1 & 5 worktrees) and 12 Vite/Rspack workloads demonstrated two critical constraints:
+
+- **Amdahl's Law after core SIMD/data-structure wins (`#751`)**: Once the 16-byte NEON/SSE2 lexer, `try_next_token`, 512-entry keyword table, `ScopeTable` 64-bit bloom filter, and `AncestryStack` parallel `NodeId` stack are in place, parsing and semantic analysis represent a small fraction of end-to-end bundler `Start to usable` and `Capture and build` (which are dominated by module graph capture, AST transformation, linking, codegen, and browser evaluation). Isolated 1-3% microbenchmark tweaks stay within the end-to-end noise floor (`≈`).
+- **Small-module heap floors & `.text` bloat hurt HMR and 10k-module graphs**:
+  - In `developer-bundler#773` (`kristofer-baxter/oxc@6b3056f7`), `Stats::estimate_from_source` imposed minimum capacity floors (`references >= 32`, `symbols >= 16`, `scopes >= 8`) that, when multiplied by `with_excess_capacity(2.0)` in the bundler pipeline, nearly tripled per-module heap allocations on small files (`RadixUIAdoptionSection.jsx` `sys alloc bytes` `2.75 KB -> 8.19 KB`). Combined with `+9.6 KB` of `.text` instruction bloat from duplicated parser fast paths, this regressed `ecosystem/10000_development-mode_hmr` `Capture and build` by `+7.5%` (`1.44 s -> 1.54 s`) and 1-worktree HMR CPU (`CPU over the additions` `+6.3%`, `CPU over the removals` `+24.5%`).
+  - Therefore, `just perf-gate` enforces:
+    1. **Zero small-module heap inflation**: `allocs_semantic.yaml` and `allocs_parser.yaml` are checked across *every* fixture including `RadixUIAdoptionSection.jsx` (2.5 KB), with a strict `<= 2%` `sys alloc bytes` ceiling.
+    2. **End-to-end per-module bundler pipeline timing**: `perf_gate` measures `parse -> semantic(with_excess_capacity(2.0)) -> transform -> codegen` across both small (`RadixUIAdoptionSection.jsx`) and large (`antd.js`, `checker.ts`) fixtures.
+    3. **Hard `.text` instruction-growth budget**: `.text` instruction growth `> 4 KB` is rejected unless accompanied by at least a `-2.0%` full bundler-pipeline speedup.
+
+### Running the Performance Gate Locally
+
+```bash
+# Run static checks, semantic parity tests, and current benchmark snapshot:
+just perf-gate
+
+# Compare HEAD against a base ref (including allocation & instruction-size gates):
+just perf-gate --base origin/main --run-allocs
+```
+
 ## Notes
 
 - Rapidly evolving project - APIs may change

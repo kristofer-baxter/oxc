@@ -53,7 +53,6 @@ impl<'a, C: Config> ParserImpl<'a, C> {
     }
 
     /// Section [Expression](https://tc39.es/ecma262/#sec-ecmascript-language-expressions)
-    #[inline]
     pub(crate) fn parse_expr(&mut self) -> Expression<'a> {
         let start = self.cur_start();
 
@@ -349,13 +348,6 @@ impl<'a, C: Config> ParserImpl<'a, C> {
             Kind::Super => self.parse_super(),
             Kind::Import => self.parse_import_meta_or_call(),
             Kind::LParen => self.parse_parenthesized_expression(),
-            Kind::Str => {
-                let lit = self.parse_known_literal_string();
-                Expression::StringLiteral(self.alloc(lit))
-            }
-            Kind::Decimal => Expression::NumericLiteral(self.parse_literal_number()),
-            Kind::True | Kind::False => Expression::BooleanLiteral(self.parse_literal_boolean()),
-            Kind::Null => Expression::NullLiteral(self.parse_literal_null()),
             Kind::Slash | Kind::SlashEq => Expression::RegExpLiteral(self.parse_literal_regexp()),
             Kind::At => self.parse_decorated_expression(),
             // Literal, RegularExpressionLiteral
@@ -447,7 +439,6 @@ impl<'a, C: Config> ParserImpl<'a, C> {
 
     /// [Literal Expression](https://tc39.es/ecma262/#prod-Literal)
     /// parses string | true | false | null | number
-    #[inline]
     pub(crate) fn parse_literal_expression(&mut self) -> Expression<'a> {
         let kind = self.cur_kind();
         match kind {
@@ -455,7 +446,6 @@ impl<'a, C: Config> ParserImpl<'a, C> {
                 let lit = self.parse_known_literal_string();
                 Expression::StringLiteral(self.alloc(lit))
             }
-            Kind::Decimal => Expression::NumericLiteral(self.parse_literal_number()),
             Kind::True | Kind::False => Expression::BooleanLiteral(self.parse_literal_boolean()),
             Kind::Null => Expression::NullLiteral(self.parse_literal_null()),
             Kind::DecimalBigInt | Kind::BinaryBigInt | Kind::OctalBigInt | Kind::HexBigInt => {
@@ -481,40 +471,12 @@ impl<'a, C: Config> ParserImpl<'a, C> {
         NullLiteral::boxed(span, self)
     }
 
-    #[expect(clippy::inline_always)]
-    #[inline(always)]
     pub(crate) fn parse_literal_number(&mut self) -> ArenaBox<'a, NumericLiteral<'a>> {
         let token = self.cur_token();
         let span = token.span();
         let kind = token.kind();
-        let src = self.token_source(&token);
+        let src = self.cur_src();
         let has_separator = token.has_separator();
-        if kind == Kind::Decimal && !has_separator && src.len() <= 19 {
-            let mut result = 0_u64;
-            for &b in src.as_bytes() {
-                result = result * 10 + u64::from(b & 15);
-            }
-            self.advance(Kind::Decimal);
-            #[expect(clippy::cast_precision_loss)]
-            return NumericLiteral::boxed(
-                span,
-                result as f64,
-                Some(Str::from(src)),
-                NumberBase::Decimal,
-                self,
-            );
-        }
-        self.parse_literal_number_slow(span, kind, src, has_separator)
-    }
-
-    #[inline(never)]
-    fn parse_literal_number_slow(
-        &mut self,
-        span: Span,
-        kind: Kind,
-        src: &'a str,
-        has_separator: bool,
-    ) -> ArenaBox<'a, NumericLiteral<'a>> {
         let value = match kind {
             Kind::Decimal | Kind::Binary | Kind::Octal | Kind::Hex => {
                 parse_int(src, kind, has_separator)
@@ -1397,17 +1359,6 @@ impl<'a, C: Config> ParserImpl<'a, C> {
         //   AssignmentExpression[+In, ?Yield, ?Await]
         let opening_span = self.cur_token().span();
         self.expect(Kind::LParen);
-        if self.at(Kind::RParen) {
-            self.advance(Kind::RParen);
-            return Expression::new_call_expression(
-                self.end_span(lhs_start),
-                lhs,
-                type_parameters,
-                ArenaVec::new_in(self),
-                optional,
-                self,
-            );
-        }
         let (call_arguments, _) = self.context(Context::In, Context::Decorator, |p| {
             p.parse_delimited_list(
                 Kind::RParen,

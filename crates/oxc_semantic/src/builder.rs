@@ -325,20 +325,19 @@ impl<'a> SemanticBuilder<'a> {
         //
         // If user did not provide existing `Stats`, calculate them by visiting AST.
         #[cfg(debug_assertions)]
-        let (stats, check_stats) = if let Some(stats) = self.stats {
-            (stats, None)
+        let (stats, raw_references, check_stats) = if let Some(stats) = self.stats {
+            (stats, stats.references, None)
         } else {
             let stats = Stats::count(program);
             let stats_with_excess = stats.increase_by(self.excess_capacity);
-            (stats_with_excess, Some(stats))
+            (stats_with_excess, stats.references, Some(stats))
         };
         #[cfg(not(debug_assertions))]
-        let stats = if let Some(stats) = self.stats {
-            stats
-        } else if matches!(self.node_store.kind, AstNodeStoreKind::Ancestry(_)) {
-            Stats::estimate_from_source(program).increase_by(self.excess_capacity)
+        let (stats, raw_references) = if let Some(stats) = self.stats {
+            (stats, stats.references)
         } else {
-            Stats::count(program).increase_by(self.excess_capacity)
+            let raw = Stats::count(program);
+            (raw.increase_by(self.excess_capacity), raw.references)
         };
         self.node_store.reserve(stats.nodes as usize);
         self.scoping.reserve(
@@ -346,7 +345,7 @@ impl<'a> SemanticBuilder<'a> {
             stats.references as usize,
             stats.scopes as usize,
         );
-        self.unresolved_references.reserve_exact(stats.references as usize);
+        self.unresolved_references.reserve_exact(raw_references as usize);
 
         self.class_table_builder.enabled |= self.check_syntax_error;
 
@@ -696,11 +695,12 @@ impl<'a> SemanticBuilder<'a> {
                             }
                             let scope_flags = *scope_table.flags(scope_id);
                             if scope_flags.is_function() && !scope_flags.is_arrow() {
-                                let name = unresolved.name.clone_in(allocator);
-                                root_unresolved
-                                    .entry(name)
-                                    .or_insert_with(|| ArenaVec::new_in(&allocator))
-                                    .push(unresolved.reference_id);
+                                Self::record_unresolved_reference(
+                                    root_unresolved,
+                                    allocator,
+                                    unresolved.name,
+                                    unresolved.reference_id,
+                                );
                                 done = true;
                                 break;
                             }
@@ -710,11 +710,12 @@ impl<'a> SemanticBuilder<'a> {
                             current_scope_id = *scope_table.parent_ids(scope_id);
                         }
                         if !done {
-                            let name = unresolved.name.clone_in(allocator);
-                            root_unresolved
-                                .entry(name)
-                                .or_insert_with(|| ArenaVec::new_in(&allocator))
-                                .push(unresolved.reference_id);
+                            Self::record_unresolved_reference(
+                                root_unresolved,
+                                allocator,
+                                unresolved.name,
+                                unresolved.reference_id,
+                            );
                         }
                         continue;
                     }
@@ -745,14 +746,49 @@ impl<'a> SemanticBuilder<'a> {
                     current_scope_id = *scope_table.parent_ids(scope_id);
                 }
                 if !resolved {
-                    let name = unresolved.name.clone_in(allocator);
-                    root_unresolved
-                        .entry(name)
-                        .or_insert_with(|| ArenaVec::new_in(&allocator))
-                        .push(unresolved.reference_id);
+                    Self::record_unresolved_reference(
+                        root_unresolved,
+                        allocator,
+                        unresolved.name,
+                        unresolved.reference_id,
+                    );
                 }
             }
         });
+    }
+
+    #[inline(never)]
+    fn record_unresolved_reference<'cell>(
+        root_unresolved: &mut crate::scoping::UnresolvedReferences<'cell>,
+        allocator: &'cell oxc_allocator::Allocator,
+        name: Ident<'a>,
+        reference_id: ReferenceId,
+    ) {
+        #[repr(transparent)]
+        struct IdentKey<'k>(Ident<'k>);
+
+        impl std::hash::Hash for IdentKey<'_> {
+            #[inline]
+            fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+                self.0.hash(state);
+            }
+        }
+
+        impl oxc_allocator::hash_map::Equivalent<Ident<'_>> for IdentKey<'_> {
+            #[inline]
+            fn equivalent(&self, key: &Ident<'_>) -> bool {
+                self.0.as_str() == key.as_str()
+            }
+        }
+
+        if let Some(list) = root_unresolved.get_mut(&IdentKey(name)) {
+            list.push(reference_id);
+        } else {
+            root_unresolved.insert(
+                name.clone_in(allocator),
+                ArenaVec::from_array_in([reference_id], &allocator),
+            );
+        }
     }
 
     #[expect(clippy::inline_always)]
@@ -3327,158 +3363,13 @@ impl<'a> Visit<'a> for SemanticBuilder<'a> {
         }
     }
 
-    fn visit_static_member_expression(&mut self, it: &StaticMemberExpression<'a>) {
-        match &self.node_store.kind {
-            AstNodeStoreKind::Full(_) => {
-                let kind = AstKind::StaticMemberExpression(self.alloc(it));
-                self.enter_node(kind);
-                self.visit_span(&it.span);
-                self.visit_expression(&it.object);
-                let prop_id = self.node_store.alloc_node_id();
-                it.property.node_id.set(prop_id);
-                let prop_kind = AstKind::IdentifierName(self.alloc(&it.property));
-                self.create_ast_node(prop_id, prop_kind);
-                self.visit_span(&it.property.span);
-                self.leave_node(prop_kind);
-                self.leave_node(kind);
-            }
-            AstNodeStoreKind::Ancestry(_) => {
-                let node_id = self.node_store.alloc_node_id();
-                it.node_id.set(node_id);
-                let prev_node_id = self.node_store.current_node_id;
-                self.node_store.current_node_id = node_id;
-                self.record_ast_node();
-                // Only push onto the ancestry stack when `it.object` is not an IdentifierReference,
-                // or when `it.object` is `"arguments"` / `"eval"` (whose slow-path checker checks
-                // `m.is_member_expression_kind()`).
-                let needs_stack = self.class_table_builder.current_class_id.is_some()
-                    || match &it.object {
-                        Expression::Identifier(id) => {
-                            let b = id.name.as_bytes();
-                            (b.len() == 4 && b[0] == b'e' && b[1] == b'v')
-                                || (b.len() == 9 && b[0] == b'a' && b[1] == b'r')
-                        }
-                        Expression::StaticMemberExpression(_)
-                        | Expression::ThisExpression(_)
-                        | Expression::StringLiteral(_)
-                        | Expression::NumericLiteral(_)
-                        | Expression::BooleanLiteral(_)
-                        | Expression::NullLiteral(_) => false,
-                        _ => true,
-                    };
-                if needs_stack {
-                    let kind = AstKind::StaticMemberExpression(self.alloc(it));
-                    if let AstNodeStoreKind::Ancestry(stack) = &mut self.node_store.kind {
-                        stack.push(kind, node_id);
-                    }
-                }
-                self.visit_expression(&it.object);
-                if needs_stack && let AstNodeStoreKind::Ancestry(stack) = &mut self.node_store.kind
-                {
-                    stack.pop();
-                }
-                let prop_id = self.node_store.alloc_node_id();
-                it.property.node_id.set(prop_id);
-                self.node_store.current_node_id = prev_node_id;
-            }
-        }
-    }
-
-    fn visit_binary_expression(&mut self, it: &BinaryExpression<'a>) {
-        match &self.node_store.kind {
-            AstNodeStoreKind::Full(_) => {
-                let kind = AstKind::BinaryExpression(self.alloc(it));
-                self.enter_node(kind);
-                self.visit_span(&it.span);
-                self.visit_expression(&it.left);
-                self.visit_expression(&it.right);
-                self.leave_node(kind);
-            }
-            AstNodeStoreKind::Ancestry(_) => {
-                let node_id = self.node_store.alloc_node_id();
-                it.node_id.set(node_id);
-                let prev_node_id = self.node_store.current_node_id;
-                self.node_store.current_node_id = node_id;
-                self.record_ast_node();
-                let in_class = self.class_table_builder.current_class_id.is_some();
-                if in_class {
-                    let kind = AstKind::BinaryExpression(self.alloc(it));
-                    if let AstNodeStoreKind::Ancestry(stack) = &mut self.node_store.kind {
-                        stack.push(kind, node_id);
-                    }
-                }
-                self.visit_expression(&it.left);
-                self.visit_expression(&it.right);
-                if in_class && let AstNodeStoreKind::Ancestry(stack) = &mut self.node_store.kind {
-                    stack.pop();
-                }
-                self.node_store.current_node_id = prev_node_id;
-            }
-        }
-    }
-
     fn visit_expression_statement(&mut self, it: &ExpressionStatement<'a>) {
-        match &self.node_store.kind {
-            AstNodeStoreKind::Full(_) => {
-                let kind = AstKind::ExpressionStatement(self.alloc(it));
-                self.enter_node(kind);
-                control_flow!(self, |cfg| cfg.enter_statement(self.node_store.current_node_id));
-                self.visit_span(&it.span);
-                self.visit_expression(&it.expression);
-                self.leave_node(kind);
-            }
-            AstNodeStoreKind::Ancestry(_) => {
-                #[cfg(feature = "jsdoc")]
-                {
-                    let kind = AstKind::ExpressionStatement(self.alloc(it));
-                    self.jsdoc.retrieve_attached_jsdoc(&kind);
-                }
-                let node_id = self.node_store.alloc_node_id();
-                it.node_id.set(node_id);
-                let prev_node_id = self.node_store.current_node_id;
-                self.node_store.current_node_id = node_id;
-                self.record_ast_node();
-                control_flow!(self, |cfg| cfg.enter_statement(self.node_store.current_node_id));
-                self.visit_expression(&it.expression);
-                self.node_store.current_node_id = prev_node_id;
-            }
-        }
-    }
-
-    fn visit_parenthesized_expression(&mut self, it: &ParenthesizedExpression<'a>) {
-        match &self.node_store.kind {
-            AstNodeStoreKind::Full(_) => {
-                let kind = AstKind::ParenthesizedExpression(self.alloc(it));
-                self.enter_node(kind);
-                self.visit_span(&it.span);
-                self.visit_expression(&it.expression);
-                self.leave_node(kind);
-            }
-            AstNodeStoreKind::Ancestry(_) => {
-                #[cfg(feature = "jsdoc")]
-                {
-                    let kind = AstKind::ParenthesizedExpression(self.alloc(it));
-                    self.jsdoc.retrieve_attached_jsdoc(&kind);
-                }
-                let node_id = self.node_store.alloc_node_id();
-                it.node_id.set(node_id);
-                let prev_node_id = self.node_store.current_node_id;
-                self.node_store.current_node_id = node_id;
-                self.record_ast_node();
-                let in_class = self.class_table_builder.current_class_id.is_some();
-                if in_class {
-                    let kind = AstKind::ParenthesizedExpression(self.alloc(it));
-                    if let AstNodeStoreKind::Ancestry(stack) = &mut self.node_store.kind {
-                        stack.push(kind, node_id);
-                    }
-                }
-                self.visit_expression(&it.expression);
-                if in_class && let AstNodeStoreKind::Ancestry(stack) = &mut self.node_store.kind {
-                    stack.pop();
-                }
-                self.node_store.current_node_id = prev_node_id;
-            }
-        }
+        let kind = AstKind::ExpressionStatement(self.alloc(it));
+        self.enter_node(kind);
+        control_flow!(self, |cfg| cfg.enter_statement(self.node_store.current_node_id));
+        self.visit_span(&it.span);
+        self.visit_expression(&it.expression);
+        self.leave_node(kind);
     }
 
     fn visit_ts_type_reference(&mut self, ty: &TSTypeReference<'a>) {
@@ -3719,7 +3610,41 @@ impl<'a> Visit<'a> for SemanticBuilder<'a> {
         self.enter_ambient_context(it.declare);
         control_flow!(self, |cfg| cfg.enter_statement(self.node_store.current_node_id));
         self.visit_span(&it.span);
-        self.visit_variable_declarators(&it.declarations);
+
+        let (mut includes, excludes) = match it.kind {
+            VariableDeclarationKind::Const
+            | VariableDeclarationKind::Using
+            | VariableDeclarationKind::AwaitUsing => (
+                SymbolFlags::BlockScopedVariable | SymbolFlags::ConstVariable,
+                SymbolFlags::BlockScopedVariableExcludes,
+            ),
+            VariableDeclarationKind::Let => {
+                (SymbolFlags::BlockScopedVariable, SymbolFlags::BlockScopedVariableExcludes)
+            }
+            VariableDeclarationKind::Var => {
+                (SymbolFlags::FunctionScopedVariable, SymbolFlags::FunctionScopedVariableExcludes)
+            }
+        };
+        if it.declare {
+            includes |= SymbolFlags::Ambient;
+        }
+        let is_lexical = it.kind.is_lexical();
+
+        for decl in &it.declarations {
+            let decl_kind = AstKind::VariableDeclarator(self.alloc(decl));
+            self.enter_node(decl_kind);
+            self.bind_variable_declarator_with_flags(decl, is_lexical, includes, excludes);
+            self.visit_span(&decl.span);
+            self.visit_binding_pattern(&decl.id);
+            if let Some(type_annotation) = &decl.type_annotation {
+                self.visit_ts_type_annotation(type_annotation);
+            }
+            if let Some(init) = &decl.init {
+                self.visit_expression(init);
+            }
+            self.leave_node(decl_kind);
+        }
+
         self.leave_node(kind);
         self.leave_ambient_context(it.declare);
     }

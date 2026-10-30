@@ -79,6 +79,10 @@ name = "parser_napi"
 harness = false
 bench = false
 
+[[example]]
+name = "perf_gate"
+required-features = ["compiler"]
+
 # All `oxc_*` dependencies optional as on CI we build each benchmark separately
 # with only the crates it needs, to speed up the builds
 [dependencies]

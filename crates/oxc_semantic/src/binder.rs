@@ -15,6 +15,117 @@ pub trait Binder<'a> {
     fn bind(&self, builder: &mut SemanticBuilder<'a>);
 }
 
+impl<'a> SemanticBuilder<'a> {
+    #[inline]
+    pub(crate) fn bind_variable_declarator_with_flags(
+        &mut self,
+        decl: &VariableDeclarator<'a>,
+        is_lexical: bool,
+        includes: SymbolFlags,
+        excludes: SymbolFlags,
+    ) {
+        if is_lexical {
+            if let BindingPattern::BindingIdentifier(ident) = &decl.id {
+                let symbol_id = self.declare_symbol(ident.span, ident.name, includes, excludes);
+                ident.symbol_id.set(Some(symbol_id));
+            } else {
+                decl.id.bound_names(&mut |ident| {
+                    let symbol_id = self.declare_symbol(ident.span, ident.name, includes, excludes);
+                    ident.symbol_id.set(Some(symbol_id));
+                });
+            }
+        } else if self.current_scope_flags().is_var()
+            && let BindingPattern::BindingIdentifier(ident) = &decl.id
+        {
+            let symbol_id = self.declare_symbol(ident.span, ident.name, includes, excludes);
+            ident.symbol_id.set(Some(symbol_id));
+        } else {
+            self.bind_hoisted_var(decl, includes, excludes);
+        }
+
+        // Save `@__NO_SIDE_EFFECTS__` for function initializers.
+        if let BindingPattern::BindingIdentifier(id) = &decl.id
+            && let Some(symbol_id) = id.symbol_id.get()
+            && let Some(init) = &decl.init
+            && match init {
+                Expression::FunctionExpression(func) => func.pure,
+                Expression::ArrowFunctionExpression(func) => func.pure,
+                _ => false,
+            }
+        {
+            self.scoping.no_side_effects.insert(symbol_id);
+        }
+    }
+
+    #[inline(never)]
+    fn bind_hoisted_var(
+        &mut self,
+        decl: &VariableDeclarator<'a>,
+        includes: SymbolFlags,
+        excludes: SymbolFlags,
+    ) {
+        // ------------------ var hosting ------------------
+        let mut target_scope_id = self.current_scope_id;
+        // Stack-allocated: nesting depth from a `var`/`let`/`const` to the
+        // enclosing function (or program) scope is small in practice — 8
+        // covers almost all real-world cases without heap allocation.
+        let mut var_scope_ids: SmallVec<[ScopeId; 8]> = SmallVec::new();
+
+        // Collect all scopes where variable hoisting can occur
+        for scope_id in self.scoping.scope_ancestors(target_scope_id) {
+            let flags = self.scoping.scope_flags(scope_id);
+            if flags.is_var() {
+                target_scope_id = scope_id;
+                break;
+            }
+            var_scope_ids.push(scope_id);
+        }
+
+        decl.id.bound_names(&mut |ident| {
+            let span = ident.span;
+            let name = ident.name;
+            let mut declared_symbol_id = None;
+
+            for &scope_id in &var_scope_ids {
+                // Type-only bindings (type aliases, interfaces) live in a separate
+                // declaration space, so a hoisted `var` must not merge into them.
+                if let Some(symbol_id) = self.check_redeclaration(scope_id, span, name, excludes)
+                    && self.scoping.symbol_flags(symbol_id).can_be_referenced_by_value()
+                    && self.scoping.symbol_flags(symbol_id).is_value()
+                {
+                    self.add_redeclare_variable(symbol_id, includes, span);
+                    declared_symbol_id = Some(symbol_id);
+
+                    // Hoist current symbol to target scope when it is not already declared
+                    // in the target scope.
+                    if !self.scoping.scope_has_binding(target_scope_id, name) {
+                        // remove current scope binding and add to target scope
+                        // avoid same symbols appear in multi-scopes
+                        self.scoping.remove_binding(scope_id, name);
+                        self.scoping.add_binding(target_scope_id, name, symbol_id);
+                        self.scoping.set_symbol_scope_id(symbol_id, target_scope_id);
+                    }
+                    break;
+                }
+            }
+
+            // If a variable is already declared in the hoisted scopes,
+            // we don't need to create another symbol with the same name
+            // to make sure they point to the same symbol.
+            let symbol_id = declared_symbol_id.unwrap_or_else(|| {
+                self.declare_symbol_on_scope(span, name, target_scope_id, includes, excludes)
+            });
+            ident.symbol_id.set(Some(symbol_id));
+
+            // Finally, add the variable to all hoisted scopes
+            // to support redeclaration checks when declaring variables with the same name later.
+            for &scope_id in &var_scope_ids {
+                self.hoisting_variables.insert((scope_id, name), symbol_id);
+            }
+        });
+    }
+}
+
 impl<'a> Binder<'a> for VariableDeclarator<'a> {
     fn bind(&self, builder: &mut SemanticBuilder<'a>) {
         let AstKind::VariableDeclaration(declaration) = builder.ancestry().parent_kind() else {
@@ -42,97 +153,7 @@ impl<'a> Binder<'a> for VariableDeclarator<'a> {
             includes |= SymbolFlags::Ambient;
         }
 
-        if kind.is_lexical() {
-            if let BindingPattern::BindingIdentifier(ident) = &self.id {
-                let symbol_id = builder.declare_symbol(ident.span, ident.name, includes, excludes);
-                ident.symbol_id.set(Some(symbol_id));
-            } else {
-                self.id.bound_names(&mut |ident| {
-                    let symbol_id =
-                        builder.declare_symbol(ident.span, ident.name, includes, excludes);
-                    ident.symbol_id.set(Some(symbol_id));
-                });
-            }
-        } else if builder.current_scope_flags().is_var()
-            && let BindingPattern::BindingIdentifier(ident) = &self.id
-        {
-            let symbol_id = builder.declare_symbol(ident.span, ident.name, includes, excludes);
-            ident.symbol_id.set(Some(symbol_id));
-        } else {
-            // ------------------ var hosting ------------------
-            let mut target_scope_id = builder.current_scope_id;
-            // Stack-allocated: nesting depth from a `var`/`let`/`const` to the
-            // enclosing function (or program) scope is small in practice — 8
-            // covers almost all real-world cases without heap allocation.
-            let mut var_scope_ids: SmallVec<[ScopeId; 8]> = SmallVec::new();
-
-            // Collect all scopes where variable hoisting can occur
-            for scope_id in builder.scoping.scope_ancestors(target_scope_id) {
-                let flags = builder.scoping.scope_flags(scope_id);
-                if flags.is_var() {
-                    target_scope_id = scope_id;
-                    break;
-                }
-                var_scope_ids.push(scope_id);
-            }
-
-            self.id.bound_names(&mut |ident| {
-                let span = ident.span;
-                let name = ident.name;
-                let mut declared_symbol_id = None;
-
-                for &scope_id in &var_scope_ids {
-                    // Type-only bindings (type aliases, interfaces) live in a separate
-                    // declaration space, so a hoisted `var` must not merge into them.
-                    if let Some(symbol_id) =
-                        builder.check_redeclaration(scope_id, span, name, excludes)
-                        && builder.scoping.symbol_flags(symbol_id).can_be_referenced_by_value()
-                        && builder.scoping.symbol_flags(symbol_id).is_value()
-                    {
-                        builder.add_redeclare_variable(symbol_id, includes, span);
-                        declared_symbol_id = Some(symbol_id);
-
-                        // Hoist current symbol to target scope when it is not already declared
-                        // in the target scope.
-                        if !builder.scoping.scope_has_binding(target_scope_id, name) {
-                            // remove current scope binding and add to target scope
-                            // avoid same symbols appear in multi-scopes
-                            builder.scoping.remove_binding(scope_id, name);
-                            builder.scoping.add_binding(target_scope_id, name, symbol_id);
-                            builder.scoping.set_symbol_scope_id(symbol_id, target_scope_id);
-                        }
-                        break;
-                    }
-                }
-
-                // If a variable is already declared in the hoisted scopes,
-                // we don't need to create another symbol with the same name
-                // to make sure they point to the same symbol.
-                let symbol_id = declared_symbol_id.unwrap_or_else(|| {
-                    builder.declare_symbol_on_scope(span, name, target_scope_id, includes, excludes)
-                });
-                ident.symbol_id.set(Some(symbol_id));
-
-                // Finally, add the variable to all hoisted scopes
-                // to support redeclaration checks when declaring variables with the same name later.
-                for &scope_id in &var_scope_ids {
-                    builder.hoisting_variables.insert((scope_id, name), symbol_id);
-                }
-            });
-        }
-
-        // Save `@__NO_SIDE_EFFECTS__` for function initializers.
-        if let BindingPattern::BindingIdentifier(id) = &self.id
-            && let Some(symbol_id) = id.symbol_id.get()
-            && let Some(init) = &self.init
-            && match init {
-                Expression::FunctionExpression(func) => func.pure,
-                Expression::ArrowFunctionExpression(func) => func.pure,
-                _ => false,
-            }
-        {
-            builder.scoping.no_side_effects.insert(symbol_id);
-        }
+        builder.bind_variable_declarator_with_flags(self, kind.is_lexical(), includes, excludes);
     }
 }
 

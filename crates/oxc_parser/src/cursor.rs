@@ -519,11 +519,9 @@ impl<'a, C: Config> ParserImpl<'a, C> {
         }
         let first = parse_element(self);
         if self.at(close) || self.has_fatal_error() {
-            let mut list = ArenaVec::with_capacity_in(1, self);
-            list.push(first);
-            return (list, None);
+            return (ArenaVec::from_value_in(first, self), None);
         }
-        let mut list = ArenaVec::with_capacity_in(2, self);
+        let mut list = ArenaVec::with_capacity_in(4, self);
         list.push(first);
         let trailing_separator = self.parse_delimited_list_rest(
             &mut list,

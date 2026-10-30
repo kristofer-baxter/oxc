@@ -2,9 +2,15 @@ use std::cell::Cell;
 
 use oxc_ast::{
     AstKind,
-    ast::{BindingIdentifier, IdentifierReference, Program, TSEnumMemberName},
+    ast::{
+        BindingIdentifier, BindingPattern, Expression, IdentifierReference, Program,
+        TSEnumMemberName, TSType,
+    },
 };
-use oxc_ast_visit::{Visit, walk::walk_ts_enum_member_name};
+use oxc_ast_visit::{
+    Visit,
+    walk::{walk_binding_pattern, walk_expression, walk_ts_enum_member_name, walk_ts_type},
+};
 use oxc_syntax::scope::{ScopeFlags, ScopeId};
 
 /// Macro to assert that `left >= right`
@@ -94,22 +100,6 @@ impl Stats {
         counter.stats
     }
 
-    /// Estimate [`Stats`] in O(1) from source text length and top-level statement count
-    /// when exact node capacity is not required (e.g. `Ancestry` mode).
-    #[inline]
-    pub fn estimate_from_source(program: &Program) -> Self {
-        let len = program.source_text.len();
-        #[expect(clippy::cast_possible_truncation)]
-        let nodes = ((len / 8) + 32).min(u32::MAX as usize) as u32;
-        #[expect(clippy::cast_possible_truncation)]
-        let references = ((len / 32) + 32).min(u32::MAX as usize) as u32;
-        #[expect(clippy::cast_possible_truncation)]
-        let symbols = ((len / 112) + 16).min(u32::MAX as usize) as u32;
-        #[expect(clippy::cast_possible_truncation)]
-        let scopes = ((len / 180) + program.body.len() + 8).min(u32::MAX as usize) as u32;
-        Stats { nodes, scopes, symbols, references }
-    }
-
     /// Increase scope, symbol, and reference counts by provided `excess`.
     ///
     /// `excess` is provided as a fraction.
@@ -176,6 +166,71 @@ impl<'a> Visit<'a> for Counter {
     fn visit_identifier_reference(&mut self, _: &IdentifierReference<'a>) {
         self.stats.nodes += 1;
         self.stats.references += 1;
+    }
+
+    #[inline]
+    fn visit_binding_pattern(&mut self, it: &BindingPattern<'a>) {
+        if matches!(it, BindingPattern::BindingIdentifier(_)) {
+            self.stats.nodes += 1;
+            self.stats.symbols += 1;
+        } else {
+            walk_binding_pattern(self, it);
+        }
+    }
+
+    #[inline]
+    fn visit_expression(&mut self, it: &Expression<'a>) {
+        match it {
+            Expression::BooleanLiteral(_)
+            | Expression::NullLiteral(_)
+            | Expression::NumericLiteral(_)
+            | Expression::BigIntLiteral(_)
+            | Expression::RegExpLiteral(_)
+            | Expression::StringLiteral(_)
+            | Expression::Super(_)
+            | Expression::ThisExpression(_) => {
+                self.stats.nodes += 1;
+            }
+            Expression::Identifier(_) => {
+                self.stats.nodes += 1;
+                self.stats.references += 1;
+            }
+            Expression::StaticMemberExpression(member) => {
+                // StaticMemberExpression + its IdentifierName property = 2 nodes
+                self.stats.nodes += 2;
+                let mut obj = &member.object;
+                while let Expression::StaticMemberExpression(inner) = obj {
+                    self.stats.nodes += 2;
+                    obj = &inner.object;
+                }
+                self.visit_expression(obj);
+            }
+            _ => walk_expression(self, it),
+        }
+    }
+
+    #[inline]
+    fn visit_ts_type(&mut self, it: &TSType<'a>) {
+        match it {
+            TSType::TSAnyKeyword(_)
+            | TSType::TSBigIntKeyword(_)
+            | TSType::TSBooleanKeyword(_)
+            | TSType::TSIntrinsicKeyword(_)
+            | TSType::TSNeverKeyword(_)
+            | TSType::TSNullKeyword(_)
+            | TSType::TSNumberKeyword(_)
+            | TSType::TSObjectKeyword(_)
+            | TSType::TSStringKeyword(_)
+            | TSType::TSSymbolKeyword(_)
+            | TSType::TSUndefinedKeyword(_)
+            | TSType::TSUnknownKeyword(_)
+            | TSType::TSVoidKeyword(_)
+            | TSType::TSThisType(_)
+            | TSType::JSDocUnknownType(_) => {
+                self.stats.nodes += 1;
+            }
+            _ => walk_ts_type(self, it),
+        }
     }
 
     #[inline]
