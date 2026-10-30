@@ -50,11 +50,11 @@ impl<'a> AstNodeStore<'a> {
     /// Switch between the two mutually-exclusive modes. Called at construction
     /// before traversal starts.
     pub fn set_build_nodes(&mut self, yes: bool) {
-        self.kind = if yes {
-            AstNodeStoreKind::Full(AstNodes::default())
-        } else {
-            AstNodeStoreKind::Ancestry(AncestryStack::default())
-        };
+        match (&self.kind, yes) {
+            (AstNodeStoreKind::Full(_), true) | (AstNodeStoreKind::Ancestry(_), false) => {}
+            (_, true) => self.kind = AstNodeStoreKind::Full(AstNodes::default()),
+            (_, false) => self.kind = AstNodeStoreKind::Ancestry(AncestryStack::default()),
+        }
     }
 
     /// Number of nodes allocated so far. Source of truth, valid in both modes.

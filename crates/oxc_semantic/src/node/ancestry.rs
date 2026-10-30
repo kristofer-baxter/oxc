@@ -65,6 +65,10 @@ impl Drop for AncestryStack<'_> {
 
 impl<'a> AncestryStack<'a> {
     fn compute_layout(cap: usize) -> Layout {
+        const {
+            assert!(align_of::<AstKind<'static>>() >= align_of::<NodeId>());
+            assert!(size_of::<AstKind<'static>>().is_multiple_of(align_of::<NodeId>()));
+        }
         let kinds_bytes = cap.checked_mul(size_of::<AstKind<'a>>()).expect("capacity overflow");
         let node_ids_bytes = (cap + 1).checked_mul(size_of::<NodeId>()).expect("capacity overflow");
         let total = kinds_bytes.checked_add(node_ids_bytes).expect("capacity overflow");

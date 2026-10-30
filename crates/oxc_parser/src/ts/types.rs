@@ -118,14 +118,16 @@ impl<'a, C: Config> ParserImpl<'a, C> {
             self.ctx = prev_ctx;
         }
         if self.at(Kind::Amp) {
-            let mut types = ArenaVec::from_value_in(ty, self);
+            let mut types = ArenaVec::with_capacity_in(2, self);
+            types.push(ty);
             while self.eat(Kind::Amp) {
                 types.push(self.parse_type_operator_or_higher());
             }
             ty = TSType::new_ts_intersection_type(self.end_span(start), types, self);
         }
         if self.at(Kind::Pipe) {
-            let mut types = ArenaVec::from_value_in(ty, self);
+            let mut types = ArenaVec::with_capacity_in(2, self);
+            types.push(ty);
             while self.eat(Kind::Pipe) {
                 types.push(self.parse_intersection_type_or_higher());
             }
@@ -396,7 +398,8 @@ impl<'a, C: Config> ParserImpl<'a, C> {
     where
         F: Fn(&mut Self) -> TSType<'a>,
     {
-        let mut types = ArenaVec::from_value_in(ty, self);
+        let mut types = ArenaVec::with_capacity_in(if self.at(kind) { 2 } else { 1 }, self);
+        types.push(ty);
         while self.eat(kind) {
             let ty = parse_constituent_type(self);
             types.push(ty);

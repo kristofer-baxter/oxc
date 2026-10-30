@@ -325,18 +325,19 @@ impl<'a> SemanticBuilder<'a> {
         //
         // If user did not provide existing `Stats`, calculate them by visiting AST.
         #[cfg(debug_assertions)]
-        let (stats, check_stats) = if let Some(stats) = self.stats {
-            (stats, None)
+        let (stats, raw_references, check_stats) = if let Some(stats) = self.stats {
+            (stats, stats.references, None)
         } else {
             let stats = Stats::count(program);
             let stats_with_excess = stats.increase_by(self.excess_capacity);
-            (stats_with_excess, Some(stats))
+            (stats_with_excess, stats.references, Some(stats))
         };
         #[cfg(not(debug_assertions))]
-        let stats = if let Some(stats) = self.stats {
-            stats
+        let (stats, raw_references) = if let Some(stats) = self.stats {
+            (stats, stats.references)
         } else {
-            Stats::count(program).increase_by(self.excess_capacity)
+            let raw = Stats::count(program);
+            (raw.increase_by(self.excess_capacity), raw.references)
         };
         self.node_store.reserve(stats.nodes as usize);
         self.scoping.reserve(
@@ -344,7 +345,7 @@ impl<'a> SemanticBuilder<'a> {
             stats.references as usize,
             stats.scopes as usize,
         );
-        self.unresolved_references.reserve_exact(stats.references as usize);
+        self.unresolved_references.reserve_exact(raw_references as usize);
 
         self.class_table_builder.enabled |= self.check_syntax_error;
 
@@ -694,11 +695,12 @@ impl<'a> SemanticBuilder<'a> {
                             }
                             let scope_flags = *scope_table.flags(scope_id);
                             if scope_flags.is_function() && !scope_flags.is_arrow() {
-                                let name = unresolved.name.clone_in(allocator);
-                                root_unresolved
-                                    .entry(name)
-                                    .or_insert_with(|| ArenaVec::new_in(&allocator))
-                                    .push(unresolved.reference_id);
+                                Self::record_unresolved_reference(
+                                    root_unresolved,
+                                    allocator,
+                                    unresolved.name,
+                                    unresolved.reference_id,
+                                );
                                 done = true;
                                 break;
                             }
@@ -708,11 +710,12 @@ impl<'a> SemanticBuilder<'a> {
                             current_scope_id = *scope_table.parent_ids(scope_id);
                         }
                         if !done {
-                            let name = unresolved.name.clone_in(allocator);
-                            root_unresolved
-                                .entry(name)
-                                .or_insert_with(|| ArenaVec::new_in(&allocator))
-                                .push(unresolved.reference_id);
+                            Self::record_unresolved_reference(
+                                root_unresolved,
+                                allocator,
+                                unresolved.name,
+                                unresolved.reference_id,
+                            );
                         }
                         continue;
                     }
@@ -743,14 +746,49 @@ impl<'a> SemanticBuilder<'a> {
                     current_scope_id = *scope_table.parent_ids(scope_id);
                 }
                 if !resolved {
-                    let name = unresolved.name.clone_in(allocator);
-                    root_unresolved
-                        .entry(name)
-                        .or_insert_with(|| ArenaVec::new_in(&allocator))
-                        .push(unresolved.reference_id);
+                    Self::record_unresolved_reference(
+                        root_unresolved,
+                        allocator,
+                        unresolved.name,
+                        unresolved.reference_id,
+                    );
                 }
             }
         });
+    }
+
+    #[inline(never)]
+    fn record_unresolved_reference<'cell>(
+        root_unresolved: &mut crate::scoping::UnresolvedReferences<'cell>,
+        allocator: &'cell oxc_allocator::Allocator,
+        name: Ident<'a>,
+        reference_id: ReferenceId,
+    ) {
+        #[repr(transparent)]
+        struct IdentKey<'k>(Ident<'k>);
+
+        impl std::hash::Hash for IdentKey<'_> {
+            #[inline]
+            fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+                self.0.hash(state);
+            }
+        }
+
+        impl oxc_allocator::hash_map::Equivalent<Ident<'_>> for IdentKey<'_> {
+            #[inline]
+            fn equivalent(&self, key: &Ident<'_>) -> bool {
+                self.0.as_str() == key.as_str()
+            }
+        }
+
+        if let Some(list) = root_unresolved.get_mut(&IdentKey(name)) {
+            list.push(reference_id);
+        } else {
+            root_unresolved.insert(
+                name.clone_in(allocator),
+                ArenaVec::from_array_in([reference_id], &allocator),
+            );
+        }
     }
 
     #[expect(clippy::inline_always)]
