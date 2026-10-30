@@ -277,6 +277,10 @@ fn check_at_bits(
     limit_lane: usize,
     mut at_bits: u64,
 ) -> bool {
+    if cfg!(all(target_arch = "aarch64", target_endian = "big")) {
+        // Normalize the four-bit lanes to the little-endian mask layout.
+        at_bits = at_bits.reverse_bits();
+    }
     while at_bits != 0 {
         let lane = if cfg!(target_arch = "aarch64") {
             (at_bits.trailing_zeros() >> 2) as usize
