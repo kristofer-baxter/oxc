@@ -186,6 +186,7 @@ fn main() {
                 let ret = SemanticBuilder::new_compiler().with_stats(stats).build(&program);
                 let ret = black_box(ret);
                 let diagnostics = ret.diagnostics;
+                drop(ret.semantic);
                 sem_elapsed += s.elapsed();
                 drop(diagnostics);
             }
