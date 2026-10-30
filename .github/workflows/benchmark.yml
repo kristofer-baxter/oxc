@@ -19,6 +19,7 @@ on:
       - "Cargo.lock"
       - "rust-toolchain.toml"
       - ".github/workflows/benchmark.yml"
+      - ".github/scripts/perf-gate.js"
   push:
     branches:
       - main
@@ -102,3 +103,32 @@ jobs:
         with:
           mode: ${{ matrix.mode }}
           run: cargo codspeed run ${{ matrix.component }}
+
+  perf-gate:
+    name: Performance & Benchmark Integrity Gate
+    if: github.repository != 'oxc-project/oxc'
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: taiki-e/checkout-action@7d1e50e93dc4fb3bba58f85018fadf77898aee8b # v1.4.2
+        with:
+          fetch-depth: 0
+
+      - uses: oxc-project/setup-node@f46a72f95efdc55273fcd042d61c84e723b2892c # v1.4.1
+
+      - uses: oxc-project/setup-rust@3d6fb132fbe7cdcb66bf8ec193911c2945369d12 # v1.0.17
+        with:
+          cache-key: perf-gate-macos
+          save-cache: ${{ github.ref_name == 'main' }}
+
+      - name: Run Performance & Benchmark Integrity Gate
+        env:
+          RUSTFLAGS: "-C target-cpu=native"
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          if [ -n "$BASE_SHA" ] && [ "$BASE_SHA" != "0000000000000000000000000000000000000000" ] && git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
+            node .github/scripts/perf-gate.js --base "$BASE_SHA" --run-allocs
+          else
+            node .github/scripts/perf-gate.js --run-allocs
+          fi
+
