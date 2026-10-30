@@ -335,8 +335,6 @@ impl<'a> SemanticBuilder<'a> {
         #[cfg(not(debug_assertions))]
         let stats = if let Some(stats) = self.stats {
             stats
-        } else if matches!(self.node_store.kind, AstNodeStoreKind::Ancestry(_)) {
-            Stats::estimate_from_source(program).increase_by(self.excess_capacity)
         } else {
             Stats::count(program).increase_by(self.excess_capacity)
         };
@@ -3327,158 +3325,13 @@ impl<'a> Visit<'a> for SemanticBuilder<'a> {
         }
     }
 
-    fn visit_static_member_expression(&mut self, it: &StaticMemberExpression<'a>) {
-        match &self.node_store.kind {
-            AstNodeStoreKind::Full(_) => {
-                let kind = AstKind::StaticMemberExpression(self.alloc(it));
-                self.enter_node(kind);
-                self.visit_span(&it.span);
-                self.visit_expression(&it.object);
-                let prop_id = self.node_store.alloc_node_id();
-                it.property.node_id.set(prop_id);
-                let prop_kind = AstKind::IdentifierName(self.alloc(&it.property));
-                self.create_ast_node(prop_id, prop_kind);
-                self.visit_span(&it.property.span);
-                self.leave_node(prop_kind);
-                self.leave_node(kind);
-            }
-            AstNodeStoreKind::Ancestry(_) => {
-                let node_id = self.node_store.alloc_node_id();
-                it.node_id.set(node_id);
-                let prev_node_id = self.node_store.current_node_id;
-                self.node_store.current_node_id = node_id;
-                self.record_ast_node();
-                // Only push onto the ancestry stack when `it.object` is not an IdentifierReference,
-                // or when `it.object` is `"arguments"` / `"eval"` (whose slow-path checker checks
-                // `m.is_member_expression_kind()`).
-                let needs_stack = self.class_table_builder.current_class_id.is_some()
-                    || match &it.object {
-                        Expression::Identifier(id) => {
-                            let b = id.name.as_bytes();
-                            (b.len() == 4 && b[0] == b'e' && b[1] == b'v')
-                                || (b.len() == 9 && b[0] == b'a' && b[1] == b'r')
-                        }
-                        Expression::StaticMemberExpression(_)
-                        | Expression::ThisExpression(_)
-                        | Expression::StringLiteral(_)
-                        | Expression::NumericLiteral(_)
-                        | Expression::BooleanLiteral(_)
-                        | Expression::NullLiteral(_) => false,
-                        _ => true,
-                    };
-                if needs_stack {
-                    let kind = AstKind::StaticMemberExpression(self.alloc(it));
-                    if let AstNodeStoreKind::Ancestry(stack) = &mut self.node_store.kind {
-                        stack.push(kind, node_id);
-                    }
-                }
-                self.visit_expression(&it.object);
-                if needs_stack && let AstNodeStoreKind::Ancestry(stack) = &mut self.node_store.kind
-                {
-                    stack.pop();
-                }
-                let prop_id = self.node_store.alloc_node_id();
-                it.property.node_id.set(prop_id);
-                self.node_store.current_node_id = prev_node_id;
-            }
-        }
-    }
-
-    fn visit_binary_expression(&mut self, it: &BinaryExpression<'a>) {
-        match &self.node_store.kind {
-            AstNodeStoreKind::Full(_) => {
-                let kind = AstKind::BinaryExpression(self.alloc(it));
-                self.enter_node(kind);
-                self.visit_span(&it.span);
-                self.visit_expression(&it.left);
-                self.visit_expression(&it.right);
-                self.leave_node(kind);
-            }
-            AstNodeStoreKind::Ancestry(_) => {
-                let node_id = self.node_store.alloc_node_id();
-                it.node_id.set(node_id);
-                let prev_node_id = self.node_store.current_node_id;
-                self.node_store.current_node_id = node_id;
-                self.record_ast_node();
-                let in_class = self.class_table_builder.current_class_id.is_some();
-                if in_class {
-                    let kind = AstKind::BinaryExpression(self.alloc(it));
-                    if let AstNodeStoreKind::Ancestry(stack) = &mut self.node_store.kind {
-                        stack.push(kind, node_id);
-                    }
-                }
-                self.visit_expression(&it.left);
-                self.visit_expression(&it.right);
-                if in_class && let AstNodeStoreKind::Ancestry(stack) = &mut self.node_store.kind {
-                    stack.pop();
-                }
-                self.node_store.current_node_id = prev_node_id;
-            }
-        }
-    }
-
     fn visit_expression_statement(&mut self, it: &ExpressionStatement<'a>) {
-        match &self.node_store.kind {
-            AstNodeStoreKind::Full(_) => {
-                let kind = AstKind::ExpressionStatement(self.alloc(it));
-                self.enter_node(kind);
-                control_flow!(self, |cfg| cfg.enter_statement(self.node_store.current_node_id));
-                self.visit_span(&it.span);
-                self.visit_expression(&it.expression);
-                self.leave_node(kind);
-            }
-            AstNodeStoreKind::Ancestry(_) => {
-                #[cfg(feature = "jsdoc")]
-                {
-                    let kind = AstKind::ExpressionStatement(self.alloc(it));
-                    self.jsdoc.retrieve_attached_jsdoc(&kind);
-                }
-                let node_id = self.node_store.alloc_node_id();
-                it.node_id.set(node_id);
-                let prev_node_id = self.node_store.current_node_id;
-                self.node_store.current_node_id = node_id;
-                self.record_ast_node();
-                control_flow!(self, |cfg| cfg.enter_statement(self.node_store.current_node_id));
-                self.visit_expression(&it.expression);
-                self.node_store.current_node_id = prev_node_id;
-            }
-        }
-    }
-
-    fn visit_parenthesized_expression(&mut self, it: &ParenthesizedExpression<'a>) {
-        match &self.node_store.kind {
-            AstNodeStoreKind::Full(_) => {
-                let kind = AstKind::ParenthesizedExpression(self.alloc(it));
-                self.enter_node(kind);
-                self.visit_span(&it.span);
-                self.visit_expression(&it.expression);
-                self.leave_node(kind);
-            }
-            AstNodeStoreKind::Ancestry(_) => {
-                #[cfg(feature = "jsdoc")]
-                {
-                    let kind = AstKind::ParenthesizedExpression(self.alloc(it));
-                    self.jsdoc.retrieve_attached_jsdoc(&kind);
-                }
-                let node_id = self.node_store.alloc_node_id();
-                it.node_id.set(node_id);
-                let prev_node_id = self.node_store.current_node_id;
-                self.node_store.current_node_id = node_id;
-                self.record_ast_node();
-                let in_class = self.class_table_builder.current_class_id.is_some();
-                if in_class {
-                    let kind = AstKind::ParenthesizedExpression(self.alloc(it));
-                    if let AstNodeStoreKind::Ancestry(stack) = &mut self.node_store.kind {
-                        stack.push(kind, node_id);
-                    }
-                }
-                self.visit_expression(&it.expression);
-                if in_class && let AstNodeStoreKind::Ancestry(stack) = &mut self.node_store.kind {
-                    stack.pop();
-                }
-                self.node_store.current_node_id = prev_node_id;
-            }
-        }
+        let kind = AstKind::ExpressionStatement(self.alloc(it));
+        self.enter_node(kind);
+        control_flow!(self, |cfg| cfg.enter_statement(self.node_store.current_node_id));
+        self.visit_span(&it.span);
+        self.visit_expression(&it.expression);
+        self.leave_node(kind);
     }
 
     fn visit_ts_type_reference(&mut self, ty: &TSTypeReference<'a>) {
