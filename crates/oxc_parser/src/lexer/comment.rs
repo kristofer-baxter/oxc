@@ -253,8 +253,8 @@ fn matches_license_or_preserve_at(bytes: &[u8], i: usize) -> bool {
     unsafe {
         let ptr = bytes.as_ptr().add(i);
         let word = ptr.cast::<u64>().read_unaligned();
-        word == u64::from_le_bytes(*b"@license")
-            || (word == u64::from_le_bytes(*b"@preserv")
+        word == u64::from_ne_bytes(*b"@license")
+            || (word == u64::from_ne_bytes(*b"@preserv")
                 && bytes.len() - i >= PRESERVE_LEN
                 && *ptr.add(8) == b'e')
     }
