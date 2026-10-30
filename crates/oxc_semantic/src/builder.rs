@@ -3428,6 +3428,11 @@ impl<'a> Visit<'a> for SemanticBuilder<'a> {
                 self.leave_node(kind);
             }
             AstNodeStoreKind::Ancestry(_) => {
+                #[cfg(feature = "jsdoc")]
+                {
+                    let kind = AstKind::ExpressionStatement(self.alloc(it));
+                    self.jsdoc.retrieve_attached_jsdoc(&kind);
+                }
                 let node_id = self.node_store.alloc_node_id();
                 it.node_id.set(node_id);
                 let prev_node_id = self.node_store.current_node_id;
@@ -3450,6 +3455,11 @@ impl<'a> Visit<'a> for SemanticBuilder<'a> {
                 self.leave_node(kind);
             }
             AstNodeStoreKind::Ancestry(_) => {
+                #[cfg(feature = "jsdoc")]
+                {
+                    let kind = AstKind::ParenthesizedExpression(self.alloc(it));
+                    self.jsdoc.retrieve_attached_jsdoc(&kind);
+                }
                 let node_id = self.node_store.alloc_node_id();
                 it.node_id.set(node_id);
                 let prev_node_id = self.node_store.current_node_id;

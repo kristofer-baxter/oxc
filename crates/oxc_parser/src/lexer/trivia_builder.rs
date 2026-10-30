@@ -585,10 +585,10 @@ fn contains_license_or_preserve_comment(s: &str) -> bool {
         // remaining, and when `hay.len() - i >= PRESERVE_LEN` (9), `ptr.add(i + 8)` is in bounds.
         unsafe {
             let word = ptr.add(i).cast::<u64>().read_unaligned();
-            if word == u64::from_le_bytes(*b"@license") {
+            if word == u64::from_ne_bytes(*b"@license") {
                 return true;
             }
-            if word == u64::from_le_bytes(*b"@preserv")
+            if word == u64::from_ne_bytes(*b"@preserv")
                 && hay.len() - i >= PRESERVE_LEN
                 && *ptr.add(i + 8) == b'e'
             {
