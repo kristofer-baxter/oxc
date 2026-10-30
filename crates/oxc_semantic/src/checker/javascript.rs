@@ -57,7 +57,10 @@ pub fn check_unresolved_exports(program: &Program<'_>, ctx: &SemanticBuilder<'_>
 /// also occurs in the VarDeclaredNames or LexicallyDeclaredNames of ModuleItemList.
 /// <https://tc39.es/ecma262/#sec-imports-static-semantics-early-errors>
 pub fn check_import_value_redeclarations(ctx: &SemanticBuilder<'_>) {
-    if !ctx.source_type.is_module() || ctx.source_type.is_typescript() {
+    if !ctx.source_type.is_module()
+        || ctx.source_type.is_typescript()
+        || !ctx.scoping.has_symbol_redeclarations()
+    {
         return;
     }
 
@@ -83,11 +86,22 @@ pub fn check_import_value_redeclarations(ctx: &SemanticBuilder<'_>) {
 
 pub fn check_duplicate_class_elements(ctx: &SemanticBuilder<'_>) {
     let classes = &ctx.class_table_builder.classes;
-    classes.iter_enumerated().for_each(|(class_id, _)| {
+    if classes.len() == 0 {
+        return;
+    }
+    let is_ts = ctx.source_type.is_typescript();
+    let mut defined_elements = FxHashMap::with_hasher(FxBuildHasher);
+    for (class_id, _) in classes.iter_enumerated() {
         let elements = &classes.elements[class_id];
-        let mut defined_elements =
-            FxHashMap::with_capacity_and_hasher(elements.len(), FxBuildHasher);
+        if elements.len() < 2 {
+            continue;
+        }
+        defined_elements.clear();
         for (element_id, element) in elements.iter_enumerated() {
+            // In JavaScript, public class elements cannot produce duplicate errors.
+            if !is_ts && !element.is_private {
+                continue;
+            }
             // Public and private names belong to separate namespaces.
             let previous =
                 defined_elements.entry((&element.name, element.is_private)).or_insert([None; 2]);
@@ -159,7 +173,7 @@ pub fn check_duplicate_class_elements(ctx: &SemanticBuilder<'_>) {
                 }
             }
         }
-    });
+    }
 }
 
 const CHECKED_IDENT_MASK_BY_LEN: [u32; 11] = [
@@ -737,6 +751,9 @@ pub fn check_variable_declarator_redeclaration(
     decl: &VariableDeclarator,
     ctx: &SemanticBuilder<'_>,
 ) {
+    if !ctx.scoping.has_symbol_redeclarations() {
+        return;
+    }
     let AstKind::VariableDeclaration(declaration) = ctx.ancestry().parent_kind() else {
         unreachable!();
     };

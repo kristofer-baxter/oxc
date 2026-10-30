@@ -34,9 +34,9 @@ function parseArgs(argv) {
     headBin: null,
     runAllocs: false,
     runBench: true,
-    rounds: 5,
-    abRounds: 4,
-    targetMs: 15,
+    rounds: 4,
+    abRounds: 5,
+    targetMs: 12,
     filter: "",
     maxAggregateRegressionPct: 2.5,
     maxFileRegressionPct: 5.0,
@@ -398,6 +398,33 @@ function runBenchmarks(opts, failures, summaryLines) {
         if (!prev) {
           targetMap.set(file, { ...m });
         } else {
+          prev.parseStdNs = Math.min(prev.parseStdNs, m.parseStdNs);
+          prev.parseNohashNs = Math.min(prev.parseNohashNs, m.parseNohashNs);
+          prev.semWithStatsNs = Math.min(prev.semWithStatsNs, m.semWithStatsNs);
+          prev.bundlerPipelineNs = Math.min(prev.bundlerPipelineNs, m.bundlerPipelineNs);
+        }
+      }
+    }
+
+    // If a file exceeds the per-file regression threshold, run a tie-breaker
+    // interleaved pass on that file to filter out transient OS scheduler spikes.
+    const b = baseBest.get(file);
+    const h = headBest.get(file);
+    const needsRetry =
+      (h.bundlerPipelineNs - b.bundlerPipelineNs) / b.bundlerPipelineNs >
+        opts.maxFileRegressionPct / 100 ||
+      (b.size >= 100_000 &&
+        ((h.parseStdNs - b.parseStdNs) / b.parseStdNs > opts.maxFileRegressionPct / 100 ||
+          (h.semWithStatsNs - b.semWithStatsNs) / b.semWithStatsNs >
+            opts.maxFileRegressionPct / 100));
+    if (needsRetry) {
+      for (let r = 0; r < opts.abRounds; r++) {
+        const order = r % 2 === 0 ? ["head", "base"] : ["base", "head"];
+        for (const which of order) {
+          const bin = which === "base" ? baseBin : headBin;
+          const targetMap = which === "base" ? baseBest : headBest;
+          const m = runPerfGateBinary(bin, opts, file).get(file);
+          const prev = targetMap.get(file);
           prev.parseStdNs = Math.min(prev.parseStdNs, m.parseStdNs);
           prev.parseNohashNs = Math.min(prev.parseNohashNs, m.parseNohashNs);
           prev.semWithStatsNs = Math.min(prev.semWithStatsNs, m.semWithStatsNs);

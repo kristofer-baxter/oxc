@@ -97,6 +97,29 @@ impl<'a, C: Config> ParserImpl<'a, C> {
         (list, rest)
     }
 
+    #[inline(never)]
+    fn push_formal_parameter(
+        &self,
+        first_param: &mut Option<FormalParameter<'a>>,
+        list: &mut ArenaVec<'a, FormalParameter<'a>>,
+        param: FormalParameter<'a>,
+    ) {
+        if list.is_empty() {
+            if let Some(first) = first_param.take() {
+                let cap = if self.at(Kind::RParen) { 2 } else { 4 };
+                *list = ArenaVec::with_capacity_in(cap, self);
+                list.push(first);
+                list.push(param);
+            } else if self.at(Kind::RParen) {
+                *list = ArenaVec::from_value_in(param, self);
+            } else {
+                *first_param = Some(param);
+            }
+        } else {
+            list.push(param);
+        }
+    }
+
     #[expect(clippy::inline_always)]
     #[inline(always)]
     fn parse_formal_parameters_list_into(
@@ -106,6 +129,7 @@ impl<'a, C: Config> ParserImpl<'a, C> {
         opening_span: Span,
     ) -> Option<ArenaBox<'a, FormalParameterRest<'a>>> {
         let mut rest: Option<ArenaBox<'a, FormalParameterRest<'a>>> = None;
+        let mut first_param: Option<FormalParameter<'a>> = None;
         let mut first = true;
         let mut has_optional = false;
 
@@ -164,7 +188,7 @@ impl<'a, C: Config> ParserImpl<'a, C> {
                             ident_span,
                         ));
                     }
-                    list.push(FormalParameter::new(
+                    let param = FormalParameter::new(
                         ident_span,
                         ArenaVec::new_in(self),
                         pattern,
@@ -175,7 +199,8 @@ impl<'a, C: Config> ParserImpl<'a, C> {
                         false,
                         false,
                         self,
-                    ));
+                    );
+                    self.push_formal_parameter(&mut first_param, list, param);
                     continue;
                 }
                 let optional = self.is_ts && self.eat(Kind::Question);
@@ -203,7 +228,7 @@ impl<'a, C: Config> ParserImpl<'a, C> {
                 } else if has_optional && init.is_none() {
                     self.error(diagnostics::required_parameter_after_optional_parameter(span));
                 }
-                list.push(FormalParameter::new(
+                let param = FormalParameter::new(
                     span,
                     ArenaVec::new_in(self),
                     pattern,
@@ -214,7 +239,8 @@ impl<'a, C: Config> ParserImpl<'a, C> {
                     false,
                     false,
                     self,
-                ));
+                );
+                self.push_formal_parameter(&mut first_param, list, param);
                 continue;
             }
 
@@ -252,8 +278,12 @@ impl<'a, C: Config> ParserImpl<'a, C> {
                         param.span,
                     ));
                 }
-                list.push(param);
+                self.push_formal_parameter(&mut first_param, list, param);
             }
+        }
+
+        if let Some(first) = first_param {
+            *list = ArenaVec::from_value_in(first, self);
         }
 
         rest

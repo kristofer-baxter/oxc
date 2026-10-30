@@ -3572,7 +3572,41 @@ impl<'a> Visit<'a> for SemanticBuilder<'a> {
         self.enter_ambient_context(it.declare);
         control_flow!(self, |cfg| cfg.enter_statement(self.node_store.current_node_id));
         self.visit_span(&it.span);
-        self.visit_variable_declarators(&it.declarations);
+
+        let (mut includes, excludes) = match it.kind {
+            VariableDeclarationKind::Const
+            | VariableDeclarationKind::Using
+            | VariableDeclarationKind::AwaitUsing => (
+                SymbolFlags::BlockScopedVariable | SymbolFlags::ConstVariable,
+                SymbolFlags::BlockScopedVariableExcludes,
+            ),
+            VariableDeclarationKind::Let => {
+                (SymbolFlags::BlockScopedVariable, SymbolFlags::BlockScopedVariableExcludes)
+            }
+            VariableDeclarationKind::Var => {
+                (SymbolFlags::FunctionScopedVariable, SymbolFlags::FunctionScopedVariableExcludes)
+            }
+        };
+        if it.declare {
+            includes |= SymbolFlags::Ambient;
+        }
+        let is_lexical = it.kind.is_lexical();
+
+        for decl in &it.declarations {
+            let decl_kind = AstKind::VariableDeclarator(self.alloc(decl));
+            self.enter_node(decl_kind);
+            self.bind_variable_declarator_with_flags(decl, is_lexical, includes, excludes);
+            self.visit_span(&decl.span);
+            self.visit_binding_pattern(&decl.id);
+            if let Some(type_annotation) = &decl.type_annotation {
+                self.visit_ts_type_annotation(type_annotation);
+            }
+            if let Some(init) = &decl.init {
+                self.visit_expression(init);
+            }
+            self.leave_node(decl_kind);
+        }
+
         self.leave_node(kind);
         self.leave_ambient_context(it.declare);
     }

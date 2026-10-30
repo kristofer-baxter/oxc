@@ -430,15 +430,19 @@ impl Scoping {
     }
 
     #[inline]
+    /// Returns `true` if any symbol in this program has been redeclared.
+    pub fn has_symbol_redeclarations(&self) -> bool {
+        !self.cell.borrow_dependent().symbol_redeclarations.is_empty()
+    }
+
+    #[inline]
     /// Get all redeclarations associated with a symbol.
     pub fn symbol_redeclarations(&self, symbol_id: SymbolId) -> &[Redeclaration] {
-        self.cell.borrow_dependent().symbol_redeclarations.get(&symbol_id).map_or_else(
-            || {
-                static EMPTY: &[Redeclaration] = &[];
-                EMPTY
-            },
-            |v| v.as_slice(),
-        )
+        let map = &self.cell.borrow_dependent().symbol_redeclarations;
+        if map.is_empty() {
+            return &[];
+        }
+        map.get(&symbol_id).map_or(&[], |v| v.as_slice())
     }
 
     #[inline]
