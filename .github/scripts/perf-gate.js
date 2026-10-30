@@ -126,7 +126,7 @@ function checkAllocationInvariants(opts, failures, summaryLines) {
   console.log("==> [2/4] Checking memory allocation & zero-reallocation invariants...");
 
   if (opts.runAllocs) {
-    execSync("cargo run --release -p oxc_track_memory_allocations", { stdio: "inherit" });
+    execSync("cargo allocs", { stdio: "inherit" });
     try {
       execSync("git diff --exit-code tasks/track_memory_allocations/", { stdio: "inherit" });
     } catch {
