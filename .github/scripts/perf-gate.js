@@ -41,6 +41,7 @@ function parseArgs(argv) {
     maxAggregateRegressionPct: 2.5,
     maxFileRegressionPct: 5.0,
     maxHeapGrowthPct: 2.0,
+    maxTextGrowthBytes: 4096,
   };
 
   for (let i = 2; i < argv.length; i++) {
@@ -177,11 +178,11 @@ function checkAllocationInvariants(opts, failures, summaryLines) {
         }
         const baseBytes = baseMetrics["sys alloc bytes"] || 0;
         const headBytes = headMetrics["sys alloc bytes"] || 0;
-        if (baseBytes > 16384) {
+        if (baseBytes > 0) {
           const growthPct = ((headBytes - baseBytes) / baseBytes) * 100;
           if (growthPct > opts.maxHeapGrowthPct) {
             failures.push(
-              `${snap} [${file}]: sys alloc bytes grew by +${growthPct.toFixed(2)}% (${baseBytes} -> ${headBytes}, max allowed +${opts.maxHeapGrowthPct}%).`,
+              `${snap} [${file}]: sys alloc bytes grew by +${growthPct.toFixed(2)}% (${baseBytes} -> ${headBytes}, max allowed +${opts.maxHeapGrowthPct}%). Small-module heap growth directly regresses 10k-module and HMR workloads.`,
             );
           }
         }
@@ -254,6 +255,7 @@ function runPerfGateBinary(binPath, opts, filterFile = "") {
       parseStdNs: Number(parts[3]),
       parseNohashNs: Number(parts[4]),
       semWithStatsNs: Number(parts[5]),
+      bundlerPipelineNs: Number(parts[6]),
     });
   }
   return results;
@@ -348,22 +350,24 @@ function runBenchmarks(opts, failures, summaryLines) {
     summaryLines.push(
       `- **Binary \`.text\` section**: \`${headTextBytes.toLocaleString()} bytes\``,
       "",
-      "| File | Size | Parse (std) | Parse (no-hash) | Semantic (`with_stats`) |",
-      "| :--- | ---: | ---: | ---: | ---: |",
+      "| File | Size | Parse (std) | Parse (no-hash) | Semantic (`with_stats`) | Bundler Pipeline (`parse+sem+xform+codegen`) |",
+      "| :--- | ---: | ---: | ---: | ---: | ---: |",
     );
     let totStd = 0;
     let totNohash = 0;
     let totSem = 0;
+    let totPipe = 0;
     for (const [file, m] of headMap.entries()) {
       totStd += m.parseStdNs;
       totNohash += m.parseNohashNs;
       totSem += m.semWithStatsNs;
+      totPipe += m.bundlerPipelineNs;
       summaryLines.push(
-        `| \`${file}\` | ${(m.size / 1024).toFixed(1)} KB | ${fmtUs(m.parseStdNs)} | ${fmtUs(m.parseNohashNs)} | ${fmtUs(m.semWithStatsNs)} |`,
+        `| \`${file}\` | ${(m.size / 1024).toFixed(1)} KB | ${fmtUs(m.parseStdNs)} | ${fmtUs(m.parseNohashNs)} | ${fmtUs(m.semWithStatsNs)} | ${fmtUs(m.bundlerPipelineNs)} |`,
       );
     }
     summaryLines.push(
-      `| **TOTAL** | | **${fmtMs(totStd)}** | **${fmtMs(totNohash)}** | **${fmtMs(totSem)}** |`,
+      `| **TOTAL** | | **${fmtMs(totStd)}** | **${fmtMs(totNohash)}** | **${fmtMs(totSem)}** | **${fmtMs(totPipe)}** |`,
     );
     return;
   }
@@ -397,6 +401,7 @@ function runBenchmarks(opts, failures, summaryLines) {
           prev.parseStdNs = Math.min(prev.parseStdNs, m.parseStdNs);
           prev.parseNohashNs = Math.min(prev.parseNohashNs, m.parseNohashNs);
           prev.semWithStatsNs = Math.min(prev.semWithStatsNs, m.semWithStatsNs);
+          prev.bundlerPipelineNs = Math.min(prev.bundlerPipelineNs, m.bundlerPipelineNs);
         }
       }
     }
@@ -404,7 +409,7 @@ function runBenchmarks(opts, failures, summaryLines) {
 
   summaryLines.push(
     "",
-    "| File | Base Parse | Head Parse | Diff | Base Parse (no-hash) | Head Parse (no-hash) | Diff | Base Sem (`with_stats`) | Head Sem (`with_stats`) | Diff |",
+    "| File | Base Parse | Head Parse | Diff | Base Sem (`with_stats`) | Head Sem (`with_stats`) | Diff | Base Bundler Pipeline | Head Bundler Pipeline | Diff |",
     "| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
   );
 
@@ -414,6 +419,8 @@ function runBenchmarks(opts, failures, summaryLines) {
   let totHeadNohash = 0;
   let totBaseSem = 0;
   let totHeadSem = 0;
+  let totBasePipe = 0;
+  let totHeadPipe = 0;
 
   for (const file of files) {
     const b = baseBest.get(file);
@@ -424,12 +431,20 @@ function runBenchmarks(opts, failures, summaryLines) {
     totHeadNohash += h.parseNohashNs;
     totBaseSem += b.semWithStatsNs;
     totHeadSem += h.semWithStatsNs;
+    totBasePipe += b.bundlerPipelineNs;
+    totHeadPipe += h.bundlerPipelineNs;
 
     summaryLines.push(
-      `| \`${file}\` | ${fmtUs(b.parseStdNs)} | ${fmtUs(h.parseStdNs)} | ${fmtPct(b.parseStdNs, h.parseStdNs)} | ${fmtUs(b.parseNohashNs)} | ${fmtUs(h.parseNohashNs)} | ${fmtPct(b.parseNohashNs, h.parseNohashNs)} | ${fmtUs(b.semWithStatsNs)} | ${fmtUs(h.semWithStatsNs)} | ${fmtPct(b.semWithStatsNs, h.semWithStatsNs)} |`,
+      `| \`${file}\` | ${fmtUs(b.parseStdNs)} | ${fmtUs(h.parseStdNs)} | ${fmtPct(b.parseStdNs, h.parseStdNs)} | ${fmtUs(b.semWithStatsNs)} | ${fmtUs(h.semWithStatsNs)} | ${fmtPct(b.semWithStatsNs, h.semWithStatsNs)} | ${fmtUs(b.bundlerPipelineNs)} | ${fmtUs(h.bundlerPipelineNs)} | ${fmtPct(b.bundlerPipelineNs, h.bundlerPipelineNs)} |`,
     );
 
-    // Check per-file regression threshold on files >= 100 KB (avoiding sub-microsecond noise on tiny files).
+    const pipeReg = ((h.bundlerPipelineNs - b.bundlerPipelineNs) / b.bundlerPipelineNs) * 100;
+    if (pipeReg > opts.maxFileRegressionPct) {
+      failures.push(
+        `Per-file bundler pipeline regression on ${file}: +${pipeReg.toFixed(1)}% (exceeds +${opts.maxFileRegressionPct}% ceiling).`,
+      );
+    }
+
     if (b.size >= 100_000) {
       const parseReg = ((h.parseStdNs - b.parseStdNs) / b.parseStdNs) * 100;
       const semReg = ((h.semWithStatsNs - b.semWithStatsNs) / b.semWithStatsNs) * 100;
@@ -447,13 +462,23 @@ function runBenchmarks(opts, failures, summaryLines) {
   }
 
   summaryLines.push(
-    `| **TOTAL** | **${fmtMs(totBaseStd)}** | **${fmtMs(totHeadStd)}** | **${fmtPct(totBaseStd, totHeadStd)}** | **${fmtMs(totBaseNohash)}** | **${fmtMs(totHeadNohash)}** | **${fmtPct(totBaseNohash, totHeadNohash)}** | **${fmtMs(totBaseSem)}** | **${fmtMs(totHeadSem)}** | **${fmtPct(totBaseSem, totHeadSem)}** |`,
+    `| **TOTAL** | **${fmtMs(totBaseStd)}** | **${fmtMs(totHeadStd)}** | **${fmtPct(totBaseStd, totHeadStd)}** | **${fmtMs(totBaseSem)}** | **${fmtMs(totHeadSem)}** | **${fmtPct(totBaseSem, totHeadSem)}** | **${fmtMs(totBasePipe)}** | **${fmtMs(totHeadPipe)}** | **${fmtPct(totBasePipe, totHeadPipe)}** |`,
+    "",
+    `- **Parser (no-ident-hash) total**: \`${fmtMs(totBaseNohash)}\` -> \`${fmtMs(totHeadNohash)}\` (\`${fmtPct(totBaseNohash, totHeadNohash)}\`)`,
   );
+
+  const pipeChangePct = ((totHeadPipe - totBasePipe) / totBasePipe) * 100;
+  if (textDeltaBytes > opts.maxTextGrowthBytes && pipeChangePct > -2.0) {
+    failures.push(
+      `Binary .text section grew by +${textDeltaBytes} bytes (max allowed +${opts.maxTextGrowthBytes} bytes) without at least a -2.0% bundler pipeline speedup (measured ${pipeChangePct.toFixed(2)}%). Avoid duplicating fast paths that bloat L1i in downstream bundlers.`,
+    );
+  }
 
   const aggChecks = [
     ["Parser (std)", totBaseStd, totHeadStd],
     ["Parser (no-hash)", totBaseNohash, totHeadNohash],
     ["Semantic (with_stats)", totBaseSem, totHeadSem],
+    ["Bundler Pipeline (parse+sem+xform+codegen)", totBasePipe, totHeadPipe],
   ];
   for (const [label, bTot, hTot] of aggChecks) {
     const regPct = ((hTot - bTot) / bTot) * 100;

@@ -363,6 +363,18 @@ Every performance optimization in `oxc_parser`, `oxc_lexer`, and `oxc_semantic` 
 - **Avoid conditional `AncestryStack` elision on intermediate expression/statement nodes**: Conditionally skipping stack pushes on `StaticMemberExpression`, `BinaryExpression`, `ExpressionStatement`, or `ParenthesizedExpression` adds branch overhead and breaks `AstNodeStoreKind::Full` vs `AstNodeStoreKind::Ancestry` parity (such as JSDoc attachment on `ExpressionStatement`/`ParenthesizedExpression` or TypeScript type-predicate parent checks inside computed accessor keys).
 - **Leaf checker parent indexing**: Because `AncestryStack::ancestor_kinds()` skips `stack.last()` assuming the current node is on top of the stack, any syntax checker called from an unpushed leaf node must start ancestor walks from `None` (top of stack = parent) in `Ancestry` mode and must be covered by `with_build_nodes(false)` vs `with_build_nodes(true)` parity tests in `crates/oxc_semantic/tests/integration/classes.rs` and `crates/oxc_semantic/src/jsdoc.rs`.
 
+### 5. Downstream Bundler Reality Check (`developer-bundler` / HMR / 10k-Module Workloads)
+
+When vendoring `oxc_parser`, `oxc_semantic`, and `oxc_str` into downstream bundlers (`shared-internal-tools/developer-bundler#773` vs `#751`), end-to-end benchmarks across `tldraw` (1 & 5 worktrees) and 12 Vite/Rspack workloads demonstrated two critical constraints:
+
+- **Amdahl's Law after core SIMD/data-structure wins (`#751`)**: Once the 16-byte NEON/SSE2 lexer, `try_next_token`, 512-entry keyword table, `ScopeTable` 64-bit bloom filter, and `AncestryStack` parallel `NodeId` stack are in place, parsing and semantic analysis represent a small fraction of end-to-end bundler `Start to usable` and `Capture and build` (which are dominated by module graph capture, AST transformation, linking, codegen, and browser evaluation). Isolated 1-3% microbenchmark tweaks stay within the end-to-end noise floor (`≈`).
+- **Small-module heap floors & `.text` bloat hurt HMR and 10k-module graphs**:
+  - In `developer-bundler#773` (`kristofer-baxter/oxc@6b3056f7`), `Stats::estimate_from_source` imposed minimum capacity floors (`references >= 32`, `symbols >= 16`, `scopes >= 8`) that, when multiplied by `with_excess_capacity(2.0)` in the bundler pipeline, nearly tripled per-module heap allocations on small files (`RadixUIAdoptionSection.jsx` `sys alloc bytes` `2.75 KB -> 8.19 KB`). Combined with `+9.6 KB` of `.text` instruction bloat from duplicated parser fast paths, this regressed `ecosystem/10000_development-mode_hmr` `Capture and build` by `+7.5%` (`1.44 s -> 1.54 s`) and 1-worktree HMR CPU (`CPU over the additions` `+6.3%`, `CPU over the removals` `+24.5%`).
+  - Therefore, `just perf-gate` enforces:
+    1. **Zero small-module heap inflation**: `allocs_semantic.yaml` and `allocs_parser.yaml` are checked across *every* fixture including `RadixUIAdoptionSection.jsx` (2.5 KB), with a strict `<= 2%` `sys alloc bytes` ceiling.
+    2. **End-to-end per-module bundler pipeline timing**: `perf_gate` measures `parse -> semantic(with_excess_capacity(2.0)) -> transform -> codegen` across both small (`RadixUIAdoptionSection.jsx`) and large (`antd.js`, `checker.ts`) fixtures.
+    3. **Hard `.text` instruction-growth budget**: `.text` instruction growth `> 4 KB` is rejected unless accompanied by at least a `-2.0%` full bundler-pipeline speedup.
+
 ### Running the Performance Gate Locally
 
 ```bash
