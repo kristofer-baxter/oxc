@@ -82,6 +82,8 @@ pub struct SemanticBuilder<'a> {
     pub(crate) current_scope_id: ScopeId,
     pub(crate) module_instance_state_cache: FxHashMap<Address, ModuleInstanceState>,
     current_reference_flags: ReferenceFlags,
+    /// Duplicate-binding exclusions for the parameter list currently being visited.
+    pub(crate) formal_parameter_excludes: SymbolFlags,
     /// Nesting depth of TypeScript ambient contexts.
     ambient_depth: u32,
     /// Symbols that have been hoisted out of a scope (e.g. `var` declarations hoisted to
@@ -150,6 +152,7 @@ impl<'a> SemanticBuilder<'a> {
             source_type: SourceType::default(),
             errors: RefCell::new(Diagnostics::new()),
             current_reference_flags: ReferenceFlags::empty(),
+            formal_parameter_excludes: SymbolFlags::FunctionScopedVariableExcludes,
             ambient_depth: 0,
             current_scope_id,
             module_instance_state_cache: FxHashMap::default(),
@@ -2828,13 +2831,7 @@ impl<'a> Visit<'a> for SemanticBuilder<'a> {
         }
         self.visit_property_key(&method.key);
         self.current_reference_flags = ReferenceFlags::empty();
-        let flags = match method.kind {
-            MethodDefinitionKind::Get => ScopeFlags::Function | ScopeFlags::GetAccessor,
-            MethodDefinitionKind::Set => ScopeFlags::Function | ScopeFlags::SetAccessor,
-            MethodDefinitionKind::Constructor => ScopeFlags::Function | ScopeFlags::Constructor,
-            MethodDefinitionKind::Method => ScopeFlags::Function,
-        };
-        self.visit_function(&method.value, flags);
+        self.visit_function(&method.value, method.kind.scope_flags());
         self.leave_node(kind);
     }
 
@@ -2986,6 +2983,7 @@ impl<'a> Visit<'a> for SemanticBuilder<'a> {
             } else {
                 SymbolFlags::FunctionScopedVariableExcludes
             };
+            let prev_excludes = mem::replace(&mut self.formal_parameter_excludes, excludes);
 
             for param in &params.items {
                 let param_kind = AstKind::FormalParameter(self.alloc(param));
@@ -3026,6 +3024,7 @@ impl<'a> Visit<'a> for SemanticBuilder<'a> {
                 }
                 self.leave_node(rest_kind);
             }
+            self.formal_parameter_excludes = prev_excludes;
         }
 
         self.leave_node(kind);
@@ -3584,6 +3583,17 @@ impl<'a> Visit<'a> for SemanticBuilder<'a> {
         self.leave_node(kind);
     }
 
+    fn visit_ts_type_assertion(&mut self, it: &TSTypeAssertion<'a>) {
+        let kind = AstKind::TSTypeAssertion(self.alloc(it));
+        self.enter_node(kind);
+        self.visit_span(&it.span);
+        // The type annotation must not consume the asserted expression's reference flags.
+        let reference_flags = mem::take(&mut self.current_reference_flags);
+        self.visit_ts_type(&it.type_annotation);
+        self.current_reference_flags = reference_flags;
+        self.visit_expression(&it.expression);
+        self.leave_node(kind);
+    }
     fn visit_ts_qualified_name(&mut self, name: &TSQualifiedName<'a>) {
         let kind = AstKind::TSQualifiedName(self.alloc(name));
         self.enter_node(kind);
