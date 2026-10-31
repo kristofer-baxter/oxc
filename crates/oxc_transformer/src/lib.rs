@@ -136,10 +136,37 @@ impl<'a> Transformer<'a> {
     ) -> TransformerReturn {
         let allocator = self.allocator;
 
-        let ast_builder = AstBuilder::new(allocator);
-
         self.state.source_type = program.source_type;
         self.state.source_text = program.source_text;
+
+        if self.jsx.display_name_plugin && !may_have_react_display_name_target(&scoping) {
+            self.jsx.display_name_plugin = false;
+        }
+
+        if !program.source_type.is_typescript()
+            && !program.source_type.is_jsx()
+            && !self.decorator.legacy
+            && !self.decorator.emit_decorator_metadata
+            && self.plugins.styled_components.is_none()
+            && !self.plugins.tagged_template_transform
+            && !self.jsx.display_name_plugin
+            && self.jsx.refresh.is_none()
+            && !self.env.has_any_enabled()
+            && !self.state.assumptions.object_rest_no_symbols
+            && !self.state.assumptions.ignore_function_length
+        {
+            if self.jsx.jsx_plugin || self.jsx.development {
+                program.source_type = program.source_type.with_standard(true);
+            }
+            #[expect(deprecated)]
+            return TransformerReturn {
+                diagnostics: self.state.take_errors().into(),
+                scoping,
+                helpers_used: FxHashMap::default(),
+            };
+        }
+
+        let ast_builder = AstBuilder::new(allocator);
 
         if program.source_type.is_jsx()
             && let Some(first_statement) = program.body.first()
@@ -156,20 +183,40 @@ impl<'a> Transformer<'a> {
             );
         }
 
+        let common = Common::new(&self.env);
+        let has_es_expression_transforms = common.has_arrow_converter()
+            || self.plugins.styled_components.is_some()
+            || self.plugins.tagged_template_transform
+            || self.env.es2022.class_static_block
+            || self.env.es2022.class_properties.is_some()
+            || self.env.es2021.logical_assignment_operators
+            || self.env.es2020.nullish_coalescing_operator
+            || self.env.es2020.optional_chaining
+            || self.env.es2018.object_rest_spread.is_some()
+            || self.env.es2016.exponentiation_operator
+            || self.env.regexp.has_any_enabled();
+        let x1_jsx = Jsx::new(
+            self.jsx,
+            self.env.es2018.object_rest_spread,
+            &ast_builder,
+            program.source_type,
+        );
+        let has_es_exit_expression_transforms = common.has_arrow_converter()
+            || x1_jsx.has_refresh()
+            || self.env.es2022.class_static_block
+            || self.env.es2022.class_properties.is_some()
+            || self.env.es2018.async_generator_functions
+            || self.env.es2017.async_to_generator;
+
         let mut transformer = TransformerImpl {
-            common: Common::new(&self.env),
+            common,
             decorator: Decorator::new(self.decorator),
             plugins: Plugins::new(self.plugins),
             x0_typescript: program
                 .source_type
                 .is_typescript()
                 .then(|| TypeScript::new(&self.typescript, &self.state)),
-            x1_jsx: Jsx::new(
-                self.jsx,
-                self.env.es2018.object_rest_spread,
-                &ast_builder,
-                program.source_type,
-            ),
+            x1_jsx,
             x2_es2026: ES2026::new(self.env.es2026),
             x2_es2022: ES2022::new(
                 self.env.es2022,
@@ -184,6 +231,8 @@ impl<'a> Transformer<'a> {
             x2_es2017: ES2017::new(self.env.es2017),
             x3_es2015: ES2015::new(self.env.es2015),
             x4_regexp: RegExp::new(self.env.regexp),
+            has_es_expression_transforms,
+            has_es_exit_expression_transforms,
         };
 
         let mut reusable_ctx = ReusableTraverseCtx::new(self.state, scoping, allocator);
@@ -194,6 +243,19 @@ impl<'a> Transformer<'a> {
         #[expect(deprecated)]
         TransformerReturn { diagnostics, scoping, helpers_used }
     }
+}
+
+/// Fast pre-check for `@babel/plugin-transform-react-display-name`, which only acts on
+/// `React.createClass({...})`, `React["createClass"]({...})`, or `createReactClass({...})`.
+/// Both patterns require an `IdentifierReference` to `"React"` or `"createReactClass"`,
+/// which must either be in `root_unresolved_references` or bound to a symbol in `scoping`.
+fn may_have_react_display_name_target(scoping: &Scoping) -> bool {
+    use oxc_str::static_ident;
+    let react = static_ident!("React");
+    let create_react_class = static_ident!("createReactClass");
+    scoping.root_unresolved_references().contains_key(&react)
+        || scoping.root_unresolved_references().contains_key(&create_react_class)
+        || scoping.symbol_names().any(|name| name == react || name == create_react_class)
 }
 
 struct TransformerImpl<'a> {
@@ -215,6 +277,8 @@ struct TransformerImpl<'a> {
     x3_es2015: ES2015<'a>,
     x4_regexp: RegExp,
     common: Common<'a>,
+    has_es_expression_transforms: bool,
+    has_es_exit_expression_transforms: bool,
 }
 
 impl<'a> Traverse<'a, TransformState<'a>> for TransformerImpl<'a> {
@@ -369,21 +433,25 @@ impl<'a> Traverse<'a, TransformState<'a>> for TransformerImpl<'a> {
 
     #[inline]
     fn enter_expression(&mut self, expr: &mut Expression<'a>, ctx: &mut TraverseCtx<'a>) {
-        self.common.enter_expression(expr, ctx);
-        if let Some(typescript) = self.x0_typescript.as_mut() {
-            typescript.enter_expression(expr, ctx);
+        if !self.has_es_expression_transforms {
+            if let Some(typescript) = self.x0_typescript.as_mut() {
+                typescript.enter_expression(expr, ctx);
+            }
+            return;
         }
-        self.plugins.enter_expression(expr, ctx);
-        self.x2_es2022.enter_expression(expr, ctx);
-        self.x2_es2021.enter_expression(expr, ctx);
-        self.x2_es2020.enter_expression(expr, ctx);
-        self.x2_es2018.enter_expression(expr, ctx);
-        self.x2_es2016.enter_expression(expr, ctx);
-        self.x4_regexp.enter_expression(expr, ctx);
+        self.enter_expression_all(expr, ctx);
     }
 
     #[inline]
     fn exit_expression(&mut self, expr: &mut Expression<'a>, ctx: &mut TraverseCtx<'a>) {
+        if !self.has_es_exit_expression_transforms {
+            if self.x1_jsx.has_jsx_plugin()
+                && matches!(expr, Expression::JSXElement(_) | Expression::JSXFragment(_))
+            {
+                self.x1_jsx.exit_expression(expr, ctx);
+            }
+            return;
+        }
         // The exit plugins only act on these expression kinds. Keep the no-op path in the walker.
         if matches!(
             expr,
@@ -791,6 +859,21 @@ impl<'a> Traverse<'a, TransformState<'a>> for TransformerImpl<'a> {
 }
 
 impl<'a> TransformerImpl<'a> {
+    #[inline(never)]
+    fn enter_expression_all(&mut self, expr: &mut Expression<'a>, ctx: &mut TraverseCtx<'a>) {
+        self.common.enter_expression(expr, ctx);
+        if let Some(typescript) = self.x0_typescript.as_mut() {
+            typescript.enter_expression(expr, ctx);
+        }
+        self.plugins.enter_expression(expr, ctx);
+        self.x2_es2022.enter_expression(expr, ctx);
+        self.x2_es2021.enter_expression(expr, ctx);
+        self.x2_es2020.enter_expression(expr, ctx);
+        self.x2_es2018.enter_expression(expr, ctx);
+        self.x2_es2016.enter_expression(expr, ctx);
+        self.x4_regexp.enter_expression(expr, ctx);
+    }
+
     #[inline(never)]
     fn exit_expression_impl(&mut self, expr: &mut Expression<'a>, ctx: &mut TraverseCtx<'a>) {
         self.common.exit_expression(expr, ctx);

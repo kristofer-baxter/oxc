@@ -105,6 +105,12 @@ impl<'a> ConstantValue<'a> {
     pub fn into_js_str(self, ctx: &impl ConstantEvaluationCtx<'a>) -> Option<JSStr<'a>> {
         match self {
             Self::String(value) => Some(value),
+            Self::Number(value) => Some(if value == 0.0 {
+                JSStr::from("0")
+            } else {
+                let mut buffer = zmij_ecma::Buffer::new();
+                JSStr::from_str_in(buffer.format(value), ctx)
+            }),
             value => value.to_js_string(ctx).map(|value| JSStr::from_cow_in(&value, ctx)),
         }
     }
@@ -118,9 +124,26 @@ pub fn evaluate_to_js_string<'a>(
 ) -> Option<JSStr<'a>> {
     match expr {
         Expression::StringLiteral(lit) => Some(lit.value),
+        Expression::NumericLiteral(lit) => Some(if lit.value == 0.0 {
+            JSStr::from("0")
+        } else {
+            let mut buffer = zmij_ecma::Buffer::new();
+            JSStr::from_str_in(buffer.format(lit.value), ctx)
+        }),
         // A template with no substitutions has a single quasi,
         // whose cooked value is already the WTF-8 string.
         Expression::TemplateLiteral(lit) if lit.expressions.is_empty() => lit.single_quasi(),
+        Expression::TemplateLiteral(lit) => {
+            let mut builder = oxc_str::JSStrBuilder::new_in(ctx);
+            for (i, quasi) in lit.quasis.iter().enumerate() {
+                builder.push_js_str(quasi.value.cooked?);
+                if i < lit.expressions.len() {
+                    let value = evaluate_to_js_string(&lit.expressions[i], ctx)?;
+                    builder.push_js_str(value);
+                }
+            }
+            Some(builder.into_js_str())
+        }
         _ => expr.to_js_string(ctx).map(|value| JSStr::from_cow_in(&value, ctx)),
     }
 }

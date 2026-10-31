@@ -271,61 +271,55 @@ impl<'a, C: Config> ParserImpl<'a, C> {
                 return JSXClosing::Fragment(closing);
             }
 
-            match self.cur_kind() {
-                Kind::LAngle => {
-                    let start = self.cur_start();
-                    self.bump_any(); // bump `<`
-                    let kind = self.cur_kind();
+            let child =
+                match self.cur_kind() {
+                    Kind::LAngle => {
+                        let start = self.cur_start();
+                        self.bump_any(); // bump `<`
+                        let kind = self.cur_kind();
 
-                    // <> open nested fragment
-                    if kind == Kind::RAngle {
-                        let child = JSXChild::Fragment(self.parse_jsx_fragment(start, true));
-                        children.push(child);
-                        continue;
+                        // <> open nested fragment
+                        if kind == Kind::RAngle {
+                            JSXChild::Fragment(self.parse_jsx_fragment(start, true))
+                        } else if kind == Kind::Ident || kind.is_any_keyword() {
+                            // <ident open nested element
+                            JSXChild::Element(self.parse_jsx_element(start, true))
+                        } else if kind == Kind::Slash {
+                            // </ closing tag - parse it inline and return
+                            self.bump_any(); // bump `/`
+                            return self.parse_jsx_closing_inline(start, in_jsx_child);
+                        } else {
+                            // Unexpected token after `<`
+                            return self.unexpected();
+                        }
                     }
+                    Kind::LCurly => {
+                        let start = self.cur_start();
+                        self.bump_any(); // bump `{`
 
-                    // <ident open nested element
-                    if kind == Kind::Ident || kind.is_any_keyword() {
-                        let child = JSXChild::Element(self.parse_jsx_element(start, true));
-                        children.push(child);
-                        continue;
+                        // {...expr}
+                        if self.eat(Kind::Dot3) {
+                            JSXChild::Spread(self.parse_jsx_spread_child(start))
+                        } else {
+                            // {expr}
+                            JSXChild::ExpressionContainer(self.parse_jsx_expression_container(
+                                start, /* in_jsx_child */ true,
+                            ))
+                        }
                     }
-
-                    // </ closing tag - parse it inline and return
-                    if kind == Kind::Slash {
-                        self.bump_any(); // bump `/`
-                        return self.parse_jsx_closing_inline(start, in_jsx_child);
+                    // text
+                    Kind::JSXText => JSXChild::Text(self.parse_jsx_text()),
+                    _ => {
+                        // Unexpected token in JSX children
+                        return self.unexpected();
                     }
-
-                    // Unexpected token after `<`
-                    return self.unexpected();
-                }
-                Kind::LCurly => {
-                    let start = self.cur_start();
-                    self.bump_any(); // bump `{`
-
-                    // {...expr}
-                    if self.eat(Kind::Dot3) {
-                        let child = JSXChild::Spread(self.parse_jsx_spread_child(start));
-                        children.push(child);
-                        continue;
-                    }
-                    // {expr}
-                    let child = JSXChild::ExpressionContainer(
-                        self.parse_jsx_expression_container(start, /* in_jsx_child */ true),
-                    );
-                    children.push(child);
-                }
-                // text
-                Kind::JSXText => {
-                    let child = JSXChild::Text(self.parse_jsx_text());
-                    children.push(child);
-                }
-                _ => {
-                    // Unexpected token in JSX children
-                    return self.unexpected();
-                }
+                };
+            if children.is_empty() {
+                let is_closing =
+                    self.at(Kind::LAngle) && self.lexer.next_token_may_start_with(|b| b == b'/');
+                *children = ArenaVec::with_capacity_in(if is_closing { 1 } else { 4 }, self);
             }
+            children.push(child);
         }
     }
 
@@ -429,6 +423,10 @@ impl<'a, C: Config> ParserImpl<'a, C> {
                 }
                 _ => JSXAttributeItem::Attribute(self.parse_jsx_attribute()),
             };
+            if attributes.is_empty() {
+                let is_end = matches!(self.cur_kind(), Kind::LAngle | Kind::RAngle | Kind::Slash);
+                attributes = ArenaVec::with_capacity_in(if is_end { 1 } else { 4 }, self);
+            }
             attributes.push(attribute);
         }
         attributes

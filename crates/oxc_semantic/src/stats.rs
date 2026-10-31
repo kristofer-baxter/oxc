@@ -3,13 +3,17 @@ use std::cell::Cell;
 use oxc_ast::{
     AstKind,
     ast::{
-        BindingIdentifier, BindingPattern, Expression, IdentifierReference, Program,
-        TSEnumMemberName, TSType,
+        BindingIdentifier, BindingPattern, Expression, IdentifierName, IdentifierReference,
+        JSXIdentifier, JSXText, PrivateIdentifier, Program, TSEnumMemberName, TSType,
+        TSTypeAnnotation, TSTypeName,
     },
 };
 use oxc_ast_visit::{
     Visit,
-    walk::{walk_binding_pattern, walk_expression, walk_ts_enum_member_name, walk_ts_type},
+    walk::{
+        walk_binding_pattern, walk_expression, walk_ts_enum_member_name, walk_ts_type,
+        walk_ts_type_name,
+    },
 };
 use oxc_syntax::scope::{ScopeFlags, ScopeId};
 
@@ -169,6 +173,32 @@ impl<'a> Visit<'a> for Counter {
     }
 
     #[inline]
+    fn visit_identifier_name(&mut self, _: &IdentifierName<'a>) {
+        self.stats.nodes += 1;
+    }
+
+    #[inline]
+    fn visit_private_identifier(&mut self, _: &PrivateIdentifier<'a>) {
+        self.stats.nodes += 1;
+    }
+
+    #[inline]
+    fn visit_jsx_identifier(&mut self, _: &JSXIdentifier<'a>) {
+        self.stats.nodes += 1;
+    }
+
+    #[inline]
+    fn visit_jsx_text(&mut self, _: &JSXText<'a>) {
+        self.stats.nodes += 1;
+    }
+
+    #[inline]
+    fn visit_ts_type_annotation(&mut self, it: &TSTypeAnnotation<'a>) {
+        self.stats.nodes += 1;
+        self.visit_ts_type(&it.type_annotation);
+    }
+
+    #[inline]
     fn visit_binding_pattern(&mut self, it: &BindingPattern<'a>) {
         if matches!(it, BindingPattern::BindingIdentifier(_)) {
             self.stats.nodes += 1;
@@ -228,6 +258,18 @@ impl<'a> Visit<'a> for Counter {
             | TSType::TSThisType(_)
             | TSType::JSDocUnknownType(_) => {
                 self.stats.nodes += 1;
+            }
+            TSType::TSTypeReference(type_ref) => {
+                self.stats.nodes += 1;
+                if let TSTypeName::IdentifierReference(_) = &type_ref.type_name {
+                    self.stats.nodes += 1;
+                    self.stats.references += 1;
+                } else {
+                    walk_ts_type_name(self, &type_ref.type_name);
+                }
+                if let Some(type_arguments) = &type_ref.type_arguments {
+                    self.visit_ts_type_parameter_instantiation(type_arguments);
+                }
             }
             _ => walk_ts_type(self, it),
         }

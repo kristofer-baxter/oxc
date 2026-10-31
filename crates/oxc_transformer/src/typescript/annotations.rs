@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use oxc_allocator::{ArenaVec, ReplaceWith, TakeIn};
 use oxc_ast::ast::*;
 use oxc_diagnostics::OxcDiagnostic;
@@ -24,22 +26,20 @@ pub struct TypeScriptAnnotations<'a> {
 
     has_jsx_element: bool,
     has_jsx_fragment: bool,
-    jsx_element_import_name: String,
-    jsx_fragment_import_name: String,
+    jsx_element_import_name: Cow<'static, str>,
+    jsx_fragment_import_name: Cow<'static, str>,
 }
 
 impl TypeScriptAnnotations<'_> {
     pub fn new(options: &TypeScriptOptions) -> Self {
-        let jsx_element_import_name = if options.jsx_pragma.contains('.') {
-            options.jsx_pragma.split('.').next().map(String::from).unwrap()
-        } else {
-            options.jsx_pragma.to_string()
+        let jsx_element_import_name = match &options.jsx_pragma {
+            Cow::Borrowed(s) => Cow::Borrowed(s.split('.').next().unwrap_or(s)),
+            Cow::Owned(s) => Cow::Owned(s.split('.').next().unwrap_or(s).to_string()),
         };
 
-        let jsx_fragment_import_name = if options.jsx_pragma_frag.contains('.') {
-            options.jsx_pragma_frag.split('.').next().map(String::from).unwrap()
-        } else {
-            options.jsx_pragma_frag.to_string()
+        let jsx_fragment_import_name = match &options.jsx_pragma_frag {
+            Cow::Borrowed(s) => Cow::Borrowed(s.split('.').next().unwrap_or(s)),
+            Cow::Owned(s) => Cow::Owned(s.split('.').next().unwrap_or(s).to_string()),
         };
 
         Self {

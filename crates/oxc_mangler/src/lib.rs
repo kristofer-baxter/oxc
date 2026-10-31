@@ -1,7 +1,4 @@
-use std::{
-    collections::hash_map::Entry,
-    iter::{self, repeat_with},
-};
+use std::{collections::hash_map::Entry, iter};
 
 use itertools::Itertools;
 use keep_names::collect_name_symbols;
@@ -418,6 +415,13 @@ impl<'t> Mangler<'t> {
         semantic: &Semantic<'_>,
     ) -> IndexVec<ClassId, FxHashMap<String, CompactStr>> {
         let classes = semantic.classes();
+        if !classes
+            .elements
+            .iter()
+            .any(|class_elements| class_elements.iter().any(|element| element.is_private))
+        {
+            return IndexVec::from_iter(iter::repeat_with(FxHashMap::default).take(classes.len()));
+        }
 
         let mut class_private_mappings: IndexVec<ClassId, FxHashMap<String, CompactStr>> =
             IndexVec::with_capacity(classes.len());
@@ -439,6 +443,11 @@ impl<'t> Mangler<'t> {
             let mut mappings =
                 FxHashMap::with_capacity_and_hasher(private_member_count, FxBuildHasher);
             for element in class_elements.iter().filter(|element| element.is_private) {
+                if let Some(name_str) = element.name.as_str()
+                    && mappings.contains_key(name_str)
+                {
+                    continue;
+                }
                 let next_index = mappings.len();
                 let Entry::Vacant(entry) = mappings.entry(element.name.display().to_string())
                 else {
@@ -465,17 +474,12 @@ fn is_special_name(name: &str) -> bool {
     matches!(name, "arguments")
 }
 
-#[derive(Debug)]
-struct SlotFrequency<'a> {
+#[derive(Debug, Clone, Copy, Default)]
+struct SlotFrequency {
     pub slot: Slot,
     pub frequency: usize,
-    pub symbol_ids: ArenaVec<'a, SymbolId>,
-}
-
-impl<'t> SlotFrequency<'t> {
-    fn new(temp_allocator: &'t Allocator) -> Self {
-        Self { slot: 0, frequency: 0, symbol_ids: ArenaVec::new_in(&temp_allocator) }
-    }
+    pub symbol_ids_start: u32,
+    pub symbol_ids_len: u32,
 }
 
 // ─────────────────────────── Pipeline stages ───────────────────────────
@@ -512,7 +516,8 @@ struct SlotAssignment<'a> {
 
 /// Phase 3 output — slots ranked by reference count, hottest first.
 struct SlotRanking<'a> {
-    frequencies: ArenaVec<'a, SlotFrequency<'a>>,
+    frequencies: ArenaVec<'a, SlotFrequency>,
+    symbol_ids: ArenaVec<'a, SymbolId>,
 }
 
 /// Phase 4 output — the short names to hand out, shortest first.
@@ -609,7 +614,7 @@ impl<'a> SlotAssignment<'a> {
         let mut slot_liveness =
             ArenaVec::<BitSet>::with_capacity_in(scoping.symbols_len(), &allocator);
         let mut tmp_bindings = ArenaVec::with_capacity_in(100, &allocator);
-        let mut reusable_slots = ArenaVec::new_in(&allocator);
+        let mut reusable_slots = ArenaVec::with_capacity_in(100, &allocator);
         // Pre-computed BitSet for ancestor membership tests - reused across iterations
         let mut ancestor_set = BitSet::new_in(scoping.scopes_len(), allocator);
 
@@ -674,7 +679,6 @@ impl<'a> SlotAssignment<'a> {
             }
 
             // Pre-compute the set of ancestors from root to scope_id (exclusive) for O(1) tests.
-            ancestor_set.clear();
             for ancestor_id in scoping.scope_ancestors(scope_id).skip(1) {
                 ancestor_set.set_bit(ancestor_id.index());
             }
@@ -726,6 +730,10 @@ impl<'a> SlotAssignment<'a> {
                 }
             }
 
+            for ancestor_id in scoping.scope_ancestors(scope_id).skip(1) {
+                ancestor_set.unset_bit(ancestor_id.index());
+            }
+
             // Repair an orphaned named-fn-expr name: a same-named body declaration
             // (`var foo`, parameter `foo`) overwrites the fn-expr's binding-map entry,
             // so the fn-expr symbol never appears in `bindings` and the main pass leaves
@@ -755,24 +763,47 @@ impl<'a> SlotRanking<'a> {
     /// Phase 3: count references per candidate slot and sort hottest-first.
     fn tally(allocator: &'a Allocator, scoping: &Scoping, slots: &SlotAssignment) -> Self {
         let mut frequencies = ArenaVec::from_iter_in(
-            repeat_with(|| SlotFrequency::new(allocator)).take(slots.total_slots),
+            iter::repeat_n(SlotFrequency::default(), slots.total_slots),
             &allocator,
         );
 
+        let mut total_mangled_symbols = 0usize;
         for (symbol_id, &slot) in slots.slots.iter().enumerate() {
             if slot == SLOT_UNASSIGNED {
                 continue;
             }
             let symbol_id = SymbolId::from_usize(symbol_id);
-            let index = slot as usize;
-            frequencies[index].slot = slot;
-            frequencies[index].frequency += scoping.get_resolved_reference_ids(symbol_id).len();
-            frequencies[index].symbol_ids.push(symbol_id);
+            let entry = &mut frequencies[slot as usize];
+            entry.slot = slot;
+            entry.frequency += scoping.get_resolved_reference_ids(symbol_id).len();
+            entry.symbol_ids_len += 1;
+            total_mangled_symbols += 1;
         }
 
-        frequencies.retain(|x| !x.symbol_ids.is_empty());
+        let mut cursor = 0u32;
+        for entry in &mut frequencies {
+            entry.symbol_ids_start = cursor;
+            cursor += entry.symbol_ids_len;
+            entry.symbol_ids_len = 0;
+        }
+
+        let mut symbol_ids = ArenaVec::from_iter_in(
+            iter::repeat_n(SymbolId::from_usize(0), total_mangled_symbols),
+            &allocator,
+        );
+        for (symbol_id, &slot) in slots.slots.iter().enumerate() {
+            if slot == SLOT_UNASSIGNED {
+                continue;
+            }
+            let entry = &mut frequencies[slot as usize];
+            let dst = (entry.symbol_ids_start + entry.symbol_ids_len) as usize;
+            symbol_ids[dst] = SymbolId::from_usize(symbol_id);
+            entry.symbol_ids_len += 1;
+        }
+
+        frequencies.retain(|x| x.symbol_ids_len > 0);
         frequencies.sort_unstable_by_key(|x| std::cmp::Reverse(x.frequency));
-        Self { frequencies }
+        Self { frequencies, symbol_ids }
     }
 }
 
@@ -850,8 +881,12 @@ impl<'a, const CAPACITY: usize> NameTable<'a, CAPACITY> {
                 symbols_renamed_in_this_batch.iter().zip(slice_of_same_len_strings.iter())
             {
                 // A slot can be shared by several symbols (cross-scope reuse); rename them all.
-                scoping
-                    .set_symbol_names(&symbol_to_rename.symbol_ids, Ident::from(new_name.as_str()));
+                let start = symbol_to_rename.symbol_ids_start as usize;
+                let end = start + symbol_to_rename.symbol_ids_len as usize;
+                scoping.set_symbol_names(
+                    &ranking.symbol_ids[start..end],
+                    Ident::from(new_name.as_str()),
+                );
             }
         }
     }
@@ -861,7 +896,7 @@ impl<'a, const CAPACITY: usize> NameTable<'a, CAPACITY> {
 ///
 /// Non-generic free fn, so the sort implementation is compiled once, rather than once per
 /// `NameTable` `CAPACITY` instantiation (the `apply` caller is generic over `CAPACITY`).
-fn sort_batch_by_slot(symbols: &mut [&SlotFrequency<'_>]) {
+fn sort_batch_by_slot(symbols: &mut [&SlotFrequency]) {
     symbols.sort_unstable_by_key(|a| a.slot);
 }
 

@@ -34,7 +34,6 @@
 //! * Babel plugin implementation: <https://github.com/babel/babel/blob/v7.26.2/packages/babel-plugin-transform-react-jsx-source/src/index.ts>
 
 use oxc_ast::ast::*;
-use oxc_data_structures::rope::{Rope, get_line_column};
 use oxc_span::SPAN;
 use oxc_syntax::{number::NumberBase, symbol::SymbolFlags};
 use oxc_traverse::{BoundIdentifier, Traverse};
@@ -46,12 +45,12 @@ const FILE_NAME_VAR: &str = "jsxFileName";
 
 pub struct JsxSource<'a> {
     filename_var: Option<BoundIdentifier<'a>>,
-    source_rope: Option<Rope>,
+    line_starts: Option<Vec<u32>>,
 }
 
 impl JsxSource<'_> {
     pub fn new() -> Self {
-        Self { filename_var: None, source_rope: None }
+        Self { filename_var: None, line_starts: None }
     }
 }
 
@@ -78,12 +77,17 @@ impl<'a> JsxSource<'a> {
     /// Column number is in UTF-16 characters, and starts at 1.
     ///
     /// This matches Babel's output.
+    #[expect(clippy::cast_possible_truncation)]
     pub fn get_line_column(&mut self, offset: u32, ctx: &TraverseCtx<'a>) -> (u32, u32) {
-        let source_rope =
-            self.source_rope.get_or_insert_with(|| Rope::from_str(ctx.state.source_text));
-        let (line, column) = get_line_column(source_rope, offset, ctx.state.source_text);
+        let source_text = ctx.state.source_text;
+        let line_starts = self.line_starts.get_or_insert_with(|| build_line_starts(source_text));
+        let line_index = line_starts.partition_point(|&start| start <= offset) - 1;
+        let line_offset = line_starts[line_index] as usize;
+        let slice = &source_text[line_offset..offset as usize];
+        let column_index =
+            if slice.is_ascii() { slice.len() } else { slice.encode_utf16().count() };
         // line and column are zero-indexed, but we want 1-indexed
-        (line + 1, column + 1)
+        (line_index as u32 + 1, column_index as u32 + 1)
     }
 
     pub fn get_object_property_kind_for_jsx_plugin(
@@ -204,4 +208,39 @@ impl<'a> JsxSource<'a> {
             ctx.generate_uid_in_root_scope(FILE_NAME_VAR, SymbolFlags::FunctionScopedVariable)
         })
     }
+}
+
+#[expect(clippy::cast_possible_truncation)]
+fn build_line_starts(source_text: &str) -> Vec<u32> {
+    let bytes = source_text.as_bytes();
+    let mut line_starts = Vec::with_capacity(bytes.len() / 32 + 1);
+    line_starts.push(0);
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\n' => {
+                i += 1;
+                line_starts.push(i as u32);
+            }
+            b'\r' => {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'\n' {
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+                line_starts.push(i as u32);
+            }
+            0xE2 if i + 2 < bytes.len()
+                && bytes[i + 1] == 0x80
+                && matches!(bytes[i + 2], 0xA8 | 0xA9) =>
+            {
+                i += 3;
+                line_starts.push(i as u32);
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+    line_starts
 }

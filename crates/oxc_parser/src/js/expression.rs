@@ -668,14 +668,16 @@ impl<'a, C: Config> ParserImpl<'a, C> {
                 (quasis, ArenaVec::new_in(self))
             }
             Kind::TemplateHead => {
-                let mut expressions = ArenaVec::with_capacity_in(1, self);
-                let mut quasis = ArenaVec::with_capacity_in(2, self);
-
-                quasis.push(self.parse_template_element(tagged));
+                let first_quasi = self.parse_template_element(tagged);
                 // TemplateHead Expression[+In, ?Yield, ?Await]
-                let expr = self.context_add(Context::In, Self::parse_expr);
-                expressions.push(expr);
+                let first_expr = self.context_add(Context::In, Self::parse_expr);
                 self.re_lex_template_substitution_tail();
+                let is_single = self.at(Kind::TemplateTail);
+                let mut expressions =
+                    ArenaVec::with_capacity_in(if is_single { 1 } else { 3 }, self);
+                let mut quasis = ArenaVec::with_capacity_in(if is_single { 2 } else { 4 }, self);
+                quasis.push(first_quasi);
+                expressions.push(first_expr);
                 while self.fatal_error.is_none() {
                     match self.cur_kind() {
                         Kind::TemplateTail => {

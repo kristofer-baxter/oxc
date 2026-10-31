@@ -47,7 +47,7 @@ impl CloneIn<'_> for Redeclaration {
 multi_index_vec! {
     /// Scope tree stored as struct-of-arrays in a single allocation.
     ///
-    /// Contains parent IDs, node IDs, flags, and a 64-bit binding bloom filter
+    /// Contains parent IDs, node IDs, flags, and a 32-bit binding bloom filter
     /// for all scopes. Using a single allocation with one `len`/`cap` instead of
     /// separate `IndexVec`s saves memory (no redundant len/cap) and CPU (one
     /// bounds check, one capacity check on push).
@@ -55,14 +55,14 @@ multi_index_vec! {
         pub parent_ids => parent_ids_mut: Option<ScopeId>,
         pub node_ids => node_ids_mut: NodeId,
         pub flags => flags_mut: ScopeFlags,
-        pub bloom => bloom_mut: u64,
+        pub bloom => bloom_mut: u32,
     }
 }
 
-/// Compute a 1-bit bloom mask from the top 6 bits of `name`'s precomputed hash.
+/// Compute a 1-bit bloom mask from the top 5 bits of `name`'s precomputed hash.
 #[expect(clippy::inline_always)]
 #[inline(always)]
-pub fn ident_bloom_bit(name: Ident<'_>) -> u64 {
+pub fn ident_bloom_bit(name: Ident<'_>) -> u32 {
     struct PackedExtractor(u64);
     impl std::hash::Hasher for PackedExtractor {
         #[inline(always)]
@@ -80,7 +80,7 @@ pub fn ident_bloom_bit(name: Ident<'_>) -> u64 {
     }
     let mut h = PackedExtractor(0);
     std::hash::Hash::hash(&name, &mut h);
-    1u64 << (h.0 >> 58)
+    1u32 << (h.0 >> 59)
 }
 
 multi_index_vec! {
@@ -1163,16 +1163,21 @@ impl Scoping {
                 !reference_ids.is_empty()
             });
 
-            for bindings in &mut cell.bindings {
-                bindings.retain(|_name, symbol_id| {
-                    let flags = *self.symbol_table.symbol_flags(*symbol_id);
-                    !flags.intersects(
-                        SymbolFlags::TypeAlias
-                            | SymbolFlags::Interface
-                            | SymbolFlags::TypeParameter
-                            | SymbolFlags::EnumMember,
-                    )
-                });
+            for symbol_id in self.symbol_table.iter_ids() {
+                let flags = *self.symbol_table.symbol_flags(symbol_id);
+                if flags.intersects(
+                    SymbolFlags::TypeAlias
+                        | SymbolFlags::Interface
+                        | SymbolFlags::TypeParameter
+                        | SymbolFlags::EnumMember,
+                ) {
+                    let scope_id = *self.symbol_table.symbol_scope_ids(symbol_id);
+                    let name = cell.symbol_names[symbol_id.index()];
+                    let bindings = &mut cell.bindings[scope_id];
+                    if bindings.get(&name) == Some(&symbol_id) {
+                        bindings.remove(&name);
+                    }
+                }
             }
         });
     }

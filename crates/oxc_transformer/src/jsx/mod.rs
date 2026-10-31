@@ -29,12 +29,11 @@ use refresh::ReactRefresh;
 pub struct Jsx<'a> {
     implementation: JsxImpl<'a>,
     display_name: ReactDisplayName,
-    refresh: ReactRefresh<'a>,
+    refresh: Option<ReactRefresh<'a>>,
     enable_jsx_plugin: bool,
     display_name_plugin: bool,
     self_plugin: bool,
     source_plugin: bool,
-    refresh_plugin: bool,
 }
 
 // Constructors
@@ -59,9 +58,18 @@ impl<'a> Jsx<'a> {
             display_name_plugin,
             self_plugin: jsx_self_plugin,
             source_plugin: jsx_source_plugin,
-            refresh_plugin: refresh.is_some(),
-            refresh: ReactRefresh::new(refresh.as_ref(), ast),
+            refresh: refresh.as_ref().map(|r| ReactRefresh::new(Some(r), ast)),
         }
+    }
+
+    #[inline]
+    pub const fn has_refresh(&self) -> bool {
+        self.refresh.is_some()
+    }
+
+    #[inline]
+    pub const fn has_jsx_plugin(&self) -> bool {
+        self.enable_jsx_plugin
     }
 }
 
@@ -70,14 +78,14 @@ impl<'a> Traverse<'a, TransformState<'a>> for Jsx<'a> {
         if self.enable_jsx_plugin {
             program.source_type = program.source_type.with_standard(true);
         }
-        if self.refresh_plugin {
-            self.refresh.enter_program(program, ctx);
+        if let Some(refresh) = &mut self.refresh {
+            refresh.enter_program(program, ctx);
         }
     }
 
     fn exit_program(&mut self, program: &mut Program<'a>, ctx: &mut TraverseCtx<'a>) {
-        if self.refresh_plugin {
-            self.refresh.exit_program(program, ctx);
+        if let Some(refresh) = &mut self.refresh {
+            refresh.exit_program(program, ctx);
         }
         if self.enable_jsx_plugin {
             self.implementation.exit_program(program, ctx);
@@ -95,8 +103,8 @@ impl<'a> Traverse<'a, TransformState<'a>> for Jsx<'a> {
             self.display_name.enter_call_expression(call_expr, ctx);
         }
 
-        if self.refresh_plugin {
-            self.refresh.enter_call_expression(call_expr, ctx);
+        if let Some(refresh) = &mut self.refresh {
+            refresh.enter_call_expression(call_expr, ctx);
         }
     }
 
@@ -119,14 +127,14 @@ impl<'a> Traverse<'a, TransformState<'a>> for Jsx<'a> {
         if self.enable_jsx_plugin {
             self.implementation.exit_expression(expr, ctx);
         }
-        if self.refresh_plugin {
-            self.refresh.exit_expression(expr, ctx);
+        if let Some(refresh) = &mut self.refresh {
+            refresh.exit_expression(expr, ctx);
         }
     }
 
     fn exit_function(&mut self, func: &mut Function<'a>, ctx: &mut TraverseCtx<'a>) {
-        if self.refresh_plugin {
-            self.refresh.exit_function(func, ctx);
+        if let Some(refresh) = &mut self.refresh {
+            refresh.exit_function(func, ctx);
         }
     }
 }

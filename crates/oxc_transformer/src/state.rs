@@ -1,4 +1,6 @@
 use std::{
+    borrow::Cow,
+    ffi::OsStr,
     mem,
     path::{Path, PathBuf},
 };
@@ -17,9 +19,6 @@ use crate::{
 
 pub struct TransformState<'a> {
     errors: Vec<OxcDiagnostic>,
-
-    /// <https://babeljs.io/docs/options#filename>
-    pub filename: String,
 
     /// Source path in the form of `<CWD>/path/to/file/input.js`
     pub source_path: PathBuf,
@@ -53,7 +52,6 @@ impl Default for TransformState<'_> {
     fn default() -> Self {
         Self {
             errors: vec![],
-            filename: String::from("unknown"),
             source_path: PathBuf::new(),
             source_type: SourceType::default(),
             source_text: "",
@@ -71,13 +69,8 @@ impl Default for TransformState<'_> {
 
 impl TransformState<'_> {
     pub fn new(source_path: &Path, options: &TransformOptions) -> Self {
-        let filename = source_path
-            .file_stem() // omit file extension
-            .map_or_else(|| String::from("unknown"), |name| name.to_string_lossy().to_string());
-
         Self {
             errors: vec![],
-            filename,
             source_path: source_path.to_path_buf(),
             source_type: SourceType::default(),
             source_text: "",
@@ -90,6 +83,13 @@ impl TransformState<'_> {
             top_level_statements: TopLevelStatementsStore::new(),
             is_class_properties_plugin_enabled: options.env.es2022.class_properties.is_some(),
         }
+    }
+
+    /// <https://babeljs.io/docs/options#filename>
+    pub fn filename(&self) -> Cow<'_, str> {
+        self.source_path
+            .file_stem() // omit file extension
+            .map_or(Cow::Borrowed("unknown"), OsStr::to_string_lossy)
     }
 
     pub fn take_errors(&mut self) -> Vec<OxcDiagnostic> {

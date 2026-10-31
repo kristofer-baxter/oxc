@@ -129,13 +129,12 @@ impl<'a> ModuleRecordBuilder<'a> {
             std::mem::replace(&mut self.export_entries, ArenaVec::new_in(&self.allocator));
         let import_len = self.module_record.import_entries.len();
 
-        // Build a lookup table when `export_entries * import_entries` would otherwise be quadratic.
-        let import_map: Option<rustc_hash::FxHashMap<&'a str, usize>> =
+        // Build an arena-backed lookup table when `export_entries * import_entries` would
+        // otherwise be quadratic, avoiding a system-heap allocation per module.
+        let import_map: Option<oxc_allocator::HashMap<'a, &'a str, usize>> =
             if import_len > 8 && export_entries.len().saturating_mul(import_len) >= 64 {
-                let mut map = rustc_hash::FxHashMap::with_capacity_and_hasher(
-                    import_len,
-                    rustc_hash::FxBuildHasher,
-                );
+                let mut map =
+                    oxc_allocator::HashMap::with_capacity_in(import_len, &self.allocator);
                 for (idx, entry) in self.module_record.import_entries.iter().enumerate() {
                     map.entry(entry.local_name.name.as_str()).or_insert(idx);
                 }

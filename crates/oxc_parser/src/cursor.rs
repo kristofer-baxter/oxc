@@ -461,6 +461,9 @@ impl<'a, C: Config> ParserImpl<'a, C> {
                 break;
             }
             let element = parse_element(self);
+            if list.is_empty() {
+                *list = ArenaVec::with_capacity_in(if self.at(close) { 1 } else { 4 }, self);
+            }
             list.push(element);
         }
     }
@@ -497,6 +500,9 @@ impl<'a, C: Config> ParserImpl<'a, C> {
                 break;
             }
             if let Some(element) = parse_element(self) {
+                if list.is_empty() {
+                    *list = ArenaVec::with_capacity_in(if self.at(close) { 1 } else { 4 }, self);
+                }
                 list.push(element);
             } else {
                 break;
@@ -682,6 +688,9 @@ impl<'a, C: Config> ParserImpl<'a, C> {
                 rest.replace(parse_rest(self));
             } else {
                 let element = parse_element(self);
+                if list.is_empty() {
+                    *list = ArenaVec::with_capacity_in(if self.at(close) { 1 } else { 4 }, self);
+                }
                 list.push(element);
             }
         }

@@ -122,11 +122,16 @@ impl<'a, C: Config> ParserImpl<'a, C> {
                 self.error(diagnostics::statement_in_ambient_context(stmt.span()));
                 reported_ambient_statement = true;
             }
-            if statements.is_empty()
-                && !is_top_level
-                && (self.at(Kind::RCurly) || self.has_fatal_error())
-            {
-                return (directives, ArenaVec::from_value_in(stmt, self));
+            if statements.is_empty() {
+                let end = if is_top_level { Kind::Eof } else { Kind::RCurly };
+                let cap = if self.at(end) {
+                    1
+                } else if is_top_level {
+                    8
+                } else {
+                    4
+                };
+                statements = ArenaVec::with_capacity_in(cap, self);
             }
             statements.push(stmt);
         }
@@ -839,6 +844,13 @@ impl<'a, C: Config> ParserImpl<'a, C> {
                 } else {
                     diagnostics::using_declaration_not_allowed_in_switch_bare_case(stmt.span())
                 });
+            }
+            if consequent.is_empty() {
+                let is_end = matches!(
+                    self.cur_kind(),
+                    Kind::Case | Kind::Default | Kind::RCurly | Kind::Eof | Kind::Undetermined
+                );
+                consequent = ArenaVec::with_capacity_in(if is_end { 1 } else { 2 }, self);
             }
             consequent.push(stmt);
         }

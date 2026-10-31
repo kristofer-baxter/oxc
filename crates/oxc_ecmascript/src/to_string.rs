@@ -60,6 +60,9 @@ impl<'a> ToJsString<'a> for StringLiteral<'a> {
 
 impl<'a> ToJsString<'a> for TemplateLiteral<'a> {
     fn to_js_string(&self, ctx: &impl GlobalContext<'a>) -> Option<Cow<'a, str>> {
+        if self.expressions.is_empty() {
+            return self.single_quasi()?.as_str().map(Cow::Borrowed);
+        }
         let mut str = String::new();
         for (i, quasi) in self.quasis.iter().enumerate() {
             str.push_str(quasi.value.cooked?.as_str()?);

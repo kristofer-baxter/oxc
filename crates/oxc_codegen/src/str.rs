@@ -86,18 +86,44 @@ impl Codegen<'_> {
         };
 
         // Loop through bytes.
-        while let Some(b) = state.peek() {
+        loop {
+            while state.bytes.as_slice().len() >= 16 {
+                // SAFETY: `state.bytes.as_slice().len() >= 16` guarantees 16 readable bytes.
+                let chunk = unsafe { &*state.bytes.ptr().cast::<[u8; 16]>() };
+                let mut needs_slow = false;
+                for &b in chunk {
+                    needs_slow |= !(0x20..0x80).contains(&b)
+                        || b == b'"'
+                        || b == b'\''
+                        || b == b'\\'
+                        || b == b'`'
+                        || b == b'$'
+                        || b == b'<';
+                }
+                if needs_slow {
+                    break;
+                }
+                // SAFETY: All 16 bytes are printable ASCII (`0x20..0x80`) that do not require
+                // escaping in any table, so advancing by 16 stays within bounds and leaves
+                // `state.bytes` on a UTF-8 character boundary.
+                unsafe { state.consume_bytes_unchecked(16) };
+            }
+
+            let Some(b) = state.peek() else { break };
             // Look up whether byte needs escaping
             let escape = table[b as usize];
             if escape == Escape::__ {
                 // No escape required.
                 // SAFETY: We just checked there's a byte to consume.
-                // If byte is not ASCII, this will temporarily leave `bytes` iterator not on a UTF-8
-                // character boundary, but if so next turns of the loop will consume the rest of
-                // the Unicode character.
-                // All bytes which produce an `Escape` which isn't `Escape::__` are 1st byte
-                // of a UTF-8 character sequence.
                 unsafe { state.consume_byte_unchecked() };
+                if b >= 0x80 {
+                    // Consume the remaining UTF-8 continuation bytes of this character so
+                    // `state.bytes` is back on a UTF-8 character boundary before the 16-byte scan.
+                    while state.peek().is_some_and(|c| (c & 0xC0) == 0x80) {
+                        // SAFETY: `peek()` returned `Some`.
+                        unsafe { state.consume_byte_unchecked() };
+                    }
+                }
             } else {
                 // Escape may be required. Execute byte handler.
                 // Characters requiring escape are relatively rare, so cold branch.

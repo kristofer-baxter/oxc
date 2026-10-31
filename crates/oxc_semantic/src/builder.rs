@@ -549,8 +549,7 @@ impl<'a> SemanticBuilder<'a> {
         excludes: SymbolFlags,
     ) -> SymbolId {
         let bit = crate::scoping::ident_bloom_bit(name);
-        if ((*self.scoping.scope_table.bloom(scope_id) & bit) != 0
-            || !self.hoisting_variables.is_empty())
+        if (*self.scoping.scope_table.bloom(scope_id) & bit) != 0
             && let Some(symbol_id) = self.check_redeclaration(scope_id, span, name, excludes)
         {
             self.add_redeclare_variable(symbol_id, includes, span);
@@ -595,11 +594,18 @@ impl<'a> SemanticBuilder<'a> {
         name: Ident<'a>,
         excludes: SymbolFlags,
     ) -> Option<SymbolId> {
-        let symbol_id = self.scoping.get_binding(scope_id, name).or_else(|| {
-            (!self.hoisting_variables.is_empty())
-                .then(|| self.hoisting_variables.get(&(scope_id, name)).copied())
-                .flatten()
-        })?;
+        if (*self.scoping.scope_table.bloom(scope_id) & crate::scoping::ident_bloom_bit(name)) == 0
+        {
+            return None;
+        }
+        let symbol_id = self.scoping.cell.borrow_dependent().bindings[scope_id]
+            .get(&name)
+            .copied()
+            .or_else(|| {
+                (!self.hoisting_variables.is_empty())
+                    .then(|| self.hoisting_variables.get(&(scope_id, name)).copied())
+                    .flatten()
+            })?;
 
         let flags = self.scoping.symbol_flags(symbol_id);
 

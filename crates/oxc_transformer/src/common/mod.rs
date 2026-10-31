@@ -20,12 +20,21 @@ pub mod top_level_statements;
 pub mod var_declarations;
 
 pub struct Common<'a> {
-    arrow_function_converter: ArrowFunctionConverter<'a>,
+    arrow_function_converter: Option<ArrowFunctionConverter<'a>>,
 }
 
 impl Common<'_> {
     pub fn new(options: &EnvOptions) -> Self {
-        Self { arrow_function_converter: ArrowFunctionConverter::new(options) }
+        let arrow_function_converter = (options.es2015.arrow_function.is_some()
+            || options.es2017.async_to_generator
+            || options.es2018.async_generator_functions)
+            .then(|| ArrowFunctionConverter::new(options));
+        Self { arrow_function_converter }
+    }
+
+    #[inline]
+    pub const fn has_arrow_converter(&self) -> bool {
+        self.arrow_function_converter.is_some()
     }
 }
 
@@ -69,10 +78,13 @@ impl<'a> Traverse<'a, TransformState<'a>> for Common<'a> {
 
         // Top level statements
         ctx.state.top_level_statements.insert_into_program(program);
-        self.arrow_function_converter.exit_program(program, ctx);
+        if let Some(conv) = &mut self.arrow_function_converter {
+            conv.exit_program(program, ctx);
+        }
         ctx.state.statement_injector.assert_no_insertions_remaining();
     }
 
+    #[inline]
     fn enter_statements(
         &mut self,
         _stmts: &mut ArenaVec<'a, Statement<'a>>,
@@ -81,6 +93,7 @@ impl<'a> Traverse<'a, TransformState<'a>> for Common<'a> {
         ctx.state.var_declarations.record_entering_statements();
     }
 
+    #[inline]
     fn exit_statements(
         &mut self,
         stmts: &mut ArenaVec<'a, Statement<'a>>,
@@ -91,30 +104,43 @@ impl<'a> Traverse<'a, TransformState<'a>> for Common<'a> {
         ctx.state.statement_injector.insert_into_statements(stmts, &ctx.ast);
     }
 
+    #[inline]
     fn enter_function(&mut self, func: &mut Function<'a>, ctx: &mut TraverseCtx<'a>) {
-        self.arrow_function_converter.enter_function(func, ctx);
+        if let Some(conv) = &mut self.arrow_function_converter {
+            conv.enter_function(func, ctx);
+        }
     }
 
+    #[inline]
     fn exit_function(&mut self, func: &mut Function<'a>, ctx: &mut TraverseCtx<'a>) {
-        self.arrow_function_converter.exit_function(func, ctx);
+        if let Some(conv) = &mut self.arrow_function_converter {
+            conv.exit_function(func, ctx);
+        }
     }
 
+    #[inline]
     fn enter_arrow_function_expression(
         &mut self,
         arrow: &mut ArrowFunctionExpression<'a>,
         ctx: &mut TraverseCtx<'a>,
     ) {
-        self.arrow_function_converter.enter_arrow_function_expression(arrow, ctx);
+        if let Some(conv) = &mut self.arrow_function_converter {
+            conv.enter_arrow_function_expression(arrow, ctx);
+        }
     }
 
+    #[inline]
     fn exit_arrow_function_expression(
         &mut self,
         arrow: &mut ArrowFunctionExpression<'a>,
         ctx: &mut TraverseCtx<'a>,
     ) {
-        self.arrow_function_converter.exit_arrow_function_expression(arrow, ctx);
+        if let Some(conv) = &mut self.arrow_function_converter {
+            conv.exit_arrow_function_expression(arrow, ctx);
+        }
     }
 
+    #[inline]
     fn enter_arrow_function_body(
         &mut self,
         body: &mut ArrowFunctionBody<'a>,
@@ -125,6 +151,7 @@ impl<'a> Traverse<'a, TransformState<'a>> for Common<'a> {
         }
     }
 
+    #[inline]
     fn exit_arrow_function_body(
         &mut self,
         body: &mut ArrowFunctionBody<'a>,
@@ -147,62 +174,94 @@ impl<'a> Traverse<'a, TransformState<'a>> for Common<'a> {
                 ArrowFunctionBody::FunctionBody(FunctionBody::boxed(span, [], statements, ctx))
             });
         }
-        self.arrow_function_converter.exit_arrow_function_body(body, ctx);
+        if let Some(conv) = &mut self.arrow_function_converter {
+            conv.exit_arrow_function_body(body, ctx);
+        }
     }
 
+    #[inline]
     fn enter_function_body(&mut self, body: &mut FunctionBody<'a>, ctx: &mut TraverseCtx<'a>) {
-        self.arrow_function_converter.enter_function_body(body, ctx);
+        if let Some(conv) = &mut self.arrow_function_converter {
+            conv.enter_function_body(body, ctx);
+        }
     }
 
+    #[inline]
     fn exit_function_body(&mut self, body: &mut FunctionBody<'a>, ctx: &mut TraverseCtx<'a>) {
-        self.arrow_function_converter.exit_function_body(body, ctx);
+        if let Some(conv) = &mut self.arrow_function_converter {
+            conv.exit_function_body(body, ctx);
+        }
     }
 
+    #[inline]
     fn enter_static_block(&mut self, block: &mut StaticBlock<'a>, ctx: &mut TraverseCtx<'a>) {
-        self.arrow_function_converter.enter_static_block(block, ctx);
+        if let Some(conv) = &mut self.arrow_function_converter {
+            conv.enter_static_block(block, ctx);
+        }
     }
 
+    #[inline]
     fn exit_static_block(&mut self, block: &mut StaticBlock<'a>, ctx: &mut TraverseCtx<'a>) {
-        self.arrow_function_converter.exit_static_block(block, ctx);
+        if let Some(conv) = &mut self.arrow_function_converter {
+            conv.exit_static_block(block, ctx);
+        }
     }
 
+    #[inline]
     fn enter_jsx_element_name(
         &mut self,
         element_name: &mut JSXElementName<'a>,
         ctx: &mut TraverseCtx<'a>,
     ) {
-        self.arrow_function_converter.enter_jsx_element_name(element_name, ctx);
+        if let Some(conv) = &mut self.arrow_function_converter {
+            conv.enter_jsx_element_name(element_name, ctx);
+        }
     }
 
+    #[inline]
     fn enter_jsx_member_expression_object(
         &mut self,
         object: &mut JSXMemberExpressionObject<'a>,
         ctx: &mut TraverseCtx<'a>,
     ) {
-        self.arrow_function_converter.enter_jsx_member_expression_object(object, ctx);
+        if let Some(conv) = &mut self.arrow_function_converter {
+            conv.enter_jsx_member_expression_object(object, ctx);
+        }
     }
 
+    #[inline]
     fn enter_expression(&mut self, expr: &mut Expression<'a>, ctx: &mut TraverseCtx<'a>) {
-        self.arrow_function_converter.enter_expression(expr, ctx);
+        if let Some(conv) = &mut self.arrow_function_converter {
+            conv.enter_expression(expr, ctx);
+        }
     }
 
+    #[inline]
     fn exit_expression(&mut self, expr: &mut Expression<'a>, ctx: &mut TraverseCtx<'a>) {
-        self.arrow_function_converter.exit_expression(expr, ctx);
+        if let Some(conv) = &mut self.arrow_function_converter {
+            conv.exit_expression(expr, ctx);
+        }
     }
 
+    #[inline]
     fn enter_binding_identifier(
         &mut self,
         node: &mut BindingIdentifier<'a>,
         ctx: &mut TraverseCtx<'a>,
     ) {
-        self.arrow_function_converter.enter_binding_identifier(node, ctx);
+        if let Some(conv) = &mut self.arrow_function_converter {
+            conv.enter_binding_identifier(node, ctx);
+        }
     }
 
+    #[inline]
     fn enter_identifier_reference(
         &mut self,
         node: &mut IdentifierReference<'a>,
         ctx: &mut TraverseCtx<'a>,
     ) {
-        self.arrow_function_converter.enter_identifier_reference(node, ctx);
+        if let Some(conv) = &mut self.arrow_function_converter {
+            conv.enter_identifier_reference(node, ctx);
+        }
     }
 }

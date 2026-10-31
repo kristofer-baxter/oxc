@@ -119,7 +119,9 @@ impl<'a> SemanticBuilder<'a> {
 
             // Finally, add the variable to all hoisted scopes
             // to support redeclaration checks when declaring variables with the same name later.
+            let bit = crate::scoping::ident_bloom_bit(name);
             for &scope_id in &var_scope_ids {
+                *self.scoping.scope_table.bloom_mut(scope_id) |= bit;
                 self.hoisting_variables.insert((scope_id, name), symbol_id);
             }
         });
