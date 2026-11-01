@@ -17,7 +17,7 @@ use oxc_cfg::{
     IterationInstructionKind, ReturnInstructionKind,
 };
 use oxc_diagnostics::{Diagnostics, OxcDiagnostic};
-use oxc_ecmascript::{BoundNames, IsSimpleParameterList};
+use oxc_ecmascript::IsSimpleParameterList;
 use oxc_span::{SourceType, Span};
 use oxc_str::Ident;
 use oxc_syntax::{
@@ -2577,6 +2577,32 @@ impl<'a> Visit<'a> for SemanticBuilder<'a> {
         self.leave_node(kind);
     }
 
+    fn visit_formal_parameters(&mut self, it: &FormalParameters<'a>) {
+        if it.items.is_empty() && it.rest.is_none() {
+            let kind = AstKind::FormalParameters(self.alloc(it));
+            self.enter_node(kind);
+            self.visit_span(&it.span);
+            self.leave_node(kind);
+            return;
+        }
+        // Checking whether a list is simple scans its parameters. Do this once per
+        // list, rather than once per parameter when binding each name.
+        let mut excludes = SymbolFlags::FunctionScopedVariableExcludes;
+        if matches!(
+            it.kind,
+            FormalParameterKind::ArrowFormalParameters
+                | FormalParameterKind::UniqueFormalParameters
+        ) || self.strict_mode()
+            || !it.is_simple_parameter_list()
+        {
+            excludes |= SymbolFlags::FunctionScopedVariable;
+        }
+        let previous = mem::replace(&mut self.formal_parameter_excludes, excludes);
+        oxc_ast_visit::walk::walk_formal_parameters(self, it);
+        // Default values and type annotations can contain nested parameter lists.
+        self.formal_parameter_excludes = previous;
+    }
+
     fn visit_update_expression(&mut self, it: &UpdateExpression<'a>) {
         let kind = AstKind::UpdateExpression(self.alloc(it));
         self.enter_node(kind);
@@ -2971,71 +2997,6 @@ impl<'a> Visit<'a> for SemanticBuilder<'a> {
         self.leave_node(kind);
     }
 
-    fn visit_formal_parameters(&mut self, params: &FormalParameters<'a>) {
-        let kind = AstKind::FormalParameters(self.alloc(params));
-        self.enter_node(kind);
-        self.visit_span(&params.span);
-
-        if !params.items.is_empty() || params.rest.is_some() {
-            let includes = SymbolFlags::FunctionScopedVariable;
-            let is_not_allowed_duplicate_parameters = matches!(
-                params.kind,
-                FormalParameterKind::ArrowFormalParameters
-                    | FormalParameterKind::UniqueFormalParameters
-            ) || self.strict_mode()
-                || !params.is_simple_parameter_list();
-            let excludes = if is_not_allowed_duplicate_parameters {
-                SymbolFlags::FunctionScopedVariable | SymbolFlags::FunctionScopedVariableExcludes
-            } else {
-                SymbolFlags::FunctionScopedVariableExcludes
-            };
-            let prev_excludes = mem::replace(&mut self.formal_parameter_excludes, excludes);
-
-            for param in &params.items {
-                let param_kind = AstKind::FormalParameter(self.alloc(param));
-                self.enter_node(param_kind);
-                if let BindingPattern::BindingIdentifier(ident) = &param.pattern {
-                    let symbol_id = self.declare_symbol(ident.span, ident.name, includes, excludes);
-                    ident.symbol_id.set(Some(symbol_id));
-                } else {
-                    param.bound_names(&mut |ident| {
-                        let symbol_id =
-                            self.declare_symbol(ident.span, ident.name, includes, excludes);
-                        ident.symbol_id.set(Some(symbol_id));
-                    });
-                }
-                self.visit_span(&param.span);
-                self.visit_parameter_decorators(&param.decorators);
-                self.visit_binding_pattern(&param.pattern);
-                if let Some(type_annotation) = &param.type_annotation {
-                    self.visit_ts_type_annotation(type_annotation);
-                }
-                if let Some(initializer) = &param.initializer {
-                    self.visit_expression(initializer);
-                }
-                self.leave_node(param_kind);
-            }
-            if let Some(rest) = &params.rest {
-                let rest_kind = AstKind::FormalParameterRest(self.alloc(rest));
-                self.enter_node(rest_kind);
-                rest.rest.argument.bound_names(&mut |ident| {
-                    let symbol_id = self.declare_symbol(ident.span, ident.name, includes, excludes);
-                    ident.symbol_id.set(Some(symbol_id));
-                });
-                self.visit_span(&rest.span);
-                self.visit_parameter_decorators(&rest.decorators);
-                self.visit_binding_rest_element(&rest.rest);
-                if let Some(type_annotation) = &rest.type_annotation {
-                    self.visit_ts_type_annotation(type_annotation);
-                }
-                self.leave_node(rest_kind);
-            }
-            self.formal_parameter_excludes = prev_excludes;
-        }
-
-        self.leave_node(kind);
-    }
-
     fn visit_formal_parameter(&mut self, param: &FormalParameter<'a>) {
         let kind = AstKind::FormalParameter(self.alloc(param));
         self.enter_node(kind);
@@ -3368,15 +3329,6 @@ impl<'a> Visit<'a> for SemanticBuilder<'a> {
         }
     }
 
-    fn visit_expression_statement(&mut self, it: &ExpressionStatement<'a>) {
-        let kind = AstKind::ExpressionStatement(self.alloc(it));
-        self.enter_node(kind);
-        control_flow!(self, |cfg| cfg.enter_statement(self.node_store.current_node_id));
-        self.visit_span(&it.span);
-        self.visit_expression(&it.expression);
-        self.leave_node(kind);
-    }
-
     fn visit_ts_type_reference(&mut self, ty: &TSTypeReference<'a>) {
         match &mut self.node_store.kind {
             AstNodeStoreKind::Full(_) => {
@@ -3617,6 +3569,15 @@ impl<'a> Visit<'a> for SemanticBuilder<'a> {
         }
         self.visit_ts_type_name(&name.left);
         self.visit_identifier_name(&name.right);
+        self.leave_node(kind);
+    }
+
+    fn visit_expression_statement(&mut self, it: &ExpressionStatement<'a>) {
+        let kind = AstKind::ExpressionStatement(self.alloc(it));
+        self.enter_node(kind);
+        control_flow!(self, |cfg| cfg.enter_statement(self.node_store.current_node_id));
+        self.visit_span(&it.span);
+        self.visit_expression(&it.expression);
         self.leave_node(kind);
     }
 

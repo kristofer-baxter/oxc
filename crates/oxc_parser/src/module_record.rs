@@ -133,8 +133,7 @@ impl<'a> ModuleRecordBuilder<'a> {
         // otherwise be quadratic, avoiding a system-heap allocation per module.
         let import_map: Option<oxc_allocator::HashMap<'a, &'a str, usize>> =
             if import_len > 8 && export_entries.len().saturating_mul(import_len) >= 64 {
-                let mut map =
-                    oxc_allocator::HashMap::with_capacity_in(import_len, &self.allocator);
+                let mut map = oxc_allocator::HashMap::with_capacity_in(import_len, self.allocator);
                 for (idx, entry) in self.module_record.import_entries.iter().enumerate() {
                     map.entry(entry.local_name.name.as_str()).or_insert(idx);
                 }

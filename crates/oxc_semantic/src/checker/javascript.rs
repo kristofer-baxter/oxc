@@ -563,6 +563,8 @@ fn check_string_literal_impl(
     //   legacy_octalEscapeSequence
     //   non_octal_decimal_escape_sequence
     // It is a Syntax Error if the source text matched by this production is strict mode code.
+    // Quotes contribute two bytes, and every escape contracts the cooked WTF-8 value.
+    // Equal content lengths therefore prove that there are no escapes to check.
     if (lit.span.size() as usize) == lit.value.len() + 2 || !ctx.strict_mode() {
         return;
     }
@@ -573,66 +575,61 @@ fn check_string_literal_impl(
     }
     let raw = lit.span.source_text(ctx.source_text);
     let raw_len = raw.len();
-    // Quotes contribute two bytes, and every escape contracts the cooked WTF-8 value.
-    // Equal content lengths therefore prove that there are no escapes to check.
-    if raw_len != lit.value.len() + 2 {
-        if raw_len >= MIN_STRING_SIZE_FOR_BATCH_CHECK {
-            let raw_bytes = raw.as_bytes();
-            // Exclude the last byte (closing quote) from the search haystack.
-            // This ensures any backslash found has at least one byte following it.
-            let haystack = &raw_bytes[..raw_len - 1];
-            let mut skip_next_backslash = false;
-            for backslash_index in memchr_iter(b'\\', haystack) {
-                if skip_next_backslash {
-                    skip_next_backslash = false;
-                    continue;
+    if raw_len >= MIN_STRING_SIZE_FOR_BATCH_CHECK {
+        let raw_bytes = raw.as_bytes();
+        // Exclude the last byte (closing quote) from the search haystack.
+        // This ensures any backslash found has at least one byte following it.
+        let haystack = &raw_bytes[..raw_len - 1];
+        let mut skip_next_backslash = false;
+        for backslash_index in memchr_iter(b'\\', haystack) {
+            if skip_next_backslash {
+                skip_next_backslash = false;
+                continue;
+            }
+            debug_assert!(
+                backslash_index + 1 < raw_bytes.len(),
+                "backslash at index {} has no following byte in string of length {}",
+                backslash_index,
+                raw_bytes.len()
+            );
+            // SAFETY: We search `haystack` which excludes the last byte, so any backslash
+            // found is at index < raw_len - 1, meaning backslash_index + 1 < raw_len.
+            let next_byte = unsafe { *raw_bytes.get_unchecked(backslash_index + 1) };
+            match next_byte {
+                b'\\' => {
+                    // Escaped backslash - skip the next backslash in memchr results
+                    skip_next_backslash = true;
                 }
-                debug_assert!(
-                    backslash_index + 1 < raw_bytes.len(),
-                    "backslash at index {} has no following byte in string of length {}",
-                    backslash_index,
-                    raw_bytes.len()
-                );
-                // SAFETY: We search `haystack` which excludes the last byte, so any backslash
-                // found is at index < raw_len - 1, meaning backslash_index + 1 < raw_len.
-                let next_byte = unsafe { *raw_bytes.get_unchecked(backslash_index + 1) };
-                match next_byte {
-                    b'\\' => {
-                        // Escaped backslash - skip the next backslash in memchr results
-                        skip_next_backslash = true;
-                    }
-                    b'0' => {
-                        let following_byte = raw_bytes.get(backslash_index + 2);
-                        if following_byte.is_some_and(u8::is_ascii_digit) {
-                            return ctx.error(diagnostics::legacy_octal(lit.span));
-                        }
-                    }
-                    b'1'..=b'7' => {
+                b'0' => {
+                    let following_byte = raw_bytes.get(backslash_index + 2);
+                    if following_byte.is_some_and(u8::is_ascii_digit) {
                         return ctx.error(diagnostics::legacy_octal(lit.span));
                     }
-                    b'8'..=b'9' => {
+                }
+                b'1'..=b'7' => {
+                    return ctx.error(diagnostics::legacy_octal(lit.span));
+                }
+                b'8'..=b'9' => {
+                    return ctx.error(diagnostics::non_octal_decimal_escape_sequence(lit.span));
+                }
+                _ => {}
+            }
+        }
+    } else {
+        let mut bytes = raw.bytes().peekable();
+        while let Some(b) = bytes.next() {
+            if b == b'\\' {
+                match bytes.next() {
+                    Some(b'0') if bytes.peek().is_some_and(u8::is_ascii_digit) => {
+                        return ctx.error(diagnostics::legacy_octal(lit.span));
+                    }
+                    Some(b'1'..=b'7') => {
+                        return ctx.error(diagnostics::legacy_octal(lit.span));
+                    }
+                    Some(b'8'..=b'9') => {
                         return ctx.error(diagnostics::non_octal_decimal_escape_sequence(lit.span));
                     }
                     _ => {}
-                }
-            }
-        } else {
-            let mut bytes = raw.bytes().peekable();
-            while let Some(b) = bytes.next() {
-                if b == b'\\' {
-                    match bytes.next() {
-                        Some(b'0') if bytes.peek().is_some_and(u8::is_ascii_digit) => {
-                            return ctx.error(diagnostics::legacy_octal(lit.span));
-                        }
-                        Some(b'1'..=b'7') => {
-                            return ctx.error(diagnostics::legacy_octal(lit.span));
-                        }
-                        Some(b'8'..=b'9') => {
-                            return ctx
-                                .error(diagnostics::non_octal_decimal_escape_sequence(lit.span));
-                        }
-                        _ => {}
-                    }
                 }
             }
         }

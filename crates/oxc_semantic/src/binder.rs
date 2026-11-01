@@ -287,10 +287,15 @@ impl<'a> Binder<'a> for FormalParameter<'a> {
         let includes = SymbolFlags::FunctionScopedVariable;
         let excludes = builder.formal_parameter_excludes;
 
-        self.bound_names(&mut |ident| {
+        if let BindingPattern::BindingIdentifier(ident) = &self.pattern {
             let symbol_id = builder.declare_symbol(ident.span, ident.name, includes, excludes);
             ident.symbol_id.set(Some(symbol_id));
-        });
+        } else {
+            self.bound_names(&mut |ident| {
+                let symbol_id = builder.declare_symbol(ident.span, ident.name, includes, excludes);
+                ident.symbol_id.set(Some(symbol_id));
+            });
+        }
     }
 }
 
