@@ -1,14 +1,19 @@
 use std::arch::aarch64::*;
 
-use crate::pipeline::chunk::{load128, mm16_nibble, mm64_neon, veq128};
+use crate::{
+    cpu::{Neon, cpu_version},
+    pipeline::chunk::{load128, mm16_nibble, mm64_neon, veq128},
+};
 
 /// First byte at or after `i` that is one of `needles`, or `n`.
+#[cpu_version(Neon)]
 #[inline]
 pub unsafe fn find_neon<const K: usize>(
     src: *const u8,
     n: usize,
     mut i: usize,
     needles: [u8; K],
+    _cpu: Neon,
 ) -> usize {
     while i + 16 <= n {
         let m = mm16_nibble(any_of(load128(src, i), needles));
@@ -55,8 +60,9 @@ unsafe fn bracket_mask16(v: uint8x16_t) -> uint8x16_t {
 }
 
 /// Bits of the 64 bytes at `base` that are brackets (`(){}[]`): bit `i` for byte `base + i`.
+#[cpu_version(Neon)]
 #[inline]
-pub fn bracket_bits_neon(src: &[u8], base: usize) -> u64 {
+pub fn bracket_bits_neon(src: &[u8], base: usize, _cpu: Neon) -> u64 {
     let block = &src[base..base + 64];
     let p = block.as_ptr();
     // SAFETY: `block` holds 64 bytes, and this module is compiled only when `neon` is enabled.

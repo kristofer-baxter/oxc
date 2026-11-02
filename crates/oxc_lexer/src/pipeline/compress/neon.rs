@@ -7,7 +7,8 @@ use std::{
 use oxc_span::Span;
 
 use crate::{
-    pipeline::{cpu::Neon, lanes::Lanes},
+    cpu::{Neon, cpu_version},
+    pipeline::lanes::Lanes,
     token::{TRIVIA_MAX, TRIVIA_MIN, is_trivia_byte, matches_tk, tk},
 };
 
@@ -24,7 +25,7 @@ pub struct PairLuts {
 const _: () = assert!(offset_of!(PairLuts, lutpad).is_multiple_of(64));
 
 impl PairLuts {
-    #[target_feature(enable = "neon")]
+    #[cpu_version(Neon)]
     fn new(_cpu: Neon) -> Box<Self> {
         let mut luts = Box::<PairLuts>::new_uninit();
         let (lut0z, lutpad) = unsafe {
@@ -58,12 +59,14 @@ impl PairLuts {
     }
 }
 
+#[cpu_version(Neon)]
 pub(super) fn init_pair_luts_neon(cpu: Neon) {
-    PAIR_LUTS.get_or_init(|| unsafe { PairLuts::new(cpu) });
+    PAIR_LUTS.get_or_init(|| PairLuts::new(cpu));
 }
 
+#[cpu_version(Neon)]
 #[inline(always)]
-unsafe fn get_pair_luts() -> &'static PairLuts {
+unsafe fn get_pair_luts(_cpu: Neon) -> &'static PairLuts {
     unsafe { PAIR_LUTS.get().unwrap_unchecked() }
 }
 
@@ -108,8 +111,8 @@ const fn bcompact8() -> [[u8; 8]; 256] {
     t
 }
 
+#[cpu_version(Neon)]
 #[inline(never)]
-#[target_feature(enable = "neon")]
 pub(super) unsafe fn compress_blocks_neon(
     st: *const u64,
     kind: *const u8,
@@ -117,9 +120,9 @@ pub(super) unsafe fn compress_blocks_neon(
     b1: usize,
     starts: *mut u32,
     kinds: *mut u8,
-    _cpu: Neon,
+    cpu: Neon,
 ) -> usize {
-    let pair_luts = get_pair_luts();
+    let pair_luts = get_pair_luts(cpu);
     let lut0z = pair_luts.lut0z.as_ptr().cast::<u8>();
     let lutpad = pair_luts.lutpad.as_ptr().cast::<u8>();
 
@@ -171,14 +174,14 @@ pub(super) unsafe fn compress_blocks_neon(
     m
 }
 
-#[target_feature(enable = "neon")]
+#[cpu_version(Neon)]
 pub(super) unsafe fn build_spans_neon(
     stage_kind: *const u8,
     stage_pos: *const u32,
     m: usize,
     spans: *mut Span,
     sig_kinds: *mut u8,
-    _cpu: Neon,
+    cpu: Neon,
 ) -> usize {
     const BITS8: [u8; 8] = [1, 2, 4, 8, 16, 32, 64, 128];
     let sp = spans.cast::<u64>();
@@ -229,7 +232,7 @@ pub(super) unsafe fn build_spans_neon(
         let k = *stage_kind.add(j);
         *sp.add(w) = stage_pos.add(j).cast::<u64>().read_unaligned();
         *sig_kinds.add(w) = k;
-        w += usize::from(!is_trivia_byte(k) || k == tk!(Hashbang));
+        w += usize::from(!is_trivia_byte(k, cpu) || k == tk!(Hashbang));
         j += 1;
     }
 
@@ -246,7 +249,7 @@ unsafe fn mm64(a: uint8x16_t, b: uint8x16_t, c: uint8x16_t, d: uint8x16_t) -> u6
     vgetq_lane_u64::<0>(vreinterpretq_u64_u8(vpaddq_u8(s, s)))
 }
 
-#[target_feature(enable = "neon")]
+#[cpu_version(Neon)]
 pub(super) unsafe fn lanes_post_neon(
     src: &[u8],
     out_kinds: *const u8,
@@ -254,7 +257,7 @@ pub(super) unsafe fn lanes_post_neon(
     m: usize,
     nn: u32,
     lanes: &mut Lanes,
-    _cpu: Neon,
+    cpu: Neon,
 ) {
     let v_num = vdupq_n_u8(tk!(Number));
     let v_big = vdupq_n_u8(tk!(BigInt));
@@ -291,7 +294,7 @@ pub(super) unsafe fn lanes_post_neon(
 
         let mut mask = mm64(h0, h1, h2, h3);
         while mask != 0 {
-            emit_value(src, out_kinds, out_spans, i + mask.trailing_zeros() as usize, lanes);
+            emit_value(src, out_kinds, out_spans, i + mask.trailing_zeros() as usize, lanes, cpu);
             mask &= mask - 1;
         }
         i += 64;
@@ -302,7 +305,7 @@ pub(super) unsafe fn lanes_post_neon(
     while i < m {
         let k = *out_kinds.add(i);
         if matches_tk!(k, Number | BigInt | IdentEscaped | PrivateIdentEscaped) {
-            emit_value(src, out_kinds, out_spans, i, lanes);
+            emit_value(src, out_kinds, out_spans, i, lanes, cpu);
         }
         inv_dirty |= k == tk!(Invalid);
         i += 1;

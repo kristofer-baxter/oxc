@@ -1,50 +1,49 @@
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx2",
-    target_feature = "bmi2",
-    target_feature = "popcnt"
-))]
+use crate::cpu::{Cpu, cpu_multiversion, cpu_select};
+
+#[cfg(target_arch = "x86_64")]
 mod avx2;
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx2",
-    target_feature = "bmi2",
-    target_feature = "popcnt"
-))]
-pub(super) use avx2::{
-    scan_block_comment_avx2 as scan_block_comment, scan_line_comment_avx2 as scan_line_comment,
-};
+#[cfg(target_arch = "x86_64")]
+use avx2::{scan_block_comment_avx2, scan_line_comment_avx2};
 
-#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+#[cfg(target_arch = "aarch64")]
 mod neon;
-#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
-pub(super) use neon::{
-    scan_block_comment_neon as scan_block_comment, scan_line_comment_neon as scan_line_comment,
-};
+#[cfg(target_arch = "aarch64")]
+use neon::{scan_block_comment_neon, scan_line_comment_neon};
 
-#[cfg(not(any(
-    all(
-        target_arch = "x86_64",
-        target_feature = "avx2",
-        target_feature = "bmi2",
-        target_feature = "popcnt"
-    ),
-    all(target_arch = "aarch64", target_feature = "neon")
-)))]
 mod generic;
-#[cfg(not(any(
-    all(
-        target_arch = "x86_64",
-        target_feature = "avx2",
-        target_feature = "bmi2",
-        target_feature = "popcnt"
-    ),
-    all(target_arch = "aarch64", target_feature = "neon")
-)))]
-pub(super) use generic::{
-    scan_block_comment_generic as scan_block_comment,
-    scan_line_comment_generic as scan_line_comment,
-};
+use generic::{scan_block_comment_generic, scan_line_comment_generic};
 
 mod common;
 pub(super) use common::{scan_ident_esc, scan_number, scan_quoted, scan_regex, scan_tmpl_text};
+
+#[cpu_multiversion]
+#[inline(always)]
+pub(super) unsafe fn scan_block_comment(
+    src: *const u8,
+    n: usize,
+    i: usize,
+    cpu: impl Cpu,
+) -> (usize, bool, i64) {
+    cpu_select!(cpu, {
+        Avx2(cpu) => scan_block_comment_avx2(src, n, i, cpu),
+        Neon(cpu) => scan_block_comment_neon(src, n, i, cpu),
+        Generic(_) => scan_block_comment_generic(src, n, i),
+    })
+}
+
+/// Scan a `//` line comment to its LineTerminator (LF, CR, or LS/PS),
+/// tracking the first `@license` / `@preserve` position for comment metadata.
+#[cpu_multiversion]
+#[inline(always)]
+pub(super) unsafe fn scan_line_comment(
+    src: *const u8,
+    n: usize,
+    i: usize,
+    cpu: impl Cpu,
+) -> (usize, i64) {
+    cpu_select!(cpu, {
+        Avx2(cpu) => scan_line_comment_avx2(src, n, i, cpu),
+        Neon(cpu) => scan_line_comment_neon(src, n, i, cpu),
+        Generic(_) => scan_line_comment_generic(src, n, i),
+    })
+}
