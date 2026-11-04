@@ -5,7 +5,7 @@
 //!     * [rustc](https://github.com/rust-lang/rust/blob/1.82.0/compiler/rustc_lexer/src)
 //!     * [v8](https://v8.dev/blog/scanner)
 
-use std::{mem, num::NonZeroU32};
+use std::mem;
 
 use rustc_hash::FxHashMap;
 
@@ -46,15 +46,14 @@ pub use number::{parse_big_int, parse_float, parse_int};
 pub use token::Token;
 
 use source::{Source, SourcePosition};
-use trivia_builder::TriviaBuilder;
+use trivia_builder::{AnnotationComments, TriviaBuilder};
 
 #[derive(Debug)]
 pub struct LexerCheckpoint<'a> {
     source_position: SourcePosition<'a>,
     errors_snapshot: ErrorSnapshot<'a>,
     tokens_len: usize,
-    pure_comments: Option<(u32, NonZeroU32)>,
-    no_side_effects_comments: Option<(u32, NonZeroU32)>,
+    annotation_comments: AnnotationComments,
 }
 
 #[derive(Debug)]
@@ -209,8 +208,7 @@ impl<'a, C: Config> Lexer<'a, C> {
             source_position: self.source.position(),
             errors_snapshot,
             tokens_len: self.tokens.len(),
-            pure_comments: self.trivia_builder.previous_token_pure_comments(),
-            no_side_effects_comments: self.trivia_builder.previous_token_no_side_effects_comments(),
+            annotation_comments: self.trivia_builder.annotation_comments,
         }
     }
 
@@ -230,8 +228,7 @@ impl<'a, C: Config> Lexer<'a, C> {
             source_position: self.source.position(),
             errors_snapshot,
             tokens_len: self.tokens.len(),
-            pure_comments: self.trivia_builder.previous_token_pure_comments(),
-            no_side_effects_comments: self.trivia_builder.previous_token_no_side_effects_comments(),
+            annotation_comments: self.trivia_builder.annotation_comments,
         }
     }
 
@@ -248,8 +245,7 @@ impl<'a, C: Config> Lexer<'a, C> {
 
         self.tokens.truncate(checkpoint.tokens_len);
         self.source.set_position(checkpoint.source_position);
-        self.trivia_builder.set_pure_comments(checkpoint.pure_comments);
-        self.trivia_builder.set_no_side_effects_comments(checkpoint.no_side_effects_comments);
+        self.trivia_builder.annotation_comments = checkpoint.annotation_comments;
     }
 
     pub fn peek_token(&mut self) -> Token {
@@ -340,8 +336,7 @@ impl<'a, C: Config> Lexer<'a, C> {
     #[inline(always)]
     fn finish_fast_token(&mut self, token: Token) -> Token {
         debug_assert_eq!(self.token, Token::default());
-        self.trivia_builder.clear_pure_comments();
-        self.trivia_builder.clear_no_side_effects_comments();
+        self.trivia_builder.clear_annotation_comments();
         if self.config.tokens() {
             self.tokens.push_fast(token);
         }
@@ -892,8 +887,7 @@ impl<'a, C: Config> Lexer<'a, C> {
     /// Whitespace and line terminators are skipped
     #[inline] // Make sure is inlined into `next_token`
     fn read_next_token(&mut self) -> Kind {
-        self.trivia_builder.clear_pure_comments();
-        self.trivia_builder.clear_no_side_effects_comments();
+        self.trivia_builder.clear_annotation_comments();
 
         let end_pos = self.source.end();
         loop {
@@ -956,8 +950,7 @@ impl<'a, C: Config> Lexer<'a, C> {
 
     #[inline]
     fn read_next_jsx_attribute_value(&mut self) -> Kind {
-        self.trivia_builder.clear_pure_comments();
-        self.trivia_builder.clear_no_side_effects_comments();
+        self.trivia_builder.clear_annotation_comments();
 
         let end_pos = self.source.end();
         loop {

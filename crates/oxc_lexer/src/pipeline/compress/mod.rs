@@ -1,26 +1,22 @@
 use oxc_span::Span;
 
 use crate::{
-    cpu::{Cpu, DynCpu, cpu_multiversion, cpu_select},
+    cpu::{Cpu, DynCpu, cpu_multiversion, to_dyn},
     token::{SPAN_SENTINELS, tk},
 };
 
 use crate::pipeline::lanes::Lanes;
 
-#[cfg(target_arch = "x86_64")]
 mod avx2;
-#[cfg(target_arch = "x86_64")]
-use avx2::{build_spans_avx2, compress_blocks_avx2, init_pair_luts_avx2, lanes_post_avx2};
-
+mod common;
+mod generic;
 #[cfg(target_arch = "aarch64")]
 mod neon;
+
+use avx2::{build_spans_avx2, compress_blocks_avx2, init_pair_luts_avx2, lanes_post_avx2};
+use generic::{build_spans_generic, compress_blocks_generic, lanes_post_generic};
 #[cfg(target_arch = "aarch64")]
 use neon::{build_spans_neon, compress_blocks_neon, init_pair_luts_neon, lanes_post_neon};
-
-mod generic;
-use generic::{build_spans_generic, compress_blocks_generic, lanes_post_generic};
-
-mod common;
 
 const STAGE_BLOCKS: usize = 32;
 pub const STAGE_CAP: usize = STAGE_BLOCKS * 64 + 128;
@@ -78,11 +74,12 @@ pub unsafe fn write_sentinels(n: u32, spans: *mut Span, sig_kinds: *mut u8, _cpu
 ///
 /// `PairLuts` is only used by AVX2 implementation, so this function is a no-op on other CPUs.
 pub(super) fn init_pair_luts(cpu: DynCpu) {
-    cpu_select!(cpu, {
-        Avx2(cpu) => init_pair_luts_avx2(cpu),
-        Neon(cpu) => init_pair_luts_neon(cpu),
-        Generic(_) => {}
-    });
+    match cpu {
+        DynCpu::Avx2(cpu) => init_pair_luts_avx2(cpu),
+        #[cfg(target_arch = "aarch64")]
+        DynCpu::Neon(cpu) => init_pair_luts_neon(cpu),
+        _ => {}
+    }
 }
 
 #[cpu_multiversion]
@@ -96,11 +93,12 @@ unsafe fn compress_blocks(
     kinds: *mut u8,
     cpu: impl Cpu,
 ) -> usize {
-    cpu_select!(cpu, {
-        Avx2(cpu) => compress_blocks_avx2(st, kind, b0, b1, starts, kinds, cpu),
-        Neon(cpu) => compress_blocks_neon(st, kind, b0, b1, starts, kinds, cpu),
-        Generic(_) => compress_blocks_generic(st, kind, b0, b1, starts, kinds),
-    })
+    match to_dyn(cpu) {
+        DynCpu::Avx2(cpu) => compress_blocks_avx2(st, kind, b0, b1, starts, kinds, cpu),
+        #[cfg(target_arch = "aarch64")]
+        DynCpu::Neon(cpu) => compress_blocks_neon(st, kind, b0, b1, starts, kinds, cpu),
+        _ => compress_blocks_generic(st, kind, b0, b1, starts, kinds),
+    }
 }
 
 #[cpu_multiversion]
@@ -113,11 +111,12 @@ unsafe fn build_spans(
     sig_kinds: *mut u8,
     cpu: impl Cpu,
 ) -> usize {
-    cpu_select!(cpu, {
-        Avx2(cpu) => build_spans_avx2(stage_kind, stage_pos, m, spans, sig_kinds, cpu),
-        Neon(cpu) => build_spans_neon(stage_kind, stage_pos, m, spans, sig_kinds, cpu),
-        Generic(_) => build_spans_generic(stage_kind, stage_pos, m, spans, sig_kinds),
-    })
+    match to_dyn(cpu) {
+        DynCpu::Avx2(cpu) => build_spans_avx2(stage_kind, stage_pos, m, spans, sig_kinds, cpu),
+        #[cfg(target_arch = "aarch64")]
+        DynCpu::Neon(cpu) => build_spans_neon(stage_kind, stage_pos, m, spans, sig_kinds, cpu),
+        _ => build_spans_generic(stage_kind, stage_pos, m, spans, sig_kinds),
+    }
 }
 
 #[cpu_multiversion]
@@ -131,9 +130,10 @@ unsafe fn lanes_post(
     lanes: &mut Lanes,
     cpu: impl Cpu,
 ) {
-    cpu_select!(cpu, {
-        Avx2(cpu) => lanes_post_avx2(src, out_kinds, out_spans, m, nn, lanes, cpu),
-        Neon(cpu) => lanes_post_neon(src, out_kinds, out_spans, m, nn, lanes, cpu),
-        Generic(_) => lanes_post_generic(src, out_kinds, out_spans, m, nn, lanes),
-    });
+    match to_dyn(cpu) {
+        DynCpu::Avx2(cpu) => lanes_post_avx2(src, out_kinds, out_spans, m, nn, lanes, cpu),
+        #[cfg(target_arch = "aarch64")]
+        DynCpu::Neon(cpu) => lanes_post_neon(src, out_kinds, out_spans, m, nn, lanes, cpu),
+        _ => lanes_post_generic(src, out_kinds, out_spans, m, nn, lanes),
+    };
 }
