@@ -602,7 +602,8 @@ impl<'a> SemanticBuilder<'a> {
         {
             return None;
         }
-        let binding_id = self.scoping.cell.borrow_dependent().bindings[scope_id].get(&name).copied();
+        let binding_id =
+            self.scoping.cell.borrow_dependent().bindings[scope_id].get(&name).copied();
 
         if let Some(symbol_id) = binding_id {
             let flags = self.scoping.symbol_flags(symbol_id);

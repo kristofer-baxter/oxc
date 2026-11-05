@@ -229,6 +229,32 @@ const A = (
     expect(result.errors).toStrictEqual([]);
   });
 
+  it("should sort classes in calls printed as member chains", async () => {
+    // Outside JSX, since a `className` context would sort them anyway
+    const input = `const a = tw.style("p-4  flex");
+const b = cn.a("p-4  flex").b("m-2  block").c();
+const c = cn.foo["a  b"]("x  y");
+const d = cn(x.y("a  b"), cn.x("p-4  flex"));
+`;
+    const options = { experimentalTailwindcss: { functions: ["cn", "tw"] } };
+
+    const result = await format("test.ts", input, options);
+
+    // Like the plugin, only the arguments are sorted, not the computed key `["a  b"]`
+    expect(result.code).toMatchInlineSnapshot(`
+      "const a = tw.style("flex p-4");
+      const b = cn.a("flex p-4").b("m-2 block").c();
+      const c = cn.foo["a  b"]("x y");
+      const d = cn(x.y("a  b"), cn.x("flex p-4"));
+      "
+    `);
+    expect(result.errors).toStrictEqual([]);
+
+    // Formatting the output again should not change it.
+    const second = await format("test.ts", result.code, options);
+    expect(second.code).toBe(result.code);
+  });
+
   it("should preserve whitespace when preserveWhitespace is true", async () => {
     // Input with leading/trailing whitespace in class string
     const input = `const A = <div className="  p-4 flex  ">Hello</div>;`;
@@ -697,7 +723,8 @@ const f = clsx({ kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk
     const result = await format("test.ts", input, options);
 
     // The line breaks are collapsed, so the template is not hugged as multiline,
-    // and the collapsed key and call arguments are short.
+    // and the collapsed key and Tailwind call arguments are short.
+    // `foo()` is not a Tailwind function, so its argument is kept and measured as is.
     expect(result.code).toMatchInlineSnapshot(`
       "const a = clsx(
           \`flex items-center justify-between p-4 \${active ? "bg-white" : "bg-black"} text-black hover:bg-gray-100\`,
@@ -714,8 +741,9 @@ const f = clsx({ kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk
       const eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee =
           clsx(\`flex p-4\`);
       const f = clsx({
-          kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk:
-              foo(\`flex p-4\`),
+          kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk: foo(
+              \`p-4                           flex\`,
+          ),
       });
       "
     `);
@@ -724,6 +752,40 @@ const f = clsx({ kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk
     // Formatting the output again should not change it.
     const second = await format("test.ts", result.code, options);
     expect(second.code).toBe(result.code);
+  });
+
+  it("should decide object key quotes from a key collapsing to a single class", async () => {
+    const input = `const a = clsx({ " p ": x, "a  b": y, " 1 ": z, "  ": w });
+const b = clsx({ " p ": x, c: y });
+const c = clsx(\`a\${{ " p ": x }}b\`);
+`;
+    const options = { experimentalTailwindcss: { functions: ["clsx"] } };
+    const consistentOptions = { ...options, quoteProps: "consistent" as const };
+
+    const result = await format("test.js", input, options);
+    const consistent = await format("test.js", input, consistentOptions);
+
+    // A single class is printed without the sorter, so it's quoted like a plain key,
+    // unless a boundary space is kept next to a template quasi
+    expect(result.code).toMatchInlineSnapshot(`
+      "const a = clsx({ p: x, "a b": y, 1: z, " ": w });
+      const b = clsx({ p: x, c: y });
+      const c = clsx(\`a\${{ " p ": x }}b\`);
+      "
+    `);
+    expect(consistent.code).toMatchInlineSnapshot(`
+      "const a = clsx({ "p": x, "a b": y, "1": z, " ": w });
+      const b = clsx({ p: x, c: y });
+      const c = clsx(\`a\${{ " p ": x }}b\`);
+      "
+    `);
+    expect(result.errors).toStrictEqual([]);
+
+    // Formatting the output again should not change it.
+    expect((await format("test.js", result.code, options)).code).toBe(result.code);
+    expect((await format("test.js", consistent.code, consistentOptions)).code).toBe(
+      consistent.code,
+    );
   });
 
   // Tests for can_collapse_whitespace in template literal expressions
@@ -1003,6 +1065,37 @@ const f = clsx({ kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk
     // The " " in split should be preserved
     expect(result.code).toContain('split(" ")');
     expect(result.errors).toStrictEqual([]);
+  });
+
+  it("should NOT sort template literals inside nested non-Tailwind call expressions", async () => {
+    const input = `const a = cn(x.includes(\`a  b\`) && "p-4  flex");
+const b = cn(x.includes(\`\${"a  b"}  c\`));
+const C = <div className={x.split(\`a  b\`).length ? "p-4  flex" : ""} />;
+const D = <div className={foo(\`p-4
+  flex\`)} />;
+`;
+    const options = { experimentalTailwindcss: { functions: ["cn"] } };
+
+    const result = await format("test.tsx", input, options);
+
+    // Like strings, the templates (and strings inside them) are kept as is
+    expect(result.code).toMatchInlineSnapshot(`
+      "const a = cn(x.includes(\`a  b\`) && "flex p-4");
+      const b = cn(x.includes(\`\${"a  b"}  c\`));
+      const C = <div className={x.split(\`a  b\`).length ? "flex p-4" : ""} />;
+      const D = (
+        <div
+          className={foo(\`p-4
+        flex\`)}
+        />
+      );
+      "
+    `);
+    expect(result.errors).toStrictEqual([]);
+
+    // Formatting the output again should not change it.
+    const second = await format("test.tsx", result.code, options);
+    expect(second.code).toBe(result.code);
   });
 
   it("should preserve escape sequences in nested call expressions", async () => {
