@@ -662,6 +662,37 @@ fn generate_struct(
             field_type.constructor_name(schema)
         };
         let internal_pos = internal_pos_offset(field.offset_64());
+        let value_expr = if field_name == "name"
+            && matches!(
+                struct_name,
+                "IdentifierName"
+                    | "IdentifierReference"
+                    | "BindingIdentifier"
+                    | "LabelIdentifier"
+                    | "JSXIdentifier"
+            ) {
+            let ptr_pos32 = internal_pos_offset_shift(field.offset_64(), 2);
+            format!(
+                "internal.ast.buffer.int32[{ptr_pos32}] >= internal.ast.sourceStartPos ? internal.ast.sourceText.slice(this.start, this.end) : {value_fn}({internal_pos}, internal.ast)"
+            )
+        } else if field_name == "name" && struct_name == "PrivateIdentifier" {
+            let ptr_pos32 = internal_pos_offset_shift(field.offset_64(), 2);
+            format!(
+                "internal.ast.buffer.int32[{ptr_pos32}] >= internal.ast.sourceStartPos ? internal.ast.sourceText.slice(this.start + 1, this.end) : {value_fn}({internal_pos}, internal.ast)"
+            )
+        } else if field_name == "value" && struct_name == "StringLiteral" {
+            let ptr_pos32 = internal_pos_offset_shift(field.offset_64(), 2);
+            format!(
+                "internal.ast.buffer.int32[{ptr_pos32}] >= internal.ast.sourceStartPos ? internal.ast.sourceText.slice(this.start + 1, this.end - 1) : {value_fn}({internal_pos}, internal.ast)"
+            )
+        } else if field_name == "value" && struct_name == "JSXText" {
+            let ptr_pos32 = internal_pos_offset_shift(field.offset_64(), 2);
+            format!(
+                "internal.ast.buffer.int32[{ptr_pos32}] >= internal.ast.sourceStartPos ? internal.ast.sourceText.slice(this.start, this.end) : {value_fn}({internal_pos}, internal.ast)"
+            )
+        } else {
+            format!("{value_fn}({internal_pos}, internal.ast)")
+        };
 
         // TODO: Currently we store all internal data in an object, stored as `#internal` property.
         // This is on assumption that private field access is relatively slow, so we only want to
@@ -679,7 +710,7 @@ fn generate_struct(
                     const internal = this.#internal,
                         cached = internal.${field_name};
                     if (cached !== void 0) return cached;
-                    return internal.${field_name} = {value_fn}({internal_pos}, internal.ast);
+                    return internal.${field_name} = {value_expr};
                 }}
             ");
         } else {
@@ -687,7 +718,7 @@ fn generate_struct(
             write_it!(getters, "
                 get {field_name}() {{
                     const internal = this.#internal;
-                    return {value_fn}({internal_pos}, internal.ast);
+                    return {value_expr};
                 }}
             ");
         }
@@ -1191,6 +1222,27 @@ where
 {
     let offset = offset.try_into().unwrap();
     if offset == 0 { Cow::Borrowed("internal.pos") } else { format_cow!("internal.pos + {offset}") }
+}
+
+/// Generate internal pos offset and shift string.
+fn internal_pos_offset_shift<O, S>(offset: O, shift: S) -> Cow<'static, str>
+where
+    O: TryInto<u64>,
+    <O as TryInto<u64>>::Error: Debug,
+    S: TryInto<u64>,
+    <S as TryInto<u64>>::Error: Debug,
+{
+    let offset = offset.try_into().unwrap();
+    let shift = shift.try_into().unwrap();
+    match (offset, shift) {
+        (0, 0) => Cow::Borrowed("internal.pos"),
+        (0, _) => format_cow!("internal.pos >> {shift}"),
+        (_, 0) => format_cow!("internal.pos + {offset}"),
+        (_, _) => {
+            let shifted_offset = offset >> shift;
+            format_cow!("(internal.pos >> {shift}) + {shifted_offset}")
+        }
+    }
 }
 
 /// Trait to get function names for constructor and walk functions for a type.

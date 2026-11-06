@@ -5,7 +5,6 @@ let uint8,
   int32,
   float64,
   sourceText,
-  sourceTextLatin,
   sourceStartPos = 0,
   firstNonAsciiPos = 0,
   parent = null;
@@ -35,16 +34,7 @@ function deserializeWith(buffer, sourceTextInput, sourceStartPosInput, sourceByt
   // `sourceText.substr()` can be used for strings which are within source text and ending before
   // this position, since byte offsets equal char offsets in the all-ASCII prefix.
   // Also decode source text as Latin-1 (or reuse `sourceText` if it's all ASCII).
-  if (sourceText.length === sourceByteLen) {
-    firstNonAsciiPos = sourceStartPos + sourceByteLen;
-    sourceTextLatin = sourceText;
-  } else {
-    let i = sourceStartPos,
-      sourceEndPos = sourceStartPos + sourceByteLen;
-    for (; i < sourceEndPos && uint8[i] < 128; i++);
-    firstNonAsciiPos = i;
-    sourceTextLatin = latin1Slice.call(uint8, sourceStartPos, sourceEndPos);
-  }
+  firstNonAsciiPos = sourceText.length === sourceByteLen ? sourceStartPos + sourceByteLen : 0;
   let data = deserialize(int32[536870890]);
   resetBuffer();
   return data;
@@ -52,7 +42,7 @@ function deserializeWith(buffer, sourceTextInput, sourceStartPosInput, sourceByt
 
 export function resetBuffer() {
   // Clear buffer and source text strings to allow them to be garbage collected
-  uint8 = int32 = float64 = sourceText = sourceTextLatin = void 0;
+  uint8 = int32 = float64 = sourceText = void 0;
 }
 
 function deserializeProgram(pos) {
@@ -68,7 +58,11 @@ function deserializeProgram(pos) {
       parent: null,
     });
   program.hashbang = deserializeOptionHashbang(pos + 56);
-  (program.body = deserializeVecDirective(pos + 88)).push(...deserializeVecStatement(pos + 112));
+  int32[(pos >> 2) + 22 + 2] === 0
+    ? (program.body = deserializeVecStatement(pos + 112))
+    : (program.body = deserializeVecDirective(pos + 88)).push(
+        ...deserializeVecStatement(pos + 112),
+      );
   parent = null;
   return program;
 }
@@ -76,146 +70,166 @@ function deserializeProgram(pos) {
 function deserializeExpression(pos) {
   switch (uint8[pos]) {
     case 0:
-      return deserializeBoxBooleanLiteral(pos + 8);
+      return deserializeBooleanLiteral(int32[(pos >> 2) + 2]);
     case 1:
-      return deserializeBoxNullLiteral(pos + 8);
+      return deserializeNullLiteral(int32[(pos >> 2) + 2]);
     case 2:
-      return deserializeBoxNumericLiteral(pos + 8);
+      return deserializeNumericLiteral(int32[(pos >> 2) + 2]);
     case 3:
-      return deserializeBoxBigIntLiteral(pos + 8);
+      return deserializeBigIntLiteral(int32[(pos >> 2) + 2]);
     case 4:
-      return deserializeBoxRegExpLiteral(pos + 8);
+      return deserializeRegExpLiteral(int32[(pos >> 2) + 2]);
     case 5:
-      return deserializeBoxStringLiteral(pos + 8);
+      return deserializeStringLiteral(int32[(pos >> 2) + 2]);
     case 6:
-      return deserializeBoxTemplateLiteral(pos + 8);
+      return deserializeTemplateLiteral(int32[(pos >> 2) + 2]);
     case 7:
-      return deserializeBoxIdentifierReference(pos + 8);
+      return deserializeIdentifierReference(int32[(pos >> 2) + 2]);
     case 8:
-      return deserializeBoxSuper(pos + 8);
+      return deserializeSuper(int32[(pos >> 2) + 2]);
     case 9:
-      return deserializeBoxArrayExpression(pos + 8);
+      return deserializeArrayExpression(int32[(pos >> 2) + 2]);
     case 10:
-      return deserializeBoxArrowFunctionExpression(pos + 8);
+      return deserializeArrowFunctionExpression(int32[(pos >> 2) + 2]);
     case 11:
-      return deserializeBoxAssignmentExpression(pos + 8);
+      return deserializeAssignmentExpression(int32[(pos >> 2) + 2]);
     case 12:
-      return deserializeBoxAwaitExpression(pos + 8);
+      return deserializeAwaitExpression(int32[(pos >> 2) + 2]);
     case 13:
-      return deserializeBoxBinaryExpression(pos + 8);
+      return deserializeBinaryExpression(int32[(pos >> 2) + 2]);
     case 14:
-      return deserializeBoxCallExpression(pos + 8);
+      return deserializeCallExpression(int32[(pos >> 2) + 2]);
     case 15:
-      return deserializeBoxChainExpression(pos + 8);
+      return deserializeChainExpression(int32[(pos >> 2) + 2]);
     case 16:
-      return deserializeBoxClass(pos + 8);
+      return deserializeClass(int32[(pos >> 2) + 2]);
     case 17:
-      return deserializeBoxConditionalExpression(pos + 8);
+      return deserializeConditionalExpression(int32[(pos >> 2) + 2]);
     case 18:
-      return deserializeBoxFunction(pos + 8);
+      return deserializeFunction(int32[(pos >> 2) + 2]);
     case 19:
-      return deserializeBoxImportExpression(pos + 8);
+      return deserializeImportExpression(int32[(pos >> 2) + 2]);
     case 20:
-      return deserializeBoxLogicalExpression(pos + 8);
+      return deserializeLogicalExpression(int32[(pos >> 2) + 2]);
     case 21:
-      return deserializeBoxNewExpression(pos + 8);
+      return deserializeNewExpression(int32[(pos >> 2) + 2]);
     case 22:
-      return deserializeBoxObjectExpression(pos + 8);
+      return deserializeObjectExpression(int32[(pos >> 2) + 2]);
     case 23:
-      return deserializeBoxParenthesizedExpression(pos + 8);
+      return deserializeParenthesizedExpression(int32[(pos >> 2) + 2]);
     case 24:
-      return deserializeBoxSequenceExpression(pos + 8);
+      return deserializeSequenceExpression(int32[(pos >> 2) + 2]);
     case 25:
-      return deserializeBoxTaggedTemplateExpression(pos + 8);
+      return deserializeTaggedTemplateExpression(int32[(pos >> 2) + 2]);
     case 26:
-      return deserializeBoxThisExpression(pos + 8);
+      return deserializeThisExpression(int32[(pos >> 2) + 2]);
     case 27:
-      return deserializeBoxUnaryExpression(pos + 8);
+      return deserializeUnaryExpression(int32[(pos >> 2) + 2]);
     case 28:
-      return deserializeBoxUpdateExpression(pos + 8);
+      return deserializeUpdateExpression(int32[(pos >> 2) + 2]);
     case 29:
-      return deserializeBoxYieldExpression(pos + 8);
+      return deserializeYieldExpression(int32[(pos >> 2) + 2]);
     case 30:
-      return deserializeBoxPrivateInExpression(pos + 8);
+      return deserializePrivateInExpression(int32[(pos >> 2) + 2]);
     case 31:
-      return deserializeBoxImportMeta(pos + 8);
+      return deserializeImportMeta(int32[(pos >> 2) + 2]);
     case 32:
-      return deserializeBoxNewTarget(pos + 8);
+      return deserializeNewTarget(int32[(pos >> 2) + 2]);
     case 33:
-      return deserializeBoxJSXElement(pos + 8);
+      return deserializeJSXElement(int32[(pos >> 2) + 2]);
     case 34:
-      return deserializeBoxJSXFragment(pos + 8);
+      return deserializeJSXFragment(int32[(pos >> 2) + 2]);
     case 35:
-      return deserializeBoxTSAsExpression(pos + 8);
+      return deserializeTSAsExpression(int32[(pos >> 2) + 2]);
     case 36:
-      return deserializeBoxTSSatisfiesExpression(pos + 8);
+      return deserializeTSSatisfiesExpression(int32[(pos >> 2) + 2]);
     case 37:
-      return deserializeBoxTSTypeAssertion(pos + 8);
+      return deserializeTSTypeAssertion(int32[(pos >> 2) + 2]);
     case 38:
-      return deserializeBoxTSNonNullExpression(pos + 8);
+      return deserializeTSNonNullExpression(int32[(pos >> 2) + 2]);
     case 39:
-      return deserializeBoxTSInstantiationExpression(pos + 8);
+      return deserializeTSInstantiationExpression(int32[(pos >> 2) + 2]);
     case 40:
-      return deserializeBoxV8IntrinsicExpression(pos + 8);
+      return deserializeV8IntrinsicExpression(int32[(pos >> 2) + 2]);
     case 48:
-      return deserializeBoxComputedMemberExpression(pos + 8);
+      return deserializeComputedMemberExpression(int32[(pos >> 2) + 2]);
     case 49:
-      return deserializeBoxStaticMemberExpression(pos + 8);
+      return deserializeStaticMemberExpression(int32[(pos >> 2) + 2]);
     case 50:
-      return deserializeBoxPrivateFieldExpression(pos + 8);
+      return deserializePrivateFieldExpression(int32[(pos >> 2) + 2]);
     default:
       throw Error(`Unexpected discriminant ${uint8[pos]} for Expression`);
   }
 }
 
 function deserializeIdentifierName(pos) {
+  let start = int32[pos >> 2],
+    end = int32[(pos >> 2) + 1];
   return {
     type: "Identifier",
     decorators: [],
-    name: deserializeStr(pos + 16),
+    name:
+      int32[(pos >> 2) + 4] >= sourceStartPos
+        ? sourceText.slice(start, end)
+        : deserializeStr(pos + 16),
     optional: false,
     typeAnnotation: null,
-    start: deserializeI32(pos),
-    end: deserializeI32(pos + 4),
+    start,
+    end,
     parent,
   };
 }
 
 function deserializeIdentifierReference(pos) {
+  let start = int32[pos >> 2],
+    end = int32[(pos >> 2) + 1];
   return {
     type: "Identifier",
     decorators: [],
-    name: deserializeStr(pos + 16),
+    name:
+      int32[(pos >> 2) + 4] >= sourceStartPos
+        ? sourceText.slice(start, end)
+        : deserializeStr(pos + 16),
     optional: false,
     typeAnnotation: null,
-    start: deserializeI32(pos),
-    end: deserializeI32(pos + 4),
+    start,
+    end,
     parent,
   };
 }
 
 function deserializeBindingIdentifier(pos) {
+  let start = int32[pos >> 2],
+    end = int32[(pos >> 2) + 1];
   return {
     type: "Identifier",
     decorators: [],
-    name: deserializeStr(pos + 16),
+    name:
+      int32[(pos >> 2) + 4] >= sourceStartPos
+        ? sourceText.slice(start, end)
+        : deserializeStr(pos + 16),
     optional: false,
     typeAnnotation: null,
-    start: deserializeI32(pos),
-    end: deserializeI32(pos + 4),
+    start,
+    end,
     parent,
   };
 }
 
 function deserializeLabelIdentifier(pos) {
+  let start = int32[pos >> 2],
+    end = int32[(pos >> 2) + 1];
   return {
     type: "Identifier",
     decorators: [],
-    name: deserializeStr(pos + 16),
+    name:
+      int32[(pos >> 2) + 4] >= sourceStartPos
+        ? sourceText.slice(start, end)
+        : deserializeStr(pos + 16),
     optional: false,
     typeAnnotation: null,
-    start: deserializeI32(pos),
-    end: deserializeI32(pos + 4),
+    start,
+    end,
     parent,
   };
 }
@@ -223,8 +237,8 @@ function deserializeLabelIdentifier(pos) {
 function deserializeThisExpression(pos) {
   return {
     type: "ThisExpression",
-    start: deserializeI32(pos),
-    end: deserializeI32(pos + 4),
+    start: int32[pos >> 2],
+    end: int32[(pos >> 2) + 1],
     parent,
   };
 }
@@ -234,8 +248,8 @@ function deserializeArrayExpression(pos) {
     node = (parent = {
       type: "ArrayExpression",
       elements: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.elements = deserializeVecArrayExpressionElement(pos + 16);
@@ -246,97 +260,97 @@ function deserializeArrayExpression(pos) {
 function deserializeArrayExpressionElement(pos) {
   switch (uint8[pos]) {
     case 0:
-      return deserializeBoxBooleanLiteral(pos + 8);
+      return deserializeBooleanLiteral(int32[(pos >> 2) + 2]);
     case 1:
-      return deserializeBoxNullLiteral(pos + 8);
+      return deserializeNullLiteral(int32[(pos >> 2) + 2]);
     case 2:
-      return deserializeBoxNumericLiteral(pos + 8);
+      return deserializeNumericLiteral(int32[(pos >> 2) + 2]);
     case 3:
-      return deserializeBoxBigIntLiteral(pos + 8);
+      return deserializeBigIntLiteral(int32[(pos >> 2) + 2]);
     case 4:
-      return deserializeBoxRegExpLiteral(pos + 8);
+      return deserializeRegExpLiteral(int32[(pos >> 2) + 2]);
     case 5:
-      return deserializeBoxStringLiteral(pos + 8);
+      return deserializeStringLiteral(int32[(pos >> 2) + 2]);
     case 6:
-      return deserializeBoxTemplateLiteral(pos + 8);
+      return deserializeTemplateLiteral(int32[(pos >> 2) + 2]);
     case 7:
-      return deserializeBoxIdentifierReference(pos + 8);
+      return deserializeIdentifierReference(int32[(pos >> 2) + 2]);
     case 8:
-      return deserializeBoxSuper(pos + 8);
+      return deserializeSuper(int32[(pos >> 2) + 2]);
     case 9:
-      return deserializeBoxArrayExpression(pos + 8);
+      return deserializeArrayExpression(int32[(pos >> 2) + 2]);
     case 10:
-      return deserializeBoxArrowFunctionExpression(pos + 8);
+      return deserializeArrowFunctionExpression(int32[(pos >> 2) + 2]);
     case 11:
-      return deserializeBoxAssignmentExpression(pos + 8);
+      return deserializeAssignmentExpression(int32[(pos >> 2) + 2]);
     case 12:
-      return deserializeBoxAwaitExpression(pos + 8);
+      return deserializeAwaitExpression(int32[(pos >> 2) + 2]);
     case 13:
-      return deserializeBoxBinaryExpression(pos + 8);
+      return deserializeBinaryExpression(int32[(pos >> 2) + 2]);
     case 14:
-      return deserializeBoxCallExpression(pos + 8);
+      return deserializeCallExpression(int32[(pos >> 2) + 2]);
     case 15:
-      return deserializeBoxChainExpression(pos + 8);
+      return deserializeChainExpression(int32[(pos >> 2) + 2]);
     case 16:
-      return deserializeBoxClass(pos + 8);
+      return deserializeClass(int32[(pos >> 2) + 2]);
     case 17:
-      return deserializeBoxConditionalExpression(pos + 8);
+      return deserializeConditionalExpression(int32[(pos >> 2) + 2]);
     case 18:
-      return deserializeBoxFunction(pos + 8);
+      return deserializeFunction(int32[(pos >> 2) + 2]);
     case 19:
-      return deserializeBoxImportExpression(pos + 8);
+      return deserializeImportExpression(int32[(pos >> 2) + 2]);
     case 20:
-      return deserializeBoxLogicalExpression(pos + 8);
+      return deserializeLogicalExpression(int32[(pos >> 2) + 2]);
     case 21:
-      return deserializeBoxNewExpression(pos + 8);
+      return deserializeNewExpression(int32[(pos >> 2) + 2]);
     case 22:
-      return deserializeBoxObjectExpression(pos + 8);
+      return deserializeObjectExpression(int32[(pos >> 2) + 2]);
     case 23:
-      return deserializeBoxParenthesizedExpression(pos + 8);
+      return deserializeParenthesizedExpression(int32[(pos >> 2) + 2]);
     case 24:
-      return deserializeBoxSequenceExpression(pos + 8);
+      return deserializeSequenceExpression(int32[(pos >> 2) + 2]);
     case 25:
-      return deserializeBoxTaggedTemplateExpression(pos + 8);
+      return deserializeTaggedTemplateExpression(int32[(pos >> 2) + 2]);
     case 26:
-      return deserializeBoxThisExpression(pos + 8);
+      return deserializeThisExpression(int32[(pos >> 2) + 2]);
     case 27:
-      return deserializeBoxUnaryExpression(pos + 8);
+      return deserializeUnaryExpression(int32[(pos >> 2) + 2]);
     case 28:
-      return deserializeBoxUpdateExpression(pos + 8);
+      return deserializeUpdateExpression(int32[(pos >> 2) + 2]);
     case 29:
-      return deserializeBoxYieldExpression(pos + 8);
+      return deserializeYieldExpression(int32[(pos >> 2) + 2]);
     case 30:
-      return deserializeBoxPrivateInExpression(pos + 8);
+      return deserializePrivateInExpression(int32[(pos >> 2) + 2]);
     case 31:
-      return deserializeBoxImportMeta(pos + 8);
+      return deserializeImportMeta(int32[(pos >> 2) + 2]);
     case 32:
-      return deserializeBoxNewTarget(pos + 8);
+      return deserializeNewTarget(int32[(pos >> 2) + 2]);
     case 33:
-      return deserializeBoxJSXElement(pos + 8);
+      return deserializeJSXElement(int32[(pos >> 2) + 2]);
     case 34:
-      return deserializeBoxJSXFragment(pos + 8);
+      return deserializeJSXFragment(int32[(pos >> 2) + 2]);
     case 35:
-      return deserializeBoxTSAsExpression(pos + 8);
+      return deserializeTSAsExpression(int32[(pos >> 2) + 2]);
     case 36:
-      return deserializeBoxTSSatisfiesExpression(pos + 8);
+      return deserializeTSSatisfiesExpression(int32[(pos >> 2) + 2]);
     case 37:
-      return deserializeBoxTSTypeAssertion(pos + 8);
+      return deserializeTSTypeAssertion(int32[(pos >> 2) + 2]);
     case 38:
-      return deserializeBoxTSNonNullExpression(pos + 8);
+      return deserializeTSNonNullExpression(int32[(pos >> 2) + 2]);
     case 39:
-      return deserializeBoxTSInstantiationExpression(pos + 8);
+      return deserializeTSInstantiationExpression(int32[(pos >> 2) + 2]);
     case 40:
-      return deserializeBoxV8IntrinsicExpression(pos + 8);
+      return deserializeV8IntrinsicExpression(int32[(pos >> 2) + 2]);
     case 48:
-      return deserializeBoxComputedMemberExpression(pos + 8);
+      return deserializeComputedMemberExpression(int32[(pos >> 2) + 2]);
     case 49:
-      return deserializeBoxStaticMemberExpression(pos + 8);
+      return deserializeStaticMemberExpression(int32[(pos >> 2) + 2]);
     case 50:
-      return deserializeBoxPrivateFieldExpression(pos + 8);
+      return deserializePrivateFieldExpression(int32[(pos >> 2) + 2]);
     case 64:
-      return deserializeBoxSpreadElement(pos + 8);
+      return deserializeSpreadElement(int32[(pos >> 2) + 2]);
     case 65:
-      return deserializeBoxElision(pos + 8);
+      return deserializeElision(int32[(pos >> 2) + 2]);
     default:
       throw Error(`Unexpected discriminant ${uint8[pos]} for ArrayExpressionElement`);
   }
@@ -351,8 +365,8 @@ function deserializeObjectExpression(pos) {
     node = (parent = {
       type: "ObjectExpression",
       properties: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.properties = deserializeVecObjectPropertyKind(pos + 16);
@@ -363,9 +377,9 @@ function deserializeObjectExpression(pos) {
 function deserializeObjectPropertyKind(pos) {
   switch (uint8[pos]) {
     case 0:
-      return deserializeBoxObjectProperty(pos + 8);
+      return deserializeObjectProperty(int32[(pos >> 2) + 2]);
     case 1:
-      return deserializeBoxSpreadElement(pos + 8);
+      return deserializeSpreadElement(int32[(pos >> 2) + 2]);
     default:
       throw Error(`Unexpected discriminant ${uint8[pos]} for ObjectPropertyKind`);
   }
@@ -375,15 +389,15 @@ function deserializeObjectProperty(pos) {
   let previousParent = parent,
     node = (parent = {
       type: "Property",
-      kind: deserializePropertyKind(pos + 12),
+      kind: PropertyKind_TABLE[uint8[pos + 12]],
       key: null,
       value: null,
-      method: deserializeBool(pos + 13),
-      shorthand: deserializeBool(pos + 14),
-      computed: deserializeBool(pos + 15),
+      method: uint8[pos + 13] === 1,
+      shorthand: uint8[pos + 14] === 1,
+      computed: uint8[pos + 15] === 1,
       optional: false,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.key = deserializePropertyKey(pos + 16);
@@ -395,114 +409,103 @@ function deserializeObjectProperty(pos) {
 function deserializePropertyKey(pos) {
   switch (uint8[pos]) {
     case 0:
-      return deserializeBoxBooleanLiteral(pos + 8);
+      return deserializeBooleanLiteral(int32[(pos >> 2) + 2]);
     case 1:
-      return deserializeBoxNullLiteral(pos + 8);
+      return deserializeNullLiteral(int32[(pos >> 2) + 2]);
     case 2:
-      return deserializeBoxNumericLiteral(pos + 8);
+      return deserializeNumericLiteral(int32[(pos >> 2) + 2]);
     case 3:
-      return deserializeBoxBigIntLiteral(pos + 8);
+      return deserializeBigIntLiteral(int32[(pos >> 2) + 2]);
     case 4:
-      return deserializeBoxRegExpLiteral(pos + 8);
+      return deserializeRegExpLiteral(int32[(pos >> 2) + 2]);
     case 5:
-      return deserializeBoxStringLiteral(pos + 8);
+      return deserializeStringLiteral(int32[(pos >> 2) + 2]);
     case 6:
-      return deserializeBoxTemplateLiteral(pos + 8);
+      return deserializeTemplateLiteral(int32[(pos >> 2) + 2]);
     case 7:
-      return deserializeBoxIdentifierReference(pos + 8);
+      return deserializeIdentifierReference(int32[(pos >> 2) + 2]);
     case 8:
-      return deserializeBoxSuper(pos + 8);
+      return deserializeSuper(int32[(pos >> 2) + 2]);
     case 9:
-      return deserializeBoxArrayExpression(pos + 8);
+      return deserializeArrayExpression(int32[(pos >> 2) + 2]);
     case 10:
-      return deserializeBoxArrowFunctionExpression(pos + 8);
+      return deserializeArrowFunctionExpression(int32[(pos >> 2) + 2]);
     case 11:
-      return deserializeBoxAssignmentExpression(pos + 8);
+      return deserializeAssignmentExpression(int32[(pos >> 2) + 2]);
     case 12:
-      return deserializeBoxAwaitExpression(pos + 8);
+      return deserializeAwaitExpression(int32[(pos >> 2) + 2]);
     case 13:
-      return deserializeBoxBinaryExpression(pos + 8);
+      return deserializeBinaryExpression(int32[(pos >> 2) + 2]);
     case 14:
-      return deserializeBoxCallExpression(pos + 8);
+      return deserializeCallExpression(int32[(pos >> 2) + 2]);
     case 15:
-      return deserializeBoxChainExpression(pos + 8);
+      return deserializeChainExpression(int32[(pos >> 2) + 2]);
     case 16:
-      return deserializeBoxClass(pos + 8);
+      return deserializeClass(int32[(pos >> 2) + 2]);
     case 17:
-      return deserializeBoxConditionalExpression(pos + 8);
+      return deserializeConditionalExpression(int32[(pos >> 2) + 2]);
     case 18:
-      return deserializeBoxFunction(pos + 8);
+      return deserializeFunction(int32[(pos >> 2) + 2]);
     case 19:
-      return deserializeBoxImportExpression(pos + 8);
+      return deserializeImportExpression(int32[(pos >> 2) + 2]);
     case 20:
-      return deserializeBoxLogicalExpression(pos + 8);
+      return deserializeLogicalExpression(int32[(pos >> 2) + 2]);
     case 21:
-      return deserializeBoxNewExpression(pos + 8);
+      return deserializeNewExpression(int32[(pos >> 2) + 2]);
     case 22:
-      return deserializeBoxObjectExpression(pos + 8);
+      return deserializeObjectExpression(int32[(pos >> 2) + 2]);
     case 23:
-      return deserializeBoxParenthesizedExpression(pos + 8);
+      return deserializeParenthesizedExpression(int32[(pos >> 2) + 2]);
     case 24:
-      return deserializeBoxSequenceExpression(pos + 8);
+      return deserializeSequenceExpression(int32[(pos >> 2) + 2]);
     case 25:
-      return deserializeBoxTaggedTemplateExpression(pos + 8);
+      return deserializeTaggedTemplateExpression(int32[(pos >> 2) + 2]);
     case 26:
-      return deserializeBoxThisExpression(pos + 8);
+      return deserializeThisExpression(int32[(pos >> 2) + 2]);
     case 27:
-      return deserializeBoxUnaryExpression(pos + 8);
+      return deserializeUnaryExpression(int32[(pos >> 2) + 2]);
     case 28:
-      return deserializeBoxUpdateExpression(pos + 8);
+      return deserializeUpdateExpression(int32[(pos >> 2) + 2]);
     case 29:
-      return deserializeBoxYieldExpression(pos + 8);
+      return deserializeYieldExpression(int32[(pos >> 2) + 2]);
     case 30:
-      return deserializeBoxPrivateInExpression(pos + 8);
+      return deserializePrivateInExpression(int32[(pos >> 2) + 2]);
     case 31:
-      return deserializeBoxImportMeta(pos + 8);
+      return deserializeImportMeta(int32[(pos >> 2) + 2]);
     case 32:
-      return deserializeBoxNewTarget(pos + 8);
+      return deserializeNewTarget(int32[(pos >> 2) + 2]);
     case 33:
-      return deserializeBoxJSXElement(pos + 8);
+      return deserializeJSXElement(int32[(pos >> 2) + 2]);
     case 34:
-      return deserializeBoxJSXFragment(pos + 8);
+      return deserializeJSXFragment(int32[(pos >> 2) + 2]);
     case 35:
-      return deserializeBoxTSAsExpression(pos + 8);
+      return deserializeTSAsExpression(int32[(pos >> 2) + 2]);
     case 36:
-      return deserializeBoxTSSatisfiesExpression(pos + 8);
+      return deserializeTSSatisfiesExpression(int32[(pos >> 2) + 2]);
     case 37:
-      return deserializeBoxTSTypeAssertion(pos + 8);
+      return deserializeTSTypeAssertion(int32[(pos >> 2) + 2]);
     case 38:
-      return deserializeBoxTSNonNullExpression(pos + 8);
+      return deserializeTSNonNullExpression(int32[(pos >> 2) + 2]);
     case 39:
-      return deserializeBoxTSInstantiationExpression(pos + 8);
+      return deserializeTSInstantiationExpression(int32[(pos >> 2) + 2]);
     case 40:
-      return deserializeBoxV8IntrinsicExpression(pos + 8);
+      return deserializeV8IntrinsicExpression(int32[(pos >> 2) + 2]);
     case 48:
-      return deserializeBoxComputedMemberExpression(pos + 8);
+      return deserializeComputedMemberExpression(int32[(pos >> 2) + 2]);
     case 49:
-      return deserializeBoxStaticMemberExpression(pos + 8);
+      return deserializeStaticMemberExpression(int32[(pos >> 2) + 2]);
     case 50:
-      return deserializeBoxPrivateFieldExpression(pos + 8);
+      return deserializePrivateFieldExpression(int32[(pos >> 2) + 2]);
     case 64:
-      return deserializeBoxIdentifierName(pos + 8);
+      return deserializeIdentifierName(int32[(pos >> 2) + 2]);
     case 65:
-      return deserializeBoxPrivateIdentifier(pos + 8);
+      return deserializePrivateIdentifier(int32[(pos >> 2) + 2]);
     default:
       throw Error(`Unexpected discriminant ${uint8[pos]} for PropertyKey`);
   }
 }
 
-function deserializePropertyKind(pos) {
-  switch (uint8[pos]) {
-    case 0:
-      return "init";
-    case 1:
-      return "get";
-    case 2:
-      return "set";
-    default:
-      throw Error(`Unexpected discriminant ${uint8[pos]} for PropertyKind`);
-  }
-}
+const PropertyKind_TABLE = ["init", "get", "set"];
 
 function deserializeTemplateLiteral(pos) {
   let previousParent = parent,
@@ -510,8 +513,8 @@ function deserializeTemplateLiteral(pos) {
       type: "TemplateLiteral",
       quasis: null,
       expressions: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.quasis = deserializeVecTemplateElement(pos + 16);
@@ -527,8 +530,8 @@ function deserializeTaggedTemplateExpression(pos) {
       tag: null,
       typeArguments: null,
       quasi: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.tag = deserializeExpression(pos + 16);
@@ -565,10 +568,10 @@ function deserializeComputedMemberExpression(pos) {
       type: "MemberExpression",
       object: null,
       property: null,
-      optional: deserializeBool(pos + 12),
+      optional: uint8[pos + 12] === 1,
       computed: true,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.object = deserializeExpression(pos + 16);
@@ -583,10 +586,10 @@ function deserializeStaticMemberExpression(pos) {
       type: "MemberExpression",
       object: null,
       property: null,
-      optional: deserializeBool(pos + 12),
+      optional: uint8[pos + 12] === 1,
       computed: false,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.object = deserializeExpression(pos + 16);
@@ -601,10 +604,10 @@ function deserializePrivateFieldExpression(pos) {
       type: "MemberExpression",
       object: null,
       property: null,
-      optional: deserializeBool(pos + 12),
+      optional: uint8[pos + 12] === 1,
       computed: false,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.object = deserializeExpression(pos + 16);
@@ -620,9 +623,9 @@ function deserializeCallExpression(pos) {
       callee: null,
       typeArguments: null,
       arguments: null,
-      optional: deserializeBool(pos + 12),
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      optional: uint8[pos + 12] === 1,
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.callee = deserializeExpression(pos + 16);
@@ -639,8 +642,8 @@ function deserializeNewExpression(pos) {
       callee: null,
       typeArguments: null,
       arguments: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.callee = deserializeExpression(pos + 16);
@@ -656,8 +659,8 @@ function deserializeImportMeta(pos) {
       type: "MetaProperty",
       meta: null,
       property: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     }),
     importStart = deserializeI32(pos),
@@ -694,8 +697,8 @@ function deserializeNewTarget(pos) {
       type: "MetaProperty",
       meta: null,
       property: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     }),
     newStart = deserializeI32(pos),
@@ -731,8 +734,8 @@ function deserializeSpreadElement(pos) {
     node = (parent = {
       type: "SpreadElement",
       argument: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.argument = deserializeExpression(pos + 16);
@@ -743,95 +746,95 @@ function deserializeSpreadElement(pos) {
 function deserializeArgument(pos) {
   switch (uint8[pos]) {
     case 0:
-      return deserializeBoxBooleanLiteral(pos + 8);
+      return deserializeBooleanLiteral(int32[(pos >> 2) + 2]);
     case 1:
-      return deserializeBoxNullLiteral(pos + 8);
+      return deserializeNullLiteral(int32[(pos >> 2) + 2]);
     case 2:
-      return deserializeBoxNumericLiteral(pos + 8);
+      return deserializeNumericLiteral(int32[(pos >> 2) + 2]);
     case 3:
-      return deserializeBoxBigIntLiteral(pos + 8);
+      return deserializeBigIntLiteral(int32[(pos >> 2) + 2]);
     case 4:
-      return deserializeBoxRegExpLiteral(pos + 8);
+      return deserializeRegExpLiteral(int32[(pos >> 2) + 2]);
     case 5:
-      return deserializeBoxStringLiteral(pos + 8);
+      return deserializeStringLiteral(int32[(pos >> 2) + 2]);
     case 6:
-      return deserializeBoxTemplateLiteral(pos + 8);
+      return deserializeTemplateLiteral(int32[(pos >> 2) + 2]);
     case 7:
-      return deserializeBoxIdentifierReference(pos + 8);
+      return deserializeIdentifierReference(int32[(pos >> 2) + 2]);
     case 8:
-      return deserializeBoxSuper(pos + 8);
+      return deserializeSuper(int32[(pos >> 2) + 2]);
     case 9:
-      return deserializeBoxArrayExpression(pos + 8);
+      return deserializeArrayExpression(int32[(pos >> 2) + 2]);
     case 10:
-      return deserializeBoxArrowFunctionExpression(pos + 8);
+      return deserializeArrowFunctionExpression(int32[(pos >> 2) + 2]);
     case 11:
-      return deserializeBoxAssignmentExpression(pos + 8);
+      return deserializeAssignmentExpression(int32[(pos >> 2) + 2]);
     case 12:
-      return deserializeBoxAwaitExpression(pos + 8);
+      return deserializeAwaitExpression(int32[(pos >> 2) + 2]);
     case 13:
-      return deserializeBoxBinaryExpression(pos + 8);
+      return deserializeBinaryExpression(int32[(pos >> 2) + 2]);
     case 14:
-      return deserializeBoxCallExpression(pos + 8);
+      return deserializeCallExpression(int32[(pos >> 2) + 2]);
     case 15:
-      return deserializeBoxChainExpression(pos + 8);
+      return deserializeChainExpression(int32[(pos >> 2) + 2]);
     case 16:
-      return deserializeBoxClass(pos + 8);
+      return deserializeClass(int32[(pos >> 2) + 2]);
     case 17:
-      return deserializeBoxConditionalExpression(pos + 8);
+      return deserializeConditionalExpression(int32[(pos >> 2) + 2]);
     case 18:
-      return deserializeBoxFunction(pos + 8);
+      return deserializeFunction(int32[(pos >> 2) + 2]);
     case 19:
-      return deserializeBoxImportExpression(pos + 8);
+      return deserializeImportExpression(int32[(pos >> 2) + 2]);
     case 20:
-      return deserializeBoxLogicalExpression(pos + 8);
+      return deserializeLogicalExpression(int32[(pos >> 2) + 2]);
     case 21:
-      return deserializeBoxNewExpression(pos + 8);
+      return deserializeNewExpression(int32[(pos >> 2) + 2]);
     case 22:
-      return deserializeBoxObjectExpression(pos + 8);
+      return deserializeObjectExpression(int32[(pos >> 2) + 2]);
     case 23:
-      return deserializeBoxParenthesizedExpression(pos + 8);
+      return deserializeParenthesizedExpression(int32[(pos >> 2) + 2]);
     case 24:
-      return deserializeBoxSequenceExpression(pos + 8);
+      return deserializeSequenceExpression(int32[(pos >> 2) + 2]);
     case 25:
-      return deserializeBoxTaggedTemplateExpression(pos + 8);
+      return deserializeTaggedTemplateExpression(int32[(pos >> 2) + 2]);
     case 26:
-      return deserializeBoxThisExpression(pos + 8);
+      return deserializeThisExpression(int32[(pos >> 2) + 2]);
     case 27:
-      return deserializeBoxUnaryExpression(pos + 8);
+      return deserializeUnaryExpression(int32[(pos >> 2) + 2]);
     case 28:
-      return deserializeBoxUpdateExpression(pos + 8);
+      return deserializeUpdateExpression(int32[(pos >> 2) + 2]);
     case 29:
-      return deserializeBoxYieldExpression(pos + 8);
+      return deserializeYieldExpression(int32[(pos >> 2) + 2]);
     case 30:
-      return deserializeBoxPrivateInExpression(pos + 8);
+      return deserializePrivateInExpression(int32[(pos >> 2) + 2]);
     case 31:
-      return deserializeBoxImportMeta(pos + 8);
+      return deserializeImportMeta(int32[(pos >> 2) + 2]);
     case 32:
-      return deserializeBoxNewTarget(pos + 8);
+      return deserializeNewTarget(int32[(pos >> 2) + 2]);
     case 33:
-      return deserializeBoxJSXElement(pos + 8);
+      return deserializeJSXElement(int32[(pos >> 2) + 2]);
     case 34:
-      return deserializeBoxJSXFragment(pos + 8);
+      return deserializeJSXFragment(int32[(pos >> 2) + 2]);
     case 35:
-      return deserializeBoxTSAsExpression(pos + 8);
+      return deserializeTSAsExpression(int32[(pos >> 2) + 2]);
     case 36:
-      return deserializeBoxTSSatisfiesExpression(pos + 8);
+      return deserializeTSSatisfiesExpression(int32[(pos >> 2) + 2]);
     case 37:
-      return deserializeBoxTSTypeAssertion(pos + 8);
+      return deserializeTSTypeAssertion(int32[(pos >> 2) + 2]);
     case 38:
-      return deserializeBoxTSNonNullExpression(pos + 8);
+      return deserializeTSNonNullExpression(int32[(pos >> 2) + 2]);
     case 39:
-      return deserializeBoxTSInstantiationExpression(pos + 8);
+      return deserializeTSInstantiationExpression(int32[(pos >> 2) + 2]);
     case 40:
-      return deserializeBoxV8IntrinsicExpression(pos + 8);
+      return deserializeV8IntrinsicExpression(int32[(pos >> 2) + 2]);
     case 48:
-      return deserializeBoxComputedMemberExpression(pos + 8);
+      return deserializeComputedMemberExpression(int32[(pos >> 2) + 2]);
     case 49:
-      return deserializeBoxStaticMemberExpression(pos + 8);
+      return deserializeStaticMemberExpression(int32[(pos >> 2) + 2]);
     case 50:
-      return deserializeBoxPrivateFieldExpression(pos + 8);
+      return deserializePrivateFieldExpression(int32[(pos >> 2) + 2]);
     case 64:
-      return deserializeBoxSpreadElement(pos + 8);
+      return deserializeSpreadElement(int32[(pos >> 2) + 2]);
     default:
       throw Error(`Unexpected discriminant ${uint8[pos]} for Argument`);
   }
@@ -841,11 +844,11 @@ function deserializeUpdateExpression(pos) {
   let previousParent = parent,
     node = (parent = {
       type: "UpdateExpression",
-      operator: deserializeUpdateOperator(pos + 12),
-      prefix: deserializeBool(pos + 13),
+      operator: uint8[pos + 12] === 0 ? "++" : "--",
+      prefix: uint8[pos + 13] === 1,
       argument: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.argument = deserializeSimpleAssignmentTarget(pos + 16);
@@ -857,11 +860,11 @@ function deserializeUnaryExpression(pos) {
   let previousParent = parent,
     node = (parent = {
       type: "UnaryExpression",
-      operator: deserializeUnaryOperator(pos + 12),
+      operator: UnaryOperator_TABLE[uint8[pos + 12]],
       argument: null,
       prefix: true,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.argument = deserializeExpression(pos + 16);
@@ -874,10 +877,10 @@ function deserializeBinaryExpression(pos) {
     node = (parent = {
       type: "BinaryExpression",
       left: null,
-      operator: deserializeBinaryOperator(pos + 12),
+      operator: BinaryOperator_TABLE[uint8[pos + 12]],
       right: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.left = deserializeExpression(pos + 16);
@@ -893,8 +896,8 @@ function deserializePrivateInExpression(pos) {
       left: null,
       operator: "in",
       right: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.left = deserializePrivateIdentifier(pos + 16);
@@ -908,10 +911,10 @@ function deserializeLogicalExpression(pos) {
     node = (parent = {
       type: "LogicalExpression",
       left: null,
-      operator: deserializeLogicalOperator(pos + 12),
+      operator: LogicalOperator_TABLE[uint8[pos + 12]],
       right: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.left = deserializeExpression(pos + 16);
@@ -927,8 +930,8 @@ function deserializeConditionalExpression(pos) {
       test: null,
       consequent: null,
       alternate: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.test = deserializeExpression(pos + 16);
@@ -942,11 +945,11 @@ function deserializeAssignmentExpression(pos) {
   let previousParent = parent,
     node = (parent = {
       type: "AssignmentExpression",
-      operator: deserializeAssignmentOperator(pos + 12),
+      operator: AssignmentOperator_TABLE[uint8[pos + 12]],
       left: null,
       right: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.left = deserializeAssignmentTarget(pos + 16);
@@ -958,25 +961,25 @@ function deserializeAssignmentExpression(pos) {
 function deserializeAssignmentTarget(pos) {
   switch (uint8[pos]) {
     case 0:
-      return deserializeBoxIdentifierReference(pos + 8);
+      return deserializeIdentifierReference(int32[(pos >> 2) + 2]);
     case 1:
-      return deserializeBoxTSAsExpression(pos + 8);
+      return deserializeTSAsExpression(int32[(pos >> 2) + 2]);
     case 2:
-      return deserializeBoxTSSatisfiesExpression(pos + 8);
+      return deserializeTSSatisfiesExpression(int32[(pos >> 2) + 2]);
     case 3:
-      return deserializeBoxTSNonNullExpression(pos + 8);
+      return deserializeTSNonNullExpression(int32[(pos >> 2) + 2]);
     case 4:
-      return deserializeBoxTSTypeAssertion(pos + 8);
+      return deserializeTSTypeAssertion(int32[(pos >> 2) + 2]);
     case 8:
-      return deserializeBoxArrayAssignmentTarget(pos + 8);
+      return deserializeArrayAssignmentTarget(int32[(pos >> 2) + 2]);
     case 9:
-      return deserializeBoxObjectAssignmentTarget(pos + 8);
+      return deserializeObjectAssignmentTarget(int32[(pos >> 2) + 2]);
     case 48:
-      return deserializeBoxComputedMemberExpression(pos + 8);
+      return deserializeComputedMemberExpression(int32[(pos >> 2) + 2]);
     case 49:
-      return deserializeBoxStaticMemberExpression(pos + 8);
+      return deserializeStaticMemberExpression(int32[(pos >> 2) + 2]);
     case 50:
-      return deserializeBoxPrivateFieldExpression(pos + 8);
+      return deserializePrivateFieldExpression(int32[(pos >> 2) + 2]);
     default:
       throw Error(`Unexpected discriminant ${uint8[pos]} for AssignmentTarget`);
   }
@@ -985,21 +988,21 @@ function deserializeAssignmentTarget(pos) {
 function deserializeSimpleAssignmentTarget(pos) {
   switch (uint8[pos]) {
     case 0:
-      return deserializeBoxIdentifierReference(pos + 8);
+      return deserializeIdentifierReference(int32[(pos >> 2) + 2]);
     case 1:
-      return deserializeBoxTSAsExpression(pos + 8);
+      return deserializeTSAsExpression(int32[(pos >> 2) + 2]);
     case 2:
-      return deserializeBoxTSSatisfiesExpression(pos + 8);
+      return deserializeTSSatisfiesExpression(int32[(pos >> 2) + 2]);
     case 3:
-      return deserializeBoxTSNonNullExpression(pos + 8);
+      return deserializeTSNonNullExpression(int32[(pos >> 2) + 2]);
     case 4:
-      return deserializeBoxTSTypeAssertion(pos + 8);
+      return deserializeTSTypeAssertion(int32[(pos >> 2) + 2]);
     case 48:
-      return deserializeBoxComputedMemberExpression(pos + 8);
+      return deserializeComputedMemberExpression(int32[(pos >> 2) + 2]);
     case 49:
-      return deserializeBoxStaticMemberExpression(pos + 8);
+      return deserializeStaticMemberExpression(int32[(pos >> 2) + 2]);
     case 50:
-      return deserializeBoxPrivateFieldExpression(pos + 8);
+      return deserializePrivateFieldExpression(int32[(pos >> 2) + 2]);
     default:
       throw Error(`Unexpected discriminant ${uint8[pos]} for SimpleAssignmentTarget`);
   }
@@ -1013,8 +1016,8 @@ function deserializeArrayAssignmentTarget(pos) {
       elements: null,
       optional: false,
       typeAnnotation: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     }),
     elements = deserializeVecOptionAssignmentTargetMaybeDefault(pos + 16),
@@ -1033,8 +1036,8 @@ function deserializeObjectAssignmentTarget(pos) {
       properties: null,
       optional: false,
       typeAnnotation: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     }),
     properties = deserializeVecAssignmentTargetProperty(pos + 16),
@@ -1054,8 +1057,8 @@ function deserializeAssignmentTargetRest(pos) {
       optional: false,
       typeAnnotation: null,
       value: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.argument = deserializeAssignmentTarget(pos + 16);
@@ -1066,27 +1069,27 @@ function deserializeAssignmentTargetRest(pos) {
 function deserializeAssignmentTargetMaybeDefault(pos) {
   switch (uint8[pos]) {
     case 0:
-      return deserializeBoxIdentifierReference(pos + 8);
+      return deserializeIdentifierReference(int32[(pos >> 2) + 2]);
     case 1:
-      return deserializeBoxTSAsExpression(pos + 8);
+      return deserializeTSAsExpression(int32[(pos >> 2) + 2]);
     case 2:
-      return deserializeBoxTSSatisfiesExpression(pos + 8);
+      return deserializeTSSatisfiesExpression(int32[(pos >> 2) + 2]);
     case 3:
-      return deserializeBoxTSNonNullExpression(pos + 8);
+      return deserializeTSNonNullExpression(int32[(pos >> 2) + 2]);
     case 4:
-      return deserializeBoxTSTypeAssertion(pos + 8);
+      return deserializeTSTypeAssertion(int32[(pos >> 2) + 2]);
     case 8:
-      return deserializeBoxArrayAssignmentTarget(pos + 8);
+      return deserializeArrayAssignmentTarget(int32[(pos >> 2) + 2]);
     case 9:
-      return deserializeBoxObjectAssignmentTarget(pos + 8);
+      return deserializeObjectAssignmentTarget(int32[(pos >> 2) + 2]);
     case 16:
-      return deserializeBoxAssignmentTargetWithDefault(pos + 8);
+      return deserializeAssignmentTargetWithDefault(int32[(pos >> 2) + 2]);
     case 48:
-      return deserializeBoxComputedMemberExpression(pos + 8);
+      return deserializeComputedMemberExpression(int32[(pos >> 2) + 2]);
     case 49:
-      return deserializeBoxStaticMemberExpression(pos + 8);
+      return deserializeStaticMemberExpression(int32[(pos >> 2) + 2]);
     case 50:
-      return deserializeBoxPrivateFieldExpression(pos + 8);
+      return deserializePrivateFieldExpression(int32[(pos >> 2) + 2]);
     default:
       throw Error(`Unexpected discriminant ${uint8[pos]} for AssignmentTargetMaybeDefault`);
   }
@@ -1101,8 +1104,8 @@ function deserializeAssignmentTargetWithDefault(pos) {
       right: null,
       optional: false,
       typeAnnotation: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.left = deserializeAssignmentTarget(pos + 16);
@@ -1114,17 +1117,17 @@ function deserializeAssignmentTargetWithDefault(pos) {
 function deserializeAssignmentTargetProperty(pos) {
   switch (uint8[pos]) {
     case 0:
-      return deserializeBoxAssignmentTargetPropertyIdentifier(pos + 8);
+      return deserializeAssignmentTargetPropertyIdentifier(int32[(pos >> 2) + 2]);
     case 1:
-      return deserializeBoxAssignmentTargetPropertyProperty(pos + 8);
+      return deserializeAssignmentTargetPropertyProperty(int32[(pos >> 2) + 2]);
     default:
       throw Error(`Unexpected discriminant ${uint8[pos]} for AssignmentTargetProperty`);
   }
 }
 
 function deserializeAssignmentTargetPropertyIdentifier(pos) {
-  let start = deserializeI32(pos),
-    end = deserializeI32(pos + 4),
+  let start = int32[pos >> 2],
+    end = int32[(pos >> 2) + 1],
     previousParent = parent,
     node = (parent = {
       type: "Property",
@@ -1182,10 +1185,10 @@ function deserializeAssignmentTargetPropertyProperty(pos) {
       value: null,
       method: false,
       shorthand: false,
-      computed: deserializeBool(pos + 12),
+      computed: uint8[pos + 12] === 1,
       optional: false,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.key = deserializePropertyKey(pos + 16);
@@ -1199,8 +1202,8 @@ function deserializeSequenceExpression(pos) {
     node = (parent = {
       type: "SequenceExpression",
       expressions: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.expressions = deserializeVecExpression(pos + 16);
@@ -1211,8 +1214,8 @@ function deserializeSequenceExpression(pos) {
 function deserializeSuper(pos) {
   return {
     type: "Super",
-    start: deserializeI32(pos),
-    end: deserializeI32(pos + 4),
+    start: int32[pos >> 2],
+    end: int32[(pos >> 2) + 1],
     parent,
   };
 }
@@ -1222,8 +1225,8 @@ function deserializeAwaitExpression(pos) {
     node = (parent = {
       type: "AwaitExpression",
       argument: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.argument = deserializeExpression(pos + 16);
@@ -1236,8 +1239,8 @@ function deserializeChainExpression(pos) {
     node = (parent = {
       type: "ChainExpression",
       expression: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.expression = deserializeChainElement(pos + 16);
@@ -1248,15 +1251,15 @@ function deserializeChainExpression(pos) {
 function deserializeChainElement(pos) {
   switch (uint8[pos]) {
     case 0:
-      return deserializeBoxCallExpression(pos + 8);
+      return deserializeCallExpression(int32[(pos >> 2) + 2]);
     case 1:
-      return deserializeBoxTSNonNullExpression(pos + 8);
+      return deserializeTSNonNullExpression(int32[(pos >> 2) + 2]);
     case 48:
-      return deserializeBoxComputedMemberExpression(pos + 8);
+      return deserializeComputedMemberExpression(int32[(pos >> 2) + 2]);
     case 49:
-      return deserializeBoxStaticMemberExpression(pos + 8);
+      return deserializeStaticMemberExpression(int32[(pos >> 2) + 2]);
     case 50:
-      return deserializeBoxPrivateFieldExpression(pos + 8);
+      return deserializePrivateFieldExpression(int32[(pos >> 2) + 2]);
     default:
       throw Error(`Unexpected discriminant ${uint8[pos]} for ChainElement`);
   }
@@ -1282,77 +1285,77 @@ function deserializeParenthesizedExpression(pos) {
 function deserializeStatement(pos) {
   switch (uint8[pos]) {
     case 0:
-      return deserializeBoxBlockStatement(pos + 8);
+      return deserializeBlockStatement(int32[(pos >> 2) + 2]);
     case 1:
-      return deserializeBoxBreakStatement(pos + 8);
+      return deserializeBreakStatement(int32[(pos >> 2) + 2]);
     case 2:
-      return deserializeBoxContinueStatement(pos + 8);
+      return deserializeContinueStatement(int32[(pos >> 2) + 2]);
     case 3:
-      return deserializeBoxDebuggerStatement(pos + 8);
+      return deserializeDebuggerStatement(int32[(pos >> 2) + 2]);
     case 4:
-      return deserializeBoxDoWhileStatement(pos + 8);
+      return deserializeDoWhileStatement(int32[(pos >> 2) + 2]);
     case 5:
-      return deserializeBoxEmptyStatement(pos + 8);
+      return deserializeEmptyStatement(int32[(pos >> 2) + 2]);
     case 6:
-      return deserializeBoxExpressionStatement(pos + 8);
+      return deserializeExpressionStatement(int32[(pos >> 2) + 2]);
     case 7:
-      return deserializeBoxForInStatement(pos + 8);
+      return deserializeForInStatement(int32[(pos >> 2) + 2]);
     case 8:
-      return deserializeBoxForOfStatement(pos + 8);
+      return deserializeForOfStatement(int32[(pos >> 2) + 2]);
     case 9:
-      return deserializeBoxForStatement(pos + 8);
+      return deserializeForStatement(int32[(pos >> 2) + 2]);
     case 10:
-      return deserializeBoxIfStatement(pos + 8);
+      return deserializeIfStatement(int32[(pos >> 2) + 2]);
     case 11:
-      return deserializeBoxLabeledStatement(pos + 8);
+      return deserializeLabeledStatement(int32[(pos >> 2) + 2]);
     case 12:
-      return deserializeBoxReturnStatement(pos + 8);
+      return deserializeReturnStatement(int32[(pos >> 2) + 2]);
     case 13:
-      return deserializeBoxSwitchStatement(pos + 8);
+      return deserializeSwitchStatement(int32[(pos >> 2) + 2]);
     case 14:
-      return deserializeBoxThrowStatement(pos + 8);
+      return deserializeThrowStatement(int32[(pos >> 2) + 2]);
     case 15:
-      return deserializeBoxTryStatement(pos + 8);
+      return deserializeTryStatement(int32[(pos >> 2) + 2]);
     case 16:
-      return deserializeBoxWhileStatement(pos + 8);
+      return deserializeWhileStatement(int32[(pos >> 2) + 2]);
     case 17:
-      return deserializeBoxWithStatement(pos + 8);
+      return deserializeWithStatement(int32[(pos >> 2) + 2]);
     case 32:
-      return deserializeBoxVariableDeclaration(pos + 8);
+      return deserializeVariableDeclaration(int32[(pos >> 2) + 2]);
     case 33:
-      return deserializeBoxFunction(pos + 8);
+      return deserializeFunction(int32[(pos >> 2) + 2]);
     case 34:
-      return deserializeBoxClass(pos + 8);
+      return deserializeClass(int32[(pos >> 2) + 2]);
     case 35:
-      return deserializeBoxTSTypeAliasDeclaration(pos + 8);
+      return deserializeTSTypeAliasDeclaration(int32[(pos >> 2) + 2]);
     case 36:
-      return deserializeBoxTSInterfaceDeclaration(pos + 8);
+      return deserializeTSInterfaceDeclaration(int32[(pos >> 2) + 2]);
     case 37:
-      return deserializeBoxTSEnumDeclaration(pos + 8);
+      return deserializeTSEnumDeclaration(int32[(pos >> 2) + 2]);
     case 38:
-      return deserializeBoxTSExternalModuleDeclaration(pos + 8);
+      return deserializeTSExternalModuleDeclaration(int32[(pos >> 2) + 2]);
     case 39:
-      return deserializeBoxTSNamespaceDeclaration(pos + 8);
+      return deserializeTSNamespaceDeclaration(int32[(pos >> 2) + 2]);
     case 40:
-      return deserializeBoxTSGlobalDeclaration(pos + 8);
+      return deserializeTSGlobalDeclaration(int32[(pos >> 2) + 2]);
     case 41:
-      return deserializeBoxTSImportEqualsDeclaration(pos + 8);
+      return deserializeTSImportEqualsDeclaration(int32[(pos >> 2) + 2]);
     case 64:
-      return deserializeBoxImportDeclaration(pos + 8);
+      return deserializeImportDeclaration(int32[(pos >> 2) + 2]);
     case 65:
-      return deserializeBoxExportAllDeclaration(pos + 8);
+      return deserializeExportAllDeclaration(int32[(pos >> 2) + 2]);
     case 66:
-      return deserializeBoxExportDefaultDeclaration(pos + 8);
+      return deserializeExportDefaultDeclaration(int32[(pos >> 2) + 2]);
     case 67:
-      return deserializeBoxExportDeclaration(pos + 8);
+      return deserializeExportDeclaration(int32[(pos >> 2) + 2]);
     case 68:
-      return deserializeBoxExportNamedDeclaration(pos + 8);
+      return deserializeExportNamedDeclaration(int32[(pos >> 2) + 2]);
     case 69:
-      return deserializeBoxExportFromDeclaration(pos + 8);
+      return deserializeExportFromDeclaration(int32[(pos >> 2) + 2]);
     case 70:
-      return deserializeBoxTSExportAssignment(pos + 8);
+      return deserializeTSExportAssignment(int32[(pos >> 2) + 2]);
     case 71:
-      return deserializeBoxTSNamespaceExportDeclaration(pos + 8);
+      return deserializeTSNamespaceExportDeclaration(int32[(pos >> 2) + 2]);
     default:
       throw Error(`Unexpected discriminant ${uint8[pos]} for Statement`);
   }
@@ -1364,8 +1367,8 @@ function deserializeDirective(pos) {
       type: "ExpressionStatement",
       expression: null,
       directive: deserializeStr(pos + 64),
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.expression = deserializeStringLiteral(pos + 16);
@@ -1377,8 +1380,8 @@ function deserializeHashbang(pos) {
   return {
     type: "Hashbang",
     value: deserializeStr(pos + 16),
-    start: deserializeI32(pos),
-    end: deserializeI32(pos + 4),
+    start: int32[pos >> 2],
+    end: int32[(pos >> 2) + 1],
     parent,
   };
 }
@@ -1388,8 +1391,8 @@ function deserializeBlockStatement(pos) {
     node = (parent = {
       type: "BlockStatement",
       body: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.body = deserializeVecStatement(pos + 16);
@@ -1400,25 +1403,25 @@ function deserializeBlockStatement(pos) {
 function deserializeDeclaration(pos) {
   switch (uint8[pos]) {
     case 32:
-      return deserializeBoxVariableDeclaration(pos + 8);
+      return deserializeVariableDeclaration(int32[(pos >> 2) + 2]);
     case 33:
-      return deserializeBoxFunction(pos + 8);
+      return deserializeFunction(int32[(pos >> 2) + 2]);
     case 34:
-      return deserializeBoxClass(pos + 8);
+      return deserializeClass(int32[(pos >> 2) + 2]);
     case 35:
-      return deserializeBoxTSTypeAliasDeclaration(pos + 8);
+      return deserializeTSTypeAliasDeclaration(int32[(pos >> 2) + 2]);
     case 36:
-      return deserializeBoxTSInterfaceDeclaration(pos + 8);
+      return deserializeTSInterfaceDeclaration(int32[(pos >> 2) + 2]);
     case 37:
-      return deserializeBoxTSEnumDeclaration(pos + 8);
+      return deserializeTSEnumDeclaration(int32[(pos >> 2) + 2]);
     case 38:
-      return deserializeBoxTSExternalModuleDeclaration(pos + 8);
+      return deserializeTSExternalModuleDeclaration(int32[(pos >> 2) + 2]);
     case 39:
-      return deserializeBoxTSNamespaceDeclaration(pos + 8);
+      return deserializeTSNamespaceDeclaration(int32[(pos >> 2) + 2]);
     case 40:
-      return deserializeBoxTSGlobalDeclaration(pos + 8);
+      return deserializeTSGlobalDeclaration(int32[(pos >> 2) + 2]);
     case 41:
-      return deserializeBoxTSImportEqualsDeclaration(pos + 8);
+      return deserializeTSImportEqualsDeclaration(int32[(pos >> 2) + 2]);
     default:
       throw Error(`Unexpected discriminant ${uint8[pos]} for Declaration`);
   }
@@ -1428,11 +1431,11 @@ function deserializeVariableDeclaration(pos) {
   let previousParent = parent,
     node = (parent = {
       type: "VariableDeclaration",
-      kind: deserializeVariableDeclarationKind(pos + 12),
+      kind: VariableDeclarationKind_TABLE[uint8[pos + 12]],
       declarations: null,
-      declare: deserializeBool(pos + 13),
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      declare: uint8[pos + 13] === 1,
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.declarations = deserializeVecVariableDeclarator(pos + 16);
@@ -1440,22 +1443,7 @@ function deserializeVariableDeclaration(pos) {
   return node;
 }
 
-function deserializeVariableDeclarationKind(pos) {
-  switch (uint8[pos]) {
-    case 0:
-      return "var";
-    case 1:
-      return "let";
-    case 2:
-      return "const";
-    case 3:
-      return "using";
-    case 4:
-      return "await using";
-    default:
-      throw Error(`Unexpected discriminant ${uint8[pos]} for VariableDeclarationKind`);
-  }
-}
+const VariableDeclarationKind_TABLE = ["var", "let", "const", "using", "await using"];
 
 function deserializeVariableDeclarator(pos) {
   let previousParent = parent,
@@ -1463,9 +1451,9 @@ function deserializeVariableDeclarator(pos) {
       type: "VariableDeclarator",
       id: null,
       init: null,
-      definite: deserializeBool(pos + 12),
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      definite: uint8[pos + 12] === 1,
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     }),
     pattern = deserializeBindingPattern(pos + 16);
@@ -1488,8 +1476,8 @@ function deserializeVariableDeclarator(pos) {
 function deserializeEmptyStatement(pos) {
   return {
     type: "EmptyStatement",
-    start: deserializeI32(pos),
-    end: deserializeI32(pos + 4),
+    start: int32[pos >> 2],
+    end: int32[(pos >> 2) + 1],
     parent,
   };
 }
@@ -1500,8 +1488,8 @@ function deserializeExpressionStatement(pos) {
       type: "ExpressionStatement",
       expression: null,
       directive: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.expression = deserializeExpression(pos + 16);
@@ -1516,8 +1504,8 @@ function deserializeIfStatement(pos) {
       test: null,
       consequent: null,
       alternate: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.test = deserializeExpression(pos + 16);
@@ -1533,8 +1521,8 @@ function deserializeDoWhileStatement(pos) {
       type: "DoWhileStatement",
       body: null,
       test: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.body = deserializeStatement(pos + 16);
@@ -1549,8 +1537,8 @@ function deserializeWhileStatement(pos) {
       type: "WhileStatement",
       test: null,
       body: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.test = deserializeExpression(pos + 16);
@@ -1567,8 +1555,8 @@ function deserializeForStatement(pos) {
       test: null,
       update: null,
       body: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.init = deserializeOptionForStatementInit(pos + 16);
@@ -1582,95 +1570,95 @@ function deserializeForStatement(pos) {
 function deserializeForStatementInit(pos) {
   switch (uint8[pos]) {
     case 0:
-      return deserializeBoxBooleanLiteral(pos + 8);
+      return deserializeBooleanLiteral(int32[(pos >> 2) + 2]);
     case 1:
-      return deserializeBoxNullLiteral(pos + 8);
+      return deserializeNullLiteral(int32[(pos >> 2) + 2]);
     case 2:
-      return deserializeBoxNumericLiteral(pos + 8);
+      return deserializeNumericLiteral(int32[(pos >> 2) + 2]);
     case 3:
-      return deserializeBoxBigIntLiteral(pos + 8);
+      return deserializeBigIntLiteral(int32[(pos >> 2) + 2]);
     case 4:
-      return deserializeBoxRegExpLiteral(pos + 8);
+      return deserializeRegExpLiteral(int32[(pos >> 2) + 2]);
     case 5:
-      return deserializeBoxStringLiteral(pos + 8);
+      return deserializeStringLiteral(int32[(pos >> 2) + 2]);
     case 6:
-      return deserializeBoxTemplateLiteral(pos + 8);
+      return deserializeTemplateLiteral(int32[(pos >> 2) + 2]);
     case 7:
-      return deserializeBoxIdentifierReference(pos + 8);
+      return deserializeIdentifierReference(int32[(pos >> 2) + 2]);
     case 8:
-      return deserializeBoxSuper(pos + 8);
+      return deserializeSuper(int32[(pos >> 2) + 2]);
     case 9:
-      return deserializeBoxArrayExpression(pos + 8);
+      return deserializeArrayExpression(int32[(pos >> 2) + 2]);
     case 10:
-      return deserializeBoxArrowFunctionExpression(pos + 8);
+      return deserializeArrowFunctionExpression(int32[(pos >> 2) + 2]);
     case 11:
-      return deserializeBoxAssignmentExpression(pos + 8);
+      return deserializeAssignmentExpression(int32[(pos >> 2) + 2]);
     case 12:
-      return deserializeBoxAwaitExpression(pos + 8);
+      return deserializeAwaitExpression(int32[(pos >> 2) + 2]);
     case 13:
-      return deserializeBoxBinaryExpression(pos + 8);
+      return deserializeBinaryExpression(int32[(pos >> 2) + 2]);
     case 14:
-      return deserializeBoxCallExpression(pos + 8);
+      return deserializeCallExpression(int32[(pos >> 2) + 2]);
     case 15:
-      return deserializeBoxChainExpression(pos + 8);
+      return deserializeChainExpression(int32[(pos >> 2) + 2]);
     case 16:
-      return deserializeBoxClass(pos + 8);
+      return deserializeClass(int32[(pos >> 2) + 2]);
     case 17:
-      return deserializeBoxConditionalExpression(pos + 8);
+      return deserializeConditionalExpression(int32[(pos >> 2) + 2]);
     case 18:
-      return deserializeBoxFunction(pos + 8);
+      return deserializeFunction(int32[(pos >> 2) + 2]);
     case 19:
-      return deserializeBoxImportExpression(pos + 8);
+      return deserializeImportExpression(int32[(pos >> 2) + 2]);
     case 20:
-      return deserializeBoxLogicalExpression(pos + 8);
+      return deserializeLogicalExpression(int32[(pos >> 2) + 2]);
     case 21:
-      return deserializeBoxNewExpression(pos + 8);
+      return deserializeNewExpression(int32[(pos >> 2) + 2]);
     case 22:
-      return deserializeBoxObjectExpression(pos + 8);
+      return deserializeObjectExpression(int32[(pos >> 2) + 2]);
     case 23:
-      return deserializeBoxParenthesizedExpression(pos + 8);
+      return deserializeParenthesizedExpression(int32[(pos >> 2) + 2]);
     case 24:
-      return deserializeBoxSequenceExpression(pos + 8);
+      return deserializeSequenceExpression(int32[(pos >> 2) + 2]);
     case 25:
-      return deserializeBoxTaggedTemplateExpression(pos + 8);
+      return deserializeTaggedTemplateExpression(int32[(pos >> 2) + 2]);
     case 26:
-      return deserializeBoxThisExpression(pos + 8);
+      return deserializeThisExpression(int32[(pos >> 2) + 2]);
     case 27:
-      return deserializeBoxUnaryExpression(pos + 8);
+      return deserializeUnaryExpression(int32[(pos >> 2) + 2]);
     case 28:
-      return deserializeBoxUpdateExpression(pos + 8);
+      return deserializeUpdateExpression(int32[(pos >> 2) + 2]);
     case 29:
-      return deserializeBoxYieldExpression(pos + 8);
+      return deserializeYieldExpression(int32[(pos >> 2) + 2]);
     case 30:
-      return deserializeBoxPrivateInExpression(pos + 8);
+      return deserializePrivateInExpression(int32[(pos >> 2) + 2]);
     case 31:
-      return deserializeBoxImportMeta(pos + 8);
+      return deserializeImportMeta(int32[(pos >> 2) + 2]);
     case 32:
-      return deserializeBoxNewTarget(pos + 8);
+      return deserializeNewTarget(int32[(pos >> 2) + 2]);
     case 33:
-      return deserializeBoxJSXElement(pos + 8);
+      return deserializeJSXElement(int32[(pos >> 2) + 2]);
     case 34:
-      return deserializeBoxJSXFragment(pos + 8);
+      return deserializeJSXFragment(int32[(pos >> 2) + 2]);
     case 35:
-      return deserializeBoxTSAsExpression(pos + 8);
+      return deserializeTSAsExpression(int32[(pos >> 2) + 2]);
     case 36:
-      return deserializeBoxTSSatisfiesExpression(pos + 8);
+      return deserializeTSSatisfiesExpression(int32[(pos >> 2) + 2]);
     case 37:
-      return deserializeBoxTSTypeAssertion(pos + 8);
+      return deserializeTSTypeAssertion(int32[(pos >> 2) + 2]);
     case 38:
-      return deserializeBoxTSNonNullExpression(pos + 8);
+      return deserializeTSNonNullExpression(int32[(pos >> 2) + 2]);
     case 39:
-      return deserializeBoxTSInstantiationExpression(pos + 8);
+      return deserializeTSInstantiationExpression(int32[(pos >> 2) + 2]);
     case 40:
-      return deserializeBoxV8IntrinsicExpression(pos + 8);
+      return deserializeV8IntrinsicExpression(int32[(pos >> 2) + 2]);
     case 48:
-      return deserializeBoxComputedMemberExpression(pos + 8);
+      return deserializeComputedMemberExpression(int32[(pos >> 2) + 2]);
     case 49:
-      return deserializeBoxStaticMemberExpression(pos + 8);
+      return deserializeStaticMemberExpression(int32[(pos >> 2) + 2]);
     case 50:
-      return deserializeBoxPrivateFieldExpression(pos + 8);
+      return deserializePrivateFieldExpression(int32[(pos >> 2) + 2]);
     case 64:
-      return deserializeBoxVariableDeclaration(pos + 8);
+      return deserializeVariableDeclaration(int32[(pos >> 2) + 2]);
     default:
       throw Error(`Unexpected discriminant ${uint8[pos]} for ForStatementInit`);
   }
@@ -1683,8 +1671,8 @@ function deserializeForInStatement(pos) {
       left: null,
       right: null,
       body: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.left = deserializeForStatementLeft(pos + 16);
@@ -1697,27 +1685,27 @@ function deserializeForInStatement(pos) {
 function deserializeForStatementLeft(pos) {
   switch (uint8[pos]) {
     case 0:
-      return deserializeBoxIdentifierReference(pos + 8);
+      return deserializeIdentifierReference(int32[(pos >> 2) + 2]);
     case 1:
-      return deserializeBoxTSAsExpression(pos + 8);
+      return deserializeTSAsExpression(int32[(pos >> 2) + 2]);
     case 2:
-      return deserializeBoxTSSatisfiesExpression(pos + 8);
+      return deserializeTSSatisfiesExpression(int32[(pos >> 2) + 2]);
     case 3:
-      return deserializeBoxTSNonNullExpression(pos + 8);
+      return deserializeTSNonNullExpression(int32[(pos >> 2) + 2]);
     case 4:
-      return deserializeBoxTSTypeAssertion(pos + 8);
+      return deserializeTSTypeAssertion(int32[(pos >> 2) + 2]);
     case 8:
-      return deserializeBoxArrayAssignmentTarget(pos + 8);
+      return deserializeArrayAssignmentTarget(int32[(pos >> 2) + 2]);
     case 9:
-      return deserializeBoxObjectAssignmentTarget(pos + 8);
+      return deserializeObjectAssignmentTarget(int32[(pos >> 2) + 2]);
     case 16:
-      return deserializeBoxVariableDeclaration(pos + 8);
+      return deserializeVariableDeclaration(int32[(pos >> 2) + 2]);
     case 48:
-      return deserializeBoxComputedMemberExpression(pos + 8);
+      return deserializeComputedMemberExpression(int32[(pos >> 2) + 2]);
     case 49:
-      return deserializeBoxStaticMemberExpression(pos + 8);
+      return deserializeStaticMemberExpression(int32[(pos >> 2) + 2]);
     case 50:
-      return deserializeBoxPrivateFieldExpression(pos + 8);
+      return deserializePrivateFieldExpression(int32[(pos >> 2) + 2]);
     default:
       throw Error(`Unexpected discriminant ${uint8[pos]} for ForStatementLeft`);
   }
@@ -1727,12 +1715,12 @@ function deserializeForOfStatement(pos) {
   let previousParent = parent,
     node = (parent = {
       type: "ForOfStatement",
-      await: deserializeBool(pos + 64),
+      await: uint8[pos + 64] === 1,
       left: null,
       right: null,
       body: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.left = deserializeForStatementLeft(pos + 16);
@@ -1747,8 +1735,8 @@ function deserializeContinueStatement(pos) {
     node = (parent = {
       type: "ContinueStatement",
       label: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.label = deserializeOptionLabelIdentifier(pos + 16);
@@ -1761,8 +1749,8 @@ function deserializeBreakStatement(pos) {
     node = (parent = {
       type: "BreakStatement",
       label: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.label = deserializeOptionLabelIdentifier(pos + 16);
@@ -1775,8 +1763,8 @@ function deserializeReturnStatement(pos) {
     node = (parent = {
       type: "ReturnStatement",
       argument: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.argument = deserializeOptionExpression(pos + 16);
@@ -1790,8 +1778,8 @@ function deserializeWithStatement(pos) {
       type: "WithStatement",
       object: null,
       body: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.object = deserializeExpression(pos + 16);
@@ -1806,8 +1794,8 @@ function deserializeSwitchStatement(pos) {
       type: "SwitchStatement",
       discriminant: null,
       cases: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.discriminant = deserializeExpression(pos + 16);
@@ -1822,8 +1810,8 @@ function deserializeSwitchCase(pos) {
       type: "SwitchCase",
       test: null,
       consequent: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.test = deserializeOptionExpression(pos + 16);
@@ -1838,8 +1826,8 @@ function deserializeLabeledStatement(pos) {
       type: "LabeledStatement",
       label: null,
       body: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.label = deserializeLabelIdentifier(pos + 16);
@@ -1853,8 +1841,8 @@ function deserializeThrowStatement(pos) {
     node = (parent = {
       type: "ThrowStatement",
       argument: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.argument = deserializeExpression(pos + 16);
@@ -1869,11 +1857,11 @@ function deserializeTryStatement(pos) {
       block: null,
       handler: null,
       finalizer: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
-  node.block = deserializeBoxBlockStatement(pos + 16);
+  node.block = deserializeBlockStatement(int32[(pos >> 2) + 4]);
   node.handler = deserializeOptionBoxCatchClause(pos + 24);
   node.finalizer = deserializeOptionBoxBlockStatement(pos + 32);
   parent = previousParent;
@@ -1886,12 +1874,12 @@ function deserializeCatchClause(pos) {
       type: "CatchClause",
       param: null,
       body: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.param = deserializeOptionCatchParameter(pos + 16);
-  node.body = deserializeBoxBlockStatement(pos + 56);
+  node.body = deserializeBlockStatement(int32[(pos >> 2) + 14]);
   parent = previousParent;
   return node;
 }
@@ -1912,8 +1900,8 @@ function deserializeCatchParameter(pos) {
 function deserializeDebuggerStatement(pos) {
   return {
     type: "DebuggerStatement",
-    start: deserializeI32(pos),
-    end: deserializeI32(pos + 4),
+    start: int32[pos >> 2],
+    end: int32[(pos >> 2) + 1],
     parent,
   };
 }
@@ -1921,13 +1909,13 @@ function deserializeDebuggerStatement(pos) {
 function deserializeBindingPattern(pos) {
   switch (uint8[pos]) {
     case 0:
-      return deserializeBoxBindingIdentifier(pos + 8);
+      return deserializeBindingIdentifier(int32[(pos >> 2) + 2]);
     case 1:
-      return deserializeBoxObjectPattern(pos + 8);
+      return deserializeObjectPattern(int32[(pos >> 2) + 2]);
     case 2:
-      return deserializeBoxArrayPattern(pos + 8);
+      return deserializeArrayPattern(int32[(pos >> 2) + 2]);
     case 3:
-      return deserializeBoxAssignmentPattern(pos + 8);
+      return deserializeAssignmentPattern(int32[(pos >> 2) + 2]);
     default:
       throw Error(`Unexpected discriminant ${uint8[pos]} for BindingPattern`);
   }
@@ -1942,8 +1930,8 @@ function deserializeAssignmentPattern(pos) {
       right: null,
       optional: false,
       typeAnnotation: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.left = deserializeBindingPattern(pos + 16);
@@ -1960,8 +1948,8 @@ function deserializeObjectPattern(pos) {
       properties: null,
       optional: false,
       typeAnnotation: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     }),
     properties = deserializeVecBindingProperty(pos + 16),
@@ -1980,11 +1968,11 @@ function deserializeBindingProperty(pos) {
       key: null,
       value: null,
       method: false,
-      shorthand: deserializeBool(pos + 12),
-      computed: deserializeBool(pos + 13),
+      shorthand: uint8[pos + 12] === 1,
+      computed: uint8[pos + 13] === 1,
       optional: false,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.key = deserializePropertyKey(pos + 16);
@@ -2001,8 +1989,8 @@ function deserializeArrayPattern(pos) {
       elements: null,
       optional: false,
       typeAnnotation: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     }),
     elements = deserializeVecOptionBindingPattern(pos + 16),
@@ -2022,8 +2010,8 @@ function deserializeBindingRestElement(pos) {
       optional: false,
       typeAnnotation: null,
       value: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.argument = deserializeBindingPattern(pos + 16);
@@ -2034,18 +2022,18 @@ function deserializeBindingRestElement(pos) {
 function deserializeFunction(pos) {
   let previousParent = parent,
     node = (parent = {
-      type: deserializeFunctionType(pos + 88),
+      type: FunctionType_TABLE[uint8[pos + 88]],
       id: null,
-      generator: deserializeBool(pos + 89),
-      async: deserializeBool(pos + 90),
-      declare: deserializeBool(pos + 91),
+      generator: uint8[pos + 89] === 1,
+      async: uint8[pos + 90] === 1,
+      declare: uint8[pos + 91] === 1,
       typeParameters: null,
       params: null,
       returnType: null,
       body: null,
       expression: false,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     }),
     params = deserializeBoxFormalParameters(pos + 64);
@@ -2062,20 +2050,12 @@ function deserializeFunction(pos) {
   return node;
 }
 
-function deserializeFunctionType(pos) {
-  switch (uint8[pos]) {
-    case 0:
-      return "FunctionDeclaration";
-    case 1:
-      return "FunctionExpression";
-    case 2:
-      return "TSDeclareFunction";
-    case 3:
-      return "TSEmptyBodyFunctionExpression";
-    default:
-      throw Error(`Unexpected discriminant ${uint8[pos]} for FunctionType`);
-  }
-}
+const FunctionType_TABLE = [
+  "FunctionDeclaration",
+  "FunctionExpression",
+  "TSDeclareFunction",
+  "TSEmptyBodyFunctionExpression",
+];
 
 function deserializeFormalParameters(pos) {
   let params = deserializeVecFormalParameter(pos + 16),
@@ -2221,12 +2201,16 @@ function deserializeFunctionBody(pos) {
     node = (parent = {
       type: "BlockStatement",
       body: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     }),
+    body;
+  if (int32[(pos >> 2) + 6] === 0) body = deserializeVecStatement(pos + 40);
+  else {
     body = deserializeVecDirective(pos + 16);
-  body.push(...deserializeVecStatement(pos + 40));
+    body.push(...deserializeVecStatement(pos + 40));
+  }
   node.body = body;
   parent = previousParent;
   return node;
@@ -2235,95 +2219,95 @@ function deserializeFunctionBody(pos) {
 function deserializeArrowFunctionBody(pos) {
   switch (uint8[pos]) {
     case 0:
-      return deserializeBoxBooleanLiteral(pos + 8);
+      return deserializeBooleanLiteral(int32[(pos >> 2) + 2]);
     case 1:
-      return deserializeBoxNullLiteral(pos + 8);
+      return deserializeNullLiteral(int32[(pos >> 2) + 2]);
     case 2:
-      return deserializeBoxNumericLiteral(pos + 8);
+      return deserializeNumericLiteral(int32[(pos >> 2) + 2]);
     case 3:
-      return deserializeBoxBigIntLiteral(pos + 8);
+      return deserializeBigIntLiteral(int32[(pos >> 2) + 2]);
     case 4:
-      return deserializeBoxRegExpLiteral(pos + 8);
+      return deserializeRegExpLiteral(int32[(pos >> 2) + 2]);
     case 5:
-      return deserializeBoxStringLiteral(pos + 8);
+      return deserializeStringLiteral(int32[(pos >> 2) + 2]);
     case 6:
-      return deserializeBoxTemplateLiteral(pos + 8);
+      return deserializeTemplateLiteral(int32[(pos >> 2) + 2]);
     case 7:
-      return deserializeBoxIdentifierReference(pos + 8);
+      return deserializeIdentifierReference(int32[(pos >> 2) + 2]);
     case 8:
-      return deserializeBoxSuper(pos + 8);
+      return deserializeSuper(int32[(pos >> 2) + 2]);
     case 9:
-      return deserializeBoxArrayExpression(pos + 8);
+      return deserializeArrayExpression(int32[(pos >> 2) + 2]);
     case 10:
-      return deserializeBoxArrowFunctionExpression(pos + 8);
+      return deserializeArrowFunctionExpression(int32[(pos >> 2) + 2]);
     case 11:
-      return deserializeBoxAssignmentExpression(pos + 8);
+      return deserializeAssignmentExpression(int32[(pos >> 2) + 2]);
     case 12:
-      return deserializeBoxAwaitExpression(pos + 8);
+      return deserializeAwaitExpression(int32[(pos >> 2) + 2]);
     case 13:
-      return deserializeBoxBinaryExpression(pos + 8);
+      return deserializeBinaryExpression(int32[(pos >> 2) + 2]);
     case 14:
-      return deserializeBoxCallExpression(pos + 8);
+      return deserializeCallExpression(int32[(pos >> 2) + 2]);
     case 15:
-      return deserializeBoxChainExpression(pos + 8);
+      return deserializeChainExpression(int32[(pos >> 2) + 2]);
     case 16:
-      return deserializeBoxClass(pos + 8);
+      return deserializeClass(int32[(pos >> 2) + 2]);
     case 17:
-      return deserializeBoxConditionalExpression(pos + 8);
+      return deserializeConditionalExpression(int32[(pos >> 2) + 2]);
     case 18:
-      return deserializeBoxFunction(pos + 8);
+      return deserializeFunction(int32[(pos >> 2) + 2]);
     case 19:
-      return deserializeBoxImportExpression(pos + 8);
+      return deserializeImportExpression(int32[(pos >> 2) + 2]);
     case 20:
-      return deserializeBoxLogicalExpression(pos + 8);
+      return deserializeLogicalExpression(int32[(pos >> 2) + 2]);
     case 21:
-      return deserializeBoxNewExpression(pos + 8);
+      return deserializeNewExpression(int32[(pos >> 2) + 2]);
     case 22:
-      return deserializeBoxObjectExpression(pos + 8);
+      return deserializeObjectExpression(int32[(pos >> 2) + 2]);
     case 23:
-      return deserializeBoxParenthesizedExpression(pos + 8);
+      return deserializeParenthesizedExpression(int32[(pos >> 2) + 2]);
     case 24:
-      return deserializeBoxSequenceExpression(pos + 8);
+      return deserializeSequenceExpression(int32[(pos >> 2) + 2]);
     case 25:
-      return deserializeBoxTaggedTemplateExpression(pos + 8);
+      return deserializeTaggedTemplateExpression(int32[(pos >> 2) + 2]);
     case 26:
-      return deserializeBoxThisExpression(pos + 8);
+      return deserializeThisExpression(int32[(pos >> 2) + 2]);
     case 27:
-      return deserializeBoxUnaryExpression(pos + 8);
+      return deserializeUnaryExpression(int32[(pos >> 2) + 2]);
     case 28:
-      return deserializeBoxUpdateExpression(pos + 8);
+      return deserializeUpdateExpression(int32[(pos >> 2) + 2]);
     case 29:
-      return deserializeBoxYieldExpression(pos + 8);
+      return deserializeYieldExpression(int32[(pos >> 2) + 2]);
     case 30:
-      return deserializeBoxPrivateInExpression(pos + 8);
+      return deserializePrivateInExpression(int32[(pos >> 2) + 2]);
     case 31:
-      return deserializeBoxImportMeta(pos + 8);
+      return deserializeImportMeta(int32[(pos >> 2) + 2]);
     case 32:
-      return deserializeBoxNewTarget(pos + 8);
+      return deserializeNewTarget(int32[(pos >> 2) + 2]);
     case 33:
-      return deserializeBoxJSXElement(pos + 8);
+      return deserializeJSXElement(int32[(pos >> 2) + 2]);
     case 34:
-      return deserializeBoxJSXFragment(pos + 8);
+      return deserializeJSXFragment(int32[(pos >> 2) + 2]);
     case 35:
-      return deserializeBoxTSAsExpression(pos + 8);
+      return deserializeTSAsExpression(int32[(pos >> 2) + 2]);
     case 36:
-      return deserializeBoxTSSatisfiesExpression(pos + 8);
+      return deserializeTSSatisfiesExpression(int32[(pos >> 2) + 2]);
     case 37:
-      return deserializeBoxTSTypeAssertion(pos + 8);
+      return deserializeTSTypeAssertion(int32[(pos >> 2) + 2]);
     case 38:
-      return deserializeBoxTSNonNullExpression(pos + 8);
+      return deserializeTSNonNullExpression(int32[(pos >> 2) + 2]);
     case 39:
-      return deserializeBoxTSInstantiationExpression(pos + 8);
+      return deserializeTSInstantiationExpression(int32[(pos >> 2) + 2]);
     case 40:
-      return deserializeBoxV8IntrinsicExpression(pos + 8);
+      return deserializeV8IntrinsicExpression(int32[(pos >> 2) + 2]);
     case 48:
-      return deserializeBoxComputedMemberExpression(pos + 8);
+      return deserializeComputedMemberExpression(int32[(pos >> 2) + 2]);
     case 49:
-      return deserializeBoxStaticMemberExpression(pos + 8);
+      return deserializeStaticMemberExpression(int32[(pos >> 2) + 2]);
     case 50:
-      return deserializeBoxPrivateFieldExpression(pos + 8);
+      return deserializePrivateFieldExpression(int32[(pos >> 2) + 2]);
     case 64:
-      return deserializeBoxFunctionBody(pos + 8);
+      return deserializeFunctionBody(int32[(pos >> 2) + 2]);
     default:
       throw Error(`Unexpected discriminant ${uint8[pos]} for ArrowFunctionBody`);
   }
@@ -2334,19 +2318,19 @@ function deserializeArrowFunctionExpression(pos) {
     node = (parent = {
       type: "ArrowFunctionExpression",
       expression: uint8[pos + 40] !== 64,
-      async: deserializeBool(pos + 56),
+      async: uint8[pos + 56] === 1,
       typeParameters: null,
       params: null,
       returnType: null,
       body: null,
       id: null,
       generator: false,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.typeParameters = deserializeOptionBoxTSTypeParameterDeclaration(pos + 16);
-  node.params = deserializeBoxFormalParameters(pos + 24);
+  node.params = deserializeFormalParameters(int32[(pos >> 2) + 6]);
   node.returnType = deserializeOptionBoxTSTypeAnnotation(pos + 32);
   node.body = deserializeArrowFunctionBody(pos + 40);
   parent = previousParent;
@@ -2357,10 +2341,10 @@ function deserializeYieldExpression(pos) {
   let previousParent = parent,
     node = (parent = {
       type: "YieldExpression",
-      delegate: deserializeBool(pos + 12),
+      delegate: uint8[pos + 12] === 1,
       argument: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.argument = deserializeOptionExpression(pos + 16);
@@ -2371,7 +2355,7 @@ function deserializeYieldExpression(pos) {
 function deserializeClass(pos) {
   let previousParent = parent,
     node = (parent = {
-      type: deserializeClassType(pos + 136),
+      type: uint8[pos + 136] === 0 ? "ClassDeclaration" : "ClassExpression",
       decorators: null,
       id: null,
       typeParameters: null,
@@ -2379,10 +2363,10 @@ function deserializeClass(pos) {
       superTypeArguments: null,
       implements: null,
       body: null,
-      abstract: deserializeBool(pos + 137),
-      declare: deserializeBool(pos + 138),
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      abstract: uint8[pos + 137] === 1,
+      declare: uint8[pos + 138] === 1,
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     }),
     superClass = deserializeOptionExpression(pos + 80);
@@ -2395,20 +2379,9 @@ function deserializeClass(pos) {
       ? null
       : deserializeOptionBoxTSTypeParameterInstantiation(pos + 80 + (pos + 16 - pos));
   node.implements = deserializeVecTSClassImplements(pos + 104);
-  node.body = deserializeBoxClassBody(pos + 128);
+  node.body = deserializeClassBody(int32[(pos >> 2) + 32]);
   parent = previousParent;
   return node;
-}
-
-function deserializeClassType(pos) {
-  switch (uint8[pos]) {
-    case 0:
-      return "ClassDeclaration";
-    case 1:
-      return "ClassExpression";
-    default:
-      throw Error(`Unexpected discriminant ${uint8[pos]} for ClassType`);
-  }
 }
 
 function deserializeClassBody(pos) {
@@ -2416,8 +2389,8 @@ function deserializeClassBody(pos) {
     node = (parent = {
       type: "ClassBody",
       body: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.body = deserializeVecClassElement(pos + 16);
@@ -2428,15 +2401,15 @@ function deserializeClassBody(pos) {
 function deserializeClassElement(pos) {
   switch (uint8[pos]) {
     case 0:
-      return deserializeBoxStaticBlock(pos + 8);
+      return deserializeStaticBlock(int32[(pos >> 2) + 2]);
     case 1:
-      return deserializeBoxMethodDefinition(pos + 8);
+      return deserializeMethodDefinition(int32[(pos >> 2) + 2]);
     case 2:
-      return deserializeBoxPropertyDefinition(pos + 8);
+      return deserializePropertyDefinition(int32[(pos >> 2) + 2]);
     case 3:
-      return deserializeBoxAccessorProperty(pos + 8);
+      return deserializeAccessorProperty(int32[(pos >> 2) + 2]);
     case 4:
-      return deserializeBoxTSIndexSignature(pos + 8);
+      return deserializeTSIndexSignature(int32[(pos >> 2) + 2]);
     default:
       throw Error(`Unexpected discriminant ${uint8[pos]} for ClassElement`);
   }
@@ -2445,56 +2418,45 @@ function deserializeClassElement(pos) {
 function deserializeMethodDefinition(pos) {
   let previousParent = parent,
     node = (parent = {
-      type: deserializeMethodDefinitionType(pos + 12),
+      type: uint8[pos + 12] === 0 ? "MethodDefinition" : "TSAbstractMethodDefinition",
       decorators: null,
       key: null,
       value: null,
-      kind: deserializeMethodDefinitionKind(pos + 13),
-      computed: deserializeBool(pos + 14),
-      static: deserializeBool(pos + 15),
-      override: deserializeBool(pos + 64),
-      optional: deserializeBool(pos + 65),
+      kind: MethodDefinitionKind_TABLE[uint8[pos + 13]],
+      computed: uint8[pos + 14] === 1,
+      static: uint8[pos + 15] === 1,
+      override: uint8[pos + 64] === 1,
+      optional: uint8[pos + 65] === 1,
       accessibility: deserializeOptionTSAccessibility(pos + 66),
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.decorators = deserializeVecDecorator(pos + 16);
   node.key = deserializePropertyKey(pos + 40);
-  node.value = deserializeBoxFunction(pos + 56);
+  node.value = deserializeFunction(int32[(pos >> 2) + 14]);
   parent = previousParent;
   return node;
-}
-
-function deserializeMethodDefinitionType(pos) {
-  switch (uint8[pos]) {
-    case 0:
-      return "MethodDefinition";
-    case 1:
-      return "TSAbstractMethodDefinition";
-    default:
-      throw Error(`Unexpected discriminant ${uint8[pos]} for MethodDefinitionType`);
-  }
 }
 
 function deserializePropertyDefinition(pos) {
   let previousParent = parent,
     node = (parent = {
-      type: deserializePropertyDefinitionType(pos + 12),
+      type: uint8[pos + 12] === 0 ? "PropertyDefinition" : "TSAbstractPropertyDefinition",
       decorators: null,
       key: null,
       typeAnnotation: null,
       value: null,
-      computed: deserializeBool(pos + 13),
-      static: deserializeBool(pos + 14),
-      declare: deserializeBool(pos + 15),
-      override: deserializeBool(pos + 80),
-      optional: deserializeBool(pos + 81),
-      definite: deserializeBool(pos + 82),
-      readonly: deserializeBool(pos + 83),
+      computed: uint8[pos + 13] === 1,
+      static: uint8[pos + 14] === 1,
+      declare: uint8[pos + 15] === 1,
+      override: uint8[pos + 80] === 1,
+      optional: uint8[pos + 81] === 1,
+      definite: uint8[pos + 82] === 1,
+      readonly: uint8[pos + 83] === 1,
       accessibility: deserializeOptionTSAccessibility(pos + 84),
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.decorators = deserializeVecDecorator(pos + 16);
@@ -2505,38 +2467,19 @@ function deserializePropertyDefinition(pos) {
   return node;
 }
 
-function deserializePropertyDefinitionType(pos) {
-  switch (uint8[pos]) {
-    case 0:
-      return "PropertyDefinition";
-    case 1:
-      return "TSAbstractPropertyDefinition";
-    default:
-      throw Error(`Unexpected discriminant ${uint8[pos]} for PropertyDefinitionType`);
-  }
-}
-
-function deserializeMethodDefinitionKind(pos) {
-  switch (uint8[pos]) {
-    case 0:
-      return "constructor";
-    case 1:
-      return "method";
-    case 2:
-      return "get";
-    case 3:
-      return "set";
-    default:
-      throw Error(`Unexpected discriminant ${uint8[pos]} for MethodDefinitionKind`);
-  }
-}
+const MethodDefinitionKind_TABLE = ["constructor", "method", "get", "set"];
 
 function deserializePrivateIdentifier(pos) {
+  let start = int32[pos >> 2],
+    end = int32[(pos >> 2) + 1];
   return {
     type: "PrivateIdentifier",
-    name: deserializeStr(pos + 16),
-    start: deserializeI32(pos),
-    end: deserializeI32(pos + 4),
+    name:
+      int32[(pos >> 2) + 4] >= sourceStartPos
+        ? sourceText.slice(start + 1, end)
+        : deserializeStr(pos + 16),
+    start,
+    end,
     parent,
   };
 }
@@ -2546,8 +2489,8 @@ function deserializeStaticBlock(pos) {
     node = (parent = {
       type: "StaticBlock",
       body: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.body = deserializeVecStatement(pos + 16);
@@ -2555,35 +2498,24 @@ function deserializeStaticBlock(pos) {
   return node;
 }
 
-function deserializeAccessorPropertyType(pos) {
-  switch (uint8[pos]) {
-    case 0:
-      return "AccessorProperty";
-    case 1:
-      return "TSAbstractAccessorProperty";
-    default:
-      throw Error(`Unexpected discriminant ${uint8[pos]} for AccessorPropertyType`);
-  }
-}
-
 function deserializeAccessorProperty(pos) {
   let previousParent = parent,
     node = (parent = {
-      type: deserializeAccessorPropertyType(pos + 12),
+      type: uint8[pos + 12] === 0 ? "AccessorProperty" : "TSAbstractAccessorProperty",
       decorators: null,
       key: null,
       typeAnnotation: null,
       value: null,
-      computed: deserializeBool(pos + 13),
-      static: deserializeBool(pos + 14),
-      override: deserializeBool(pos + 15),
-      definite: deserializeBool(pos + 80),
+      computed: uint8[pos + 13] === 1,
+      static: uint8[pos + 14] === 1,
+      override: uint8[pos + 15] === 1,
+      definite: uint8[pos + 80] === 1,
       accessibility: deserializeOptionTSAccessibility(pos + 81),
       declare: false,
       optional: false,
       readonly: false,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.decorators = deserializeVecDecorator(pos + 16);
@@ -2601,8 +2533,8 @@ function deserializeImportExpression(pos) {
       source: null,
       options: null,
       phase: deserializeOptionImportPhase(pos + 12),
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.source = deserializeExpression(pos + 16);
@@ -2619,9 +2551,9 @@ function deserializeImportDeclaration(pos) {
       source: null,
       phase: deserializeOptionImportPhase(pos + 12),
       attributes: null,
-      importKind: deserializeImportOrExportKind(pos + 13),
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      importKind: uint8[pos + 13] === 0 ? "value" : "type",
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     }),
     specifiers = deserializeOptionVecImportDeclarationSpecifier(pos + 16);
@@ -2648,11 +2580,11 @@ function deserializeImportPhase(pos) {
 function deserializeImportDeclarationSpecifier(pos) {
   switch (uint8[pos]) {
     case 0:
-      return deserializeBoxImportSpecifier(pos + 8);
+      return deserializeImportSpecifier(int32[(pos >> 2) + 2]);
     case 1:
-      return deserializeBoxImportDefaultSpecifier(pos + 8);
+      return deserializeImportDefaultSpecifier(int32[(pos >> 2) + 2]);
     case 2:
-      return deserializeBoxImportNamespaceSpecifier(pos + 8);
+      return deserializeImportNamespaceSpecifier(int32[(pos >> 2) + 2]);
     default:
       throw Error(`Unexpected discriminant ${uint8[pos]} for ImportDeclarationSpecifier`);
   }
@@ -2664,9 +2596,9 @@ function deserializeImportSpecifier(pos) {
       type: "ImportSpecifier",
       imported: null,
       local: null,
-      importKind: deserializeImportOrExportKind(pos + 12),
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      importKind: uint8[pos + 12] === 0 ? "value" : "type",
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.imported = deserializeModuleExportName(pos + 16);
@@ -2680,8 +2612,8 @@ function deserializeImportDefaultSpecifier(pos) {
     node = (parent = {
       type: "ImportDefaultSpecifier",
       local: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.local = deserializeBindingIdentifier(pos + 16);
@@ -2694,8 +2626,8 @@ function deserializeImportNamespaceSpecifier(pos) {
     node = (parent = {
       type: "ImportNamespaceSpecifier",
       local: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.local = deserializeBindingIdentifier(pos + 16);
@@ -2713,8 +2645,8 @@ function deserializeImportAttribute(pos) {
       type: "ImportAttribute",
       key: null,
       value: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.key = deserializeImportAttributeKey(pos + 16);
@@ -2743,8 +2675,8 @@ function deserializeExportDeclaration(pos) {
       source: null,
       exportKind: null,
       attributes: [],
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     }),
     declaration = deserializeDeclaration(pos + 16);
@@ -2766,10 +2698,10 @@ function deserializeExportNamedDeclaration(pos) {
       declaration: null,
       specifiers: null,
       source: null,
-      exportKind: deserializeImportOrExportKind(pos + 12),
+      exportKind: uint8[pos + 12] === 0 ? "value" : "type",
       attributes: [],
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.specifiers = deserializeVecExportSpecifier(pos + 16);
@@ -2784,10 +2716,10 @@ function deserializeExportFromDeclaration(pos) {
       declaration: null,
       specifiers: null,
       source: null,
-      exportKind: deserializeImportOrExportKind(pos + 12),
+      exportKind: uint8[pos + 12] === 0 ? "value" : "type",
       attributes: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     }),
     withClause = deserializeOptionBoxWithClause(pos + 88);
@@ -2804,8 +2736,8 @@ function deserializeExportDefaultDeclaration(pos) {
       type: "ExportDefaultDeclaration",
       declaration: null,
       exportKind: "value",
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.declaration = deserializeExportDefaultDeclarationKind(pos + 16);
@@ -2820,9 +2752,9 @@ function deserializeExportAllDeclaration(pos) {
       exported: null,
       source: null,
       attributes: null,
-      exportKind: deserializeImportOrExportKind(pos + 12),
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      exportKind: uint8[pos + 12] === 0 ? "value" : "type",
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     }),
     withClause = deserializeOptionBoxWithClause(pos + 120);
@@ -2839,9 +2771,9 @@ function deserializeExportSpecifier(pos) {
       type: "ExportSpecifier",
       local: null,
       exported: null,
-      exportKind: deserializeImportOrExportKind(pos + 12),
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      exportKind: uint8[pos + 12] === 0 ? "value" : "type",
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.local = deserializeModuleExportName(pos + 16);
@@ -2853,99 +2785,99 @@ function deserializeExportSpecifier(pos) {
 function deserializeExportDefaultDeclarationKind(pos) {
   switch (uint8[pos]) {
     case 0:
-      return deserializeBoxBooleanLiteral(pos + 8);
+      return deserializeBooleanLiteral(int32[(pos >> 2) + 2]);
     case 1:
-      return deserializeBoxNullLiteral(pos + 8);
+      return deserializeNullLiteral(int32[(pos >> 2) + 2]);
     case 2:
-      return deserializeBoxNumericLiteral(pos + 8);
+      return deserializeNumericLiteral(int32[(pos >> 2) + 2]);
     case 3:
-      return deserializeBoxBigIntLiteral(pos + 8);
+      return deserializeBigIntLiteral(int32[(pos >> 2) + 2]);
     case 4:
-      return deserializeBoxRegExpLiteral(pos + 8);
+      return deserializeRegExpLiteral(int32[(pos >> 2) + 2]);
     case 5:
-      return deserializeBoxStringLiteral(pos + 8);
+      return deserializeStringLiteral(int32[(pos >> 2) + 2]);
     case 6:
-      return deserializeBoxTemplateLiteral(pos + 8);
+      return deserializeTemplateLiteral(int32[(pos >> 2) + 2]);
     case 7:
-      return deserializeBoxIdentifierReference(pos + 8);
+      return deserializeIdentifierReference(int32[(pos >> 2) + 2]);
     case 8:
-      return deserializeBoxSuper(pos + 8);
+      return deserializeSuper(int32[(pos >> 2) + 2]);
     case 9:
-      return deserializeBoxArrayExpression(pos + 8);
+      return deserializeArrayExpression(int32[(pos >> 2) + 2]);
     case 10:
-      return deserializeBoxArrowFunctionExpression(pos + 8);
+      return deserializeArrowFunctionExpression(int32[(pos >> 2) + 2]);
     case 11:
-      return deserializeBoxAssignmentExpression(pos + 8);
+      return deserializeAssignmentExpression(int32[(pos >> 2) + 2]);
     case 12:
-      return deserializeBoxAwaitExpression(pos + 8);
+      return deserializeAwaitExpression(int32[(pos >> 2) + 2]);
     case 13:
-      return deserializeBoxBinaryExpression(pos + 8);
+      return deserializeBinaryExpression(int32[(pos >> 2) + 2]);
     case 14:
-      return deserializeBoxCallExpression(pos + 8);
+      return deserializeCallExpression(int32[(pos >> 2) + 2]);
     case 15:
-      return deserializeBoxChainExpression(pos + 8);
+      return deserializeChainExpression(int32[(pos >> 2) + 2]);
     case 16:
-      return deserializeBoxClass(pos + 8);
+      return deserializeClass(int32[(pos >> 2) + 2]);
     case 17:
-      return deserializeBoxConditionalExpression(pos + 8);
+      return deserializeConditionalExpression(int32[(pos >> 2) + 2]);
     case 18:
-      return deserializeBoxFunction(pos + 8);
+      return deserializeFunction(int32[(pos >> 2) + 2]);
     case 19:
-      return deserializeBoxImportExpression(pos + 8);
+      return deserializeImportExpression(int32[(pos >> 2) + 2]);
     case 20:
-      return deserializeBoxLogicalExpression(pos + 8);
+      return deserializeLogicalExpression(int32[(pos >> 2) + 2]);
     case 21:
-      return deserializeBoxNewExpression(pos + 8);
+      return deserializeNewExpression(int32[(pos >> 2) + 2]);
     case 22:
-      return deserializeBoxObjectExpression(pos + 8);
+      return deserializeObjectExpression(int32[(pos >> 2) + 2]);
     case 23:
-      return deserializeBoxParenthesizedExpression(pos + 8);
+      return deserializeParenthesizedExpression(int32[(pos >> 2) + 2]);
     case 24:
-      return deserializeBoxSequenceExpression(pos + 8);
+      return deserializeSequenceExpression(int32[(pos >> 2) + 2]);
     case 25:
-      return deserializeBoxTaggedTemplateExpression(pos + 8);
+      return deserializeTaggedTemplateExpression(int32[(pos >> 2) + 2]);
     case 26:
-      return deserializeBoxThisExpression(pos + 8);
+      return deserializeThisExpression(int32[(pos >> 2) + 2]);
     case 27:
-      return deserializeBoxUnaryExpression(pos + 8);
+      return deserializeUnaryExpression(int32[(pos >> 2) + 2]);
     case 28:
-      return deserializeBoxUpdateExpression(pos + 8);
+      return deserializeUpdateExpression(int32[(pos >> 2) + 2]);
     case 29:
-      return deserializeBoxYieldExpression(pos + 8);
+      return deserializeYieldExpression(int32[(pos >> 2) + 2]);
     case 30:
-      return deserializeBoxPrivateInExpression(pos + 8);
+      return deserializePrivateInExpression(int32[(pos >> 2) + 2]);
     case 31:
-      return deserializeBoxImportMeta(pos + 8);
+      return deserializeImportMeta(int32[(pos >> 2) + 2]);
     case 32:
-      return deserializeBoxNewTarget(pos + 8);
+      return deserializeNewTarget(int32[(pos >> 2) + 2]);
     case 33:
-      return deserializeBoxJSXElement(pos + 8);
+      return deserializeJSXElement(int32[(pos >> 2) + 2]);
     case 34:
-      return deserializeBoxJSXFragment(pos + 8);
+      return deserializeJSXFragment(int32[(pos >> 2) + 2]);
     case 35:
-      return deserializeBoxTSAsExpression(pos + 8);
+      return deserializeTSAsExpression(int32[(pos >> 2) + 2]);
     case 36:
-      return deserializeBoxTSSatisfiesExpression(pos + 8);
+      return deserializeTSSatisfiesExpression(int32[(pos >> 2) + 2]);
     case 37:
-      return deserializeBoxTSTypeAssertion(pos + 8);
+      return deserializeTSTypeAssertion(int32[(pos >> 2) + 2]);
     case 38:
-      return deserializeBoxTSNonNullExpression(pos + 8);
+      return deserializeTSNonNullExpression(int32[(pos >> 2) + 2]);
     case 39:
-      return deserializeBoxTSInstantiationExpression(pos + 8);
+      return deserializeTSInstantiationExpression(int32[(pos >> 2) + 2]);
     case 40:
-      return deserializeBoxV8IntrinsicExpression(pos + 8);
+      return deserializeV8IntrinsicExpression(int32[(pos >> 2) + 2]);
     case 48:
-      return deserializeBoxComputedMemberExpression(pos + 8);
+      return deserializeComputedMemberExpression(int32[(pos >> 2) + 2]);
     case 49:
-      return deserializeBoxStaticMemberExpression(pos + 8);
+      return deserializeStaticMemberExpression(int32[(pos >> 2) + 2]);
     case 50:
-      return deserializeBoxPrivateFieldExpression(pos + 8);
+      return deserializePrivateFieldExpression(int32[(pos >> 2) + 2]);
     case 64:
-      return deserializeBoxFunction(pos + 8);
+      return deserializeFunction(int32[(pos >> 2) + 2]);
     case 65:
-      return deserializeBoxClass(pos + 8);
+      return deserializeClass(int32[(pos >> 2) + 2]);
     case 66:
-      return deserializeBoxTSInterfaceDeclaration(pos + 8);
+      return deserializeTSInterfaceDeclaration(int32[(pos >> 2) + 2]);
     default:
       throw Error(`Unexpected discriminant ${uint8[pos]} for ExportDefaultDeclarationKind`);
   }
@@ -2970,8 +2902,8 @@ function deserializeV8IntrinsicExpression(pos) {
       type: "V8IntrinsicExpression",
       name: null,
       arguments: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.name = deserializeIdentifierName(pos + 16);
@@ -2981,26 +2913,22 @@ function deserializeV8IntrinsicExpression(pos) {
 }
 
 function deserializeBooleanLiteral(pos) {
-  let value = deserializeBool(pos + 12),
-    start = deserializeI32(pos),
-    end = deserializeI32(pos + 4),
-    previousParent = parent,
-    node = (parent = {
-      type: "Literal",
-      value,
-      raw: null,
-      start,
-      end,
-      parent,
-    });
-  node.raw = start === 0 && end === 0 ? null : value + "";
-  parent = previousParent;
-  return node;
+  let value = uint8[pos + 12] === 1,
+    start = int32[pos >> 2],
+    end = int32[(pos >> 2) + 1];
+  return {
+    type: "Literal",
+    value,
+    raw: start === 0 && end === 0 ? null : value ? "true" : "false",
+    start,
+    end,
+    parent,
+  };
 }
 
 function deserializeNullLiteral(pos) {
-  let start = deserializeI32(pos),
-    end = deserializeI32(pos + 4);
+  let start = int32[pos >> 2],
+    end = int32[(pos >> 2) + 1];
   return {
     type: "Literal",
     value: null,
@@ -3012,11 +2940,11 @@ function deserializeNullLiteral(pos) {
 }
 
 function deserializeNumericLiteral(pos) {
-  let start = deserializeI32(pos),
-    end = deserializeI32(pos + 4);
+  let start = int32[pos >> 2],
+    end = int32[(pos >> 2) + 1];
   return {
     type: "Literal",
-    value: deserializeF64(pos + 32),
+    value: float64[(pos >> 3) + 4],
     raw:
       int32[(pos >> 2) + 4] === 0 && int32[(pos >> 2) + 5] === 0
         ? null
@@ -3028,11 +2956,14 @@ function deserializeNumericLiteral(pos) {
 }
 
 function deserializeStringLiteral(pos) {
-  let start = deserializeI32(pos),
-    end = deserializeI32(pos + 4);
+  let start = int32[pos >> 2],
+    end = int32[(pos >> 2) + 1];
   return {
     type: "Literal",
-    value: deserializeJSStr(pos + 16),
+    value:
+      int32[(pos >> 2) + 4] >= sourceStartPos
+        ? sourceText.slice(start + 1, end - 1)
+        : deserializeJSStr(pos + 16),
     raw:
       int32[(pos >> 2) + 8] === 0 && int32[(pos >> 2) + 9] === 0
         ? null
@@ -3044,8 +2975,8 @@ function deserializeStringLiteral(pos) {
 }
 
 function deserializeBigIntLiteral(pos) {
-  let start = deserializeI32(pos),
-    end = deserializeI32(pos + 4),
+  let start = int32[pos >> 2],
+    end = int32[(pos >> 2) + 1],
     bigint = deserializeStr(pos + 16);
   return {
     type: "Literal",
@@ -3062,8 +2993,8 @@ function deserializeBigIntLiteral(pos) {
 }
 
 function deserializeRegExpLiteral(pos) {
-  let start = deserializeI32(pos),
-    end = deserializeI32(pos + 4),
+  let start = int32[pos >> 2],
+    end = int32[(pos >> 2) + 1],
     previousParent = parent,
     node = (parent = {
       type: "Literal",
@@ -3117,8 +3048,8 @@ function deserializeJSXElement(pos) {
       openingElement: null,
       children: null,
       closingElement: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     }),
     closingElement = deserializeOptionBoxJSXClosingElement(pos + 48),
@@ -3139,8 +3070,8 @@ function deserializeJSXOpeningElement(pos) {
       typeArguments: null,
       attributes: null,
       selfClosing: false,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.name = deserializeJSXElementName(pos + 16);
@@ -3155,8 +3086,8 @@ function deserializeJSXClosingElement(pos) {
     node = (parent = {
       type: "JSXClosingElement",
       name: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.name = deserializeJSXElementName(pos + 16);
@@ -3171,8 +3102,8 @@ function deserializeJSXFragment(pos) {
       openingFragment: null,
       children: null,
       closingFragment: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.openingFragment = deserializeJSXOpeningFragment(pos + 16);
@@ -3185,8 +3116,8 @@ function deserializeJSXFragment(pos) {
 function deserializeJSXOpeningFragment(pos) {
   return {
     type: "JSXOpeningFragment",
-    start: deserializeI32(pos),
-    end: deserializeI32(pos + 4),
+    start: int32[pos >> 2],
+    end: int32[(pos >> 2) + 1],
     parent,
   };
 }
@@ -3194,8 +3125,8 @@ function deserializeJSXOpeningFragment(pos) {
 function deserializeJSXClosingFragment(pos) {
   return {
     type: "JSXClosingFragment",
-    start: deserializeI32(pos),
-    end: deserializeI32(pos + 4),
+    start: int32[pos >> 2],
+    end: int32[(pos >> 2) + 1],
     parent,
   };
 }
@@ -3203,7 +3134,7 @@ function deserializeJSXClosingFragment(pos) {
 function deserializeJSXElementName(pos) {
   switch (uint8[pos]) {
     case 0:
-      return deserializeBoxJSXIdentifier(pos + 8);
+      return deserializeJSXIdentifier(int32[(pos >> 2) + 2]);
     case 1:
       let ident = deserializeBoxIdentifierReference(pos + 8);
       return {
@@ -3214,9 +3145,9 @@ function deserializeJSXElementName(pos) {
         parent,
       };
     case 2:
-      return deserializeBoxJSXNamespacedName(pos + 8);
+      return deserializeJSXNamespacedName(int32[(pos >> 2) + 2]);
     case 3:
-      return deserializeBoxJSXMemberExpression(pos + 8);
+      return deserializeJSXMemberExpression(int32[(pos >> 2) + 2]);
     case 4:
       let thisExpr = deserializeBoxThisExpression(pos + 8);
       return {
@@ -3237,8 +3168,8 @@ function deserializeJSXNamespacedName(pos) {
       type: "JSXNamespacedName",
       namespace: null,
       name: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.namespace = deserializeJSXIdentifier(pos + 16);
@@ -3253,8 +3184,8 @@ function deserializeJSXMemberExpression(pos) {
       type: "JSXMemberExpression",
       object: null,
       property: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.object = deserializeJSXMemberExpressionObject(pos + 16);
@@ -3275,7 +3206,7 @@ function deserializeJSXMemberExpressionObject(pos) {
         parent,
       };
     case 1:
-      return deserializeBoxJSXMemberExpression(pos + 8);
+      return deserializeJSXMemberExpression(int32[(pos >> 2) + 2]);
     case 2:
       let thisExpr = deserializeBoxThisExpression(pos + 8);
       return {
@@ -3295,8 +3226,8 @@ function deserializeJSXExpressionContainer(pos) {
     node = (parent = {
       type: "JSXExpressionContainer",
       expression: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.expression = deserializeJSXExpression(pos + 16);
@@ -3307,95 +3238,95 @@ function deserializeJSXExpressionContainer(pos) {
 function deserializeJSXExpression(pos) {
   switch (uint8[pos]) {
     case 0:
-      return deserializeBoxBooleanLiteral(pos + 8);
+      return deserializeBooleanLiteral(int32[(pos >> 2) + 2]);
     case 1:
-      return deserializeBoxNullLiteral(pos + 8);
+      return deserializeNullLiteral(int32[(pos >> 2) + 2]);
     case 2:
-      return deserializeBoxNumericLiteral(pos + 8);
+      return deserializeNumericLiteral(int32[(pos >> 2) + 2]);
     case 3:
-      return deserializeBoxBigIntLiteral(pos + 8);
+      return deserializeBigIntLiteral(int32[(pos >> 2) + 2]);
     case 4:
-      return deserializeBoxRegExpLiteral(pos + 8);
+      return deserializeRegExpLiteral(int32[(pos >> 2) + 2]);
     case 5:
-      return deserializeBoxStringLiteral(pos + 8);
+      return deserializeStringLiteral(int32[(pos >> 2) + 2]);
     case 6:
-      return deserializeBoxTemplateLiteral(pos + 8);
+      return deserializeTemplateLiteral(int32[(pos >> 2) + 2]);
     case 7:
-      return deserializeBoxIdentifierReference(pos + 8);
+      return deserializeIdentifierReference(int32[(pos >> 2) + 2]);
     case 8:
-      return deserializeBoxSuper(pos + 8);
+      return deserializeSuper(int32[(pos >> 2) + 2]);
     case 9:
-      return deserializeBoxArrayExpression(pos + 8);
+      return deserializeArrayExpression(int32[(pos >> 2) + 2]);
     case 10:
-      return deserializeBoxArrowFunctionExpression(pos + 8);
+      return deserializeArrowFunctionExpression(int32[(pos >> 2) + 2]);
     case 11:
-      return deserializeBoxAssignmentExpression(pos + 8);
+      return deserializeAssignmentExpression(int32[(pos >> 2) + 2]);
     case 12:
-      return deserializeBoxAwaitExpression(pos + 8);
+      return deserializeAwaitExpression(int32[(pos >> 2) + 2]);
     case 13:
-      return deserializeBoxBinaryExpression(pos + 8);
+      return deserializeBinaryExpression(int32[(pos >> 2) + 2]);
     case 14:
-      return deserializeBoxCallExpression(pos + 8);
+      return deserializeCallExpression(int32[(pos >> 2) + 2]);
     case 15:
-      return deserializeBoxChainExpression(pos + 8);
+      return deserializeChainExpression(int32[(pos >> 2) + 2]);
     case 16:
-      return deserializeBoxClass(pos + 8);
+      return deserializeClass(int32[(pos >> 2) + 2]);
     case 17:
-      return deserializeBoxConditionalExpression(pos + 8);
+      return deserializeConditionalExpression(int32[(pos >> 2) + 2]);
     case 18:
-      return deserializeBoxFunction(pos + 8);
+      return deserializeFunction(int32[(pos >> 2) + 2]);
     case 19:
-      return deserializeBoxImportExpression(pos + 8);
+      return deserializeImportExpression(int32[(pos >> 2) + 2]);
     case 20:
-      return deserializeBoxLogicalExpression(pos + 8);
+      return deserializeLogicalExpression(int32[(pos >> 2) + 2]);
     case 21:
-      return deserializeBoxNewExpression(pos + 8);
+      return deserializeNewExpression(int32[(pos >> 2) + 2]);
     case 22:
-      return deserializeBoxObjectExpression(pos + 8);
+      return deserializeObjectExpression(int32[(pos >> 2) + 2]);
     case 23:
-      return deserializeBoxParenthesizedExpression(pos + 8);
+      return deserializeParenthesizedExpression(int32[(pos >> 2) + 2]);
     case 24:
-      return deserializeBoxSequenceExpression(pos + 8);
+      return deserializeSequenceExpression(int32[(pos >> 2) + 2]);
     case 25:
-      return deserializeBoxTaggedTemplateExpression(pos + 8);
+      return deserializeTaggedTemplateExpression(int32[(pos >> 2) + 2]);
     case 26:
-      return deserializeBoxThisExpression(pos + 8);
+      return deserializeThisExpression(int32[(pos >> 2) + 2]);
     case 27:
-      return deserializeBoxUnaryExpression(pos + 8);
+      return deserializeUnaryExpression(int32[(pos >> 2) + 2]);
     case 28:
-      return deserializeBoxUpdateExpression(pos + 8);
+      return deserializeUpdateExpression(int32[(pos >> 2) + 2]);
     case 29:
-      return deserializeBoxYieldExpression(pos + 8);
+      return deserializeYieldExpression(int32[(pos >> 2) + 2]);
     case 30:
-      return deserializeBoxPrivateInExpression(pos + 8);
+      return deserializePrivateInExpression(int32[(pos >> 2) + 2]);
     case 31:
-      return deserializeBoxImportMeta(pos + 8);
+      return deserializeImportMeta(int32[(pos >> 2) + 2]);
     case 32:
-      return deserializeBoxNewTarget(pos + 8);
+      return deserializeNewTarget(int32[(pos >> 2) + 2]);
     case 33:
-      return deserializeBoxJSXElement(pos + 8);
+      return deserializeJSXElement(int32[(pos >> 2) + 2]);
     case 34:
-      return deserializeBoxJSXFragment(pos + 8);
+      return deserializeJSXFragment(int32[(pos >> 2) + 2]);
     case 35:
-      return deserializeBoxTSAsExpression(pos + 8);
+      return deserializeTSAsExpression(int32[(pos >> 2) + 2]);
     case 36:
-      return deserializeBoxTSSatisfiesExpression(pos + 8);
+      return deserializeTSSatisfiesExpression(int32[(pos >> 2) + 2]);
     case 37:
-      return deserializeBoxTSTypeAssertion(pos + 8);
+      return deserializeTSTypeAssertion(int32[(pos >> 2) + 2]);
     case 38:
-      return deserializeBoxTSNonNullExpression(pos + 8);
+      return deserializeTSNonNullExpression(int32[(pos >> 2) + 2]);
     case 39:
-      return deserializeBoxTSInstantiationExpression(pos + 8);
+      return deserializeTSInstantiationExpression(int32[(pos >> 2) + 2]);
     case 40:
-      return deserializeBoxV8IntrinsicExpression(pos + 8);
+      return deserializeV8IntrinsicExpression(int32[(pos >> 2) + 2]);
     case 48:
-      return deserializeBoxComputedMemberExpression(pos + 8);
+      return deserializeComputedMemberExpression(int32[(pos >> 2) + 2]);
     case 49:
-      return deserializeBoxStaticMemberExpression(pos + 8);
+      return deserializeStaticMemberExpression(int32[(pos >> 2) + 2]);
     case 50:
-      return deserializeBoxPrivateFieldExpression(pos + 8);
+      return deserializePrivateFieldExpression(int32[(pos >> 2) + 2]);
     case 64:
-      return deserializeBoxJSXEmptyExpression(pos + 8);
+      return deserializeJSXEmptyExpression(int32[(pos >> 2) + 2]);
     default:
       throw Error(`Unexpected discriminant ${uint8[pos]} for JSXExpression`);
   }
@@ -3404,8 +3335,8 @@ function deserializeJSXExpression(pos) {
 function deserializeJSXEmptyExpression(pos) {
   return {
     type: "JSXEmptyExpression",
-    start: deserializeI32(pos),
-    end: deserializeI32(pos + 4),
+    start: int32[pos >> 2],
+    end: int32[(pos >> 2) + 1],
     parent,
   };
 }
@@ -3413,9 +3344,9 @@ function deserializeJSXEmptyExpression(pos) {
 function deserializeJSXAttributeItem(pos) {
   switch (uint8[pos]) {
     case 0:
-      return deserializeBoxJSXAttribute(pos + 8);
+      return deserializeJSXAttribute(int32[(pos >> 2) + 2]);
     case 1:
-      return deserializeBoxJSXSpreadAttribute(pos + 8);
+      return deserializeJSXSpreadAttribute(int32[(pos >> 2) + 2]);
     default:
       throw Error(`Unexpected discriminant ${uint8[pos]} for JSXAttributeItem`);
   }
@@ -3427,8 +3358,8 @@ function deserializeJSXAttribute(pos) {
       type: "JSXAttribute",
       name: null,
       value: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.name = deserializeJSXAttributeName(pos + 16);
@@ -3442,8 +3373,8 @@ function deserializeJSXSpreadAttribute(pos) {
     node = (parent = {
       type: "JSXSpreadAttribute",
       argument: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.argument = deserializeExpression(pos + 16);
@@ -3454,9 +3385,9 @@ function deserializeJSXSpreadAttribute(pos) {
 function deserializeJSXAttributeName(pos) {
   switch (uint8[pos]) {
     case 0:
-      return deserializeBoxJSXIdentifier(pos + 8);
+      return deserializeJSXIdentifier(int32[(pos >> 2) + 2]);
     case 1:
-      return deserializeBoxJSXNamespacedName(pos + 8);
+      return deserializeJSXNamespacedName(int32[(pos >> 2) + 2]);
     default:
       throw Error(`Unexpected discriminant ${uint8[pos]} for JSXAttributeName`);
   }
@@ -3465,24 +3396,29 @@ function deserializeJSXAttributeName(pos) {
 function deserializeJSXAttributeValue(pos) {
   switch (uint8[pos]) {
     case 0:
-      return deserializeBoxStringLiteral(pos + 8);
+      return deserializeStringLiteral(int32[(pos >> 2) + 2]);
     case 1:
-      return deserializeBoxJSXExpressionContainer(pos + 8);
+      return deserializeJSXExpressionContainer(int32[(pos >> 2) + 2]);
     case 2:
-      return deserializeBoxJSXElement(pos + 8);
+      return deserializeJSXElement(int32[(pos >> 2) + 2]);
     case 3:
-      return deserializeBoxJSXFragment(pos + 8);
+      return deserializeJSXFragment(int32[(pos >> 2) + 2]);
     default:
       throw Error(`Unexpected discriminant ${uint8[pos]} for JSXAttributeValue`);
   }
 }
 
 function deserializeJSXIdentifier(pos) {
+  let start = int32[pos >> 2],
+    end = int32[(pos >> 2) + 1];
   return {
     type: "JSXIdentifier",
-    name: deserializeStr(pos + 16),
-    start: deserializeI32(pos),
-    end: deserializeI32(pos + 4),
+    name:
+      int32[(pos >> 2) + 4] >= sourceStartPos
+        ? sourceText.slice(start, end)
+        : deserializeStr(pos + 16),
+    start,
+    end,
     parent,
   };
 }
@@ -3490,15 +3426,15 @@ function deserializeJSXIdentifier(pos) {
 function deserializeJSXChild(pos) {
   switch (uint8[pos]) {
     case 0:
-      return deserializeBoxJSXText(pos + 8);
+      return deserializeJSXText(int32[(pos >> 2) + 2]);
     case 1:
-      return deserializeBoxJSXElement(pos + 8);
+      return deserializeJSXElement(int32[(pos >> 2) + 2]);
     case 2:
-      return deserializeBoxJSXFragment(pos + 8);
+      return deserializeJSXFragment(int32[(pos >> 2) + 2]);
     case 3:
-      return deserializeBoxJSXExpressionContainer(pos + 8);
+      return deserializeJSXExpressionContainer(int32[(pos >> 2) + 2]);
     case 4:
-      return deserializeBoxJSXSpreadChild(pos + 8);
+      return deserializeJSXSpreadChild(int32[(pos >> 2) + 2]);
     default:
       throw Error(`Unexpected discriminant ${uint8[pos]} for JSXChild`);
   }
@@ -3509,8 +3445,8 @@ function deserializeJSXSpreadChild(pos) {
     node = (parent = {
       type: "JSXSpreadChild",
       expression: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.expression = deserializeExpression(pos + 16);
@@ -3519,11 +3455,14 @@ function deserializeJSXSpreadChild(pos) {
 }
 
 function deserializeJSXText(pos) {
-  let start = deserializeI32(pos),
-    end = deserializeI32(pos + 4);
+  let start = int32[pos >> 2],
+    end = int32[(pos >> 2) + 1];
   return {
     type: "JSXText",
-    value: deserializeStr(pos + 16),
+    value:
+      int32[(pos >> 2) + 4] >= sourceStartPos
+        ? sourceText.slice(start, end)
+        : deserializeStr(pos + 16),
     raw:
       int32[(pos >> 2) + 8] === 0 && int32[(pos >> 2) + 9] === 0
         ? null
@@ -3542,8 +3481,8 @@ function deserializeTSThisParameter(pos) {
       name: "this",
       optional: false,
       typeAnnotation: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.typeAnnotation = deserializeOptionBoxTSTypeAnnotation(pos + 24);
@@ -3557,10 +3496,10 @@ function deserializeTSEnumDeclaration(pos) {
       type: "TSEnumDeclaration",
       id: null,
       body: null,
-      const: deserializeBool(pos + 12),
-      declare: deserializeBool(pos + 13),
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      const: uint8[pos + 12] === 1,
+      declare: uint8[pos + 13] === 1,
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.id = deserializeBindingIdentifier(pos + 16);
@@ -3574,8 +3513,8 @@ function deserializeTSEnumBody(pos) {
     node = (parent = {
       type: "TSEnumBody",
       members: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.members = deserializeVecTSEnumMember(pos + 16);
@@ -3590,8 +3529,8 @@ function deserializeTSEnumMember(pos) {
       id: null,
       initializer: null,
       computed: deserializeU8(pos + 16) > 1,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.id = deserializeTSEnumMemberName(pos + 16);
@@ -3603,13 +3542,13 @@ function deserializeTSEnumMember(pos) {
 function deserializeTSEnumMemberName(pos) {
   switch (uint8[pos]) {
     case 0:
-      return deserializeBoxIdentifierName(pos + 8);
+      return deserializeIdentifierName(int32[(pos >> 2) + 2]);
     case 1:
-      return deserializeBoxStringLiteral(pos + 8);
+      return deserializeStringLiteral(int32[(pos >> 2) + 2]);
     case 2:
-      return deserializeBoxStringLiteral(pos + 8);
+      return deserializeStringLiteral(int32[(pos >> 2) + 2]);
     case 3:
-      return deserializeBoxTemplateLiteral(pos + 8);
+      return deserializeTemplateLiteral(int32[(pos >> 2) + 2]);
     default:
       throw Error(`Unexpected discriminant ${uint8[pos]} for TSEnumMemberName`);
   }
@@ -3620,8 +3559,8 @@ function deserializeTSTypeAnnotation(pos) {
     node = (parent = {
       type: "TSTypeAnnotation",
       typeAnnotation: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.typeAnnotation = deserializeTSType(pos + 16);
@@ -3634,8 +3573,8 @@ function deserializeTSLiteralType(pos) {
     node = (parent = {
       type: "TSLiteralType",
       literal: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.literal = deserializeTSLiteral(pos + 16);
@@ -3646,17 +3585,17 @@ function deserializeTSLiteralType(pos) {
 function deserializeTSLiteral(pos) {
   switch (uint8[pos]) {
     case 0:
-      return deserializeBoxBooleanLiteral(pos + 8);
+      return deserializeBooleanLiteral(int32[(pos >> 2) + 2]);
     case 1:
-      return deserializeBoxNumericLiteral(pos + 8);
+      return deserializeNumericLiteral(int32[(pos >> 2) + 2]);
     case 2:
-      return deserializeBoxBigIntLiteral(pos + 8);
+      return deserializeBigIntLiteral(int32[(pos >> 2) + 2]);
     case 3:
-      return deserializeBoxStringLiteral(pos + 8);
+      return deserializeStringLiteral(int32[(pos >> 2) + 2]);
     case 4:
-      return deserializeBoxTemplateLiteral(pos + 8);
+      return deserializeTemplateLiteral(int32[(pos >> 2) + 2]);
     case 5:
-      return deserializeBoxUnaryExpression(pos + 8);
+      return deserializeUnaryExpression(int32[(pos >> 2) + 2]);
     default:
       throw Error(`Unexpected discriminant ${uint8[pos]} for TSLiteral`);
   }
@@ -3665,79 +3604,79 @@ function deserializeTSLiteral(pos) {
 function deserializeTSType(pos) {
   switch (uint8[pos]) {
     case 0:
-      return deserializeBoxTSAnyKeyword(pos + 8);
+      return deserializeTSAnyKeyword(int32[(pos >> 2) + 2]);
     case 1:
-      return deserializeBoxTSBigIntKeyword(pos + 8);
+      return deserializeTSBigIntKeyword(int32[(pos >> 2) + 2]);
     case 2:
-      return deserializeBoxTSBooleanKeyword(pos + 8);
+      return deserializeTSBooleanKeyword(int32[(pos >> 2) + 2]);
     case 3:
-      return deserializeBoxTSIntrinsicKeyword(pos + 8);
+      return deserializeTSIntrinsicKeyword(int32[(pos >> 2) + 2]);
     case 4:
-      return deserializeBoxTSNeverKeyword(pos + 8);
+      return deserializeTSNeverKeyword(int32[(pos >> 2) + 2]);
     case 5:
-      return deserializeBoxTSNullKeyword(pos + 8);
+      return deserializeTSNullKeyword(int32[(pos >> 2) + 2]);
     case 6:
-      return deserializeBoxTSNumberKeyword(pos + 8);
+      return deserializeTSNumberKeyword(int32[(pos >> 2) + 2]);
     case 7:
-      return deserializeBoxTSObjectKeyword(pos + 8);
+      return deserializeTSObjectKeyword(int32[(pos >> 2) + 2]);
     case 8:
-      return deserializeBoxTSStringKeyword(pos + 8);
+      return deserializeTSStringKeyword(int32[(pos >> 2) + 2]);
     case 9:
-      return deserializeBoxTSSymbolKeyword(pos + 8);
+      return deserializeTSSymbolKeyword(int32[(pos >> 2) + 2]);
     case 10:
-      return deserializeBoxTSThisType(pos + 8);
+      return deserializeTSThisType(int32[(pos >> 2) + 2]);
     case 11:
-      return deserializeBoxTSUndefinedKeyword(pos + 8);
+      return deserializeTSUndefinedKeyword(int32[(pos >> 2) + 2]);
     case 12:
-      return deserializeBoxTSUnknownKeyword(pos + 8);
+      return deserializeTSUnknownKeyword(int32[(pos >> 2) + 2]);
     case 13:
-      return deserializeBoxTSVoidKeyword(pos + 8);
+      return deserializeTSVoidKeyword(int32[(pos >> 2) + 2]);
     case 14:
-      return deserializeBoxTSArrayType(pos + 8);
+      return deserializeTSArrayType(int32[(pos >> 2) + 2]);
     case 15:
-      return deserializeBoxTSConditionalType(pos + 8);
+      return deserializeTSConditionalType(int32[(pos >> 2) + 2]);
     case 16:
-      return deserializeBoxTSConstructorType(pos + 8);
+      return deserializeTSConstructorType(int32[(pos >> 2) + 2]);
     case 17:
-      return deserializeBoxTSFunctionType(pos + 8);
+      return deserializeTSFunctionType(int32[(pos >> 2) + 2]);
     case 18:
-      return deserializeBoxTSImportType(pos + 8);
+      return deserializeTSImportType(int32[(pos >> 2) + 2]);
     case 19:
-      return deserializeBoxTSIndexedAccessType(pos + 8);
+      return deserializeTSIndexedAccessType(int32[(pos >> 2) + 2]);
     case 20:
-      return deserializeBoxTSInferType(pos + 8);
+      return deserializeTSInferType(int32[(pos >> 2) + 2]);
     case 21:
-      return deserializeBoxTSIntersectionType(pos + 8);
+      return deserializeTSIntersectionType(int32[(pos >> 2) + 2]);
     case 22:
-      return deserializeBoxTSLiteralType(pos + 8);
+      return deserializeTSLiteralType(int32[(pos >> 2) + 2]);
     case 23:
-      return deserializeBoxTSMappedType(pos + 8);
+      return deserializeTSMappedType(int32[(pos >> 2) + 2]);
     case 24:
-      return deserializeBoxTSNamedTupleMember(pos + 8);
+      return deserializeTSNamedTupleMember(int32[(pos >> 2) + 2]);
     case 26:
-      return deserializeBoxTSTemplateLiteralType(pos + 8);
+      return deserializeTSTemplateLiteralType(int32[(pos >> 2) + 2]);
     case 27:
-      return deserializeBoxTSTupleType(pos + 8);
+      return deserializeTSTupleType(int32[(pos >> 2) + 2]);
     case 28:
-      return deserializeBoxTSTypeLiteral(pos + 8);
+      return deserializeTSTypeLiteral(int32[(pos >> 2) + 2]);
     case 29:
-      return deserializeBoxTSTypeOperator(pos + 8);
+      return deserializeTSTypeOperator(int32[(pos >> 2) + 2]);
     case 30:
-      return deserializeBoxTSTypePredicate(pos + 8);
+      return deserializeTSTypePredicate(int32[(pos >> 2) + 2]);
     case 31:
-      return deserializeBoxTSTypeQuery(pos + 8);
+      return deserializeTSTypeQuery(int32[(pos >> 2) + 2]);
     case 32:
-      return deserializeBoxTSTypeReference(pos + 8);
+      return deserializeTSTypeReference(int32[(pos >> 2) + 2]);
     case 33:
-      return deserializeBoxTSUnionType(pos + 8);
+      return deserializeTSUnionType(int32[(pos >> 2) + 2]);
     case 34:
-      return deserializeBoxTSParenthesizedType(pos + 8);
+      return deserializeTSParenthesizedType(int32[(pos >> 2) + 2]);
     case 35:
-      return deserializeBoxJSDocNullableType(pos + 8);
+      return deserializeJSDocNullableType(int32[(pos >> 2) + 2]);
     case 36:
-      return deserializeBoxJSDocNonNullableType(pos + 8);
+      return deserializeJSDocNonNullableType(int32[(pos >> 2) + 2]);
     case 37:
-      return deserializeBoxJSDocUnknownType(pos + 8);
+      return deserializeJSDocUnknownType(int32[(pos >> 2) + 2]);
     default:
       throw Error(`Unexpected discriminant ${uint8[pos]} for TSType`);
   }
@@ -3751,8 +3690,8 @@ function deserializeTSConditionalType(pos) {
       extendsType: null,
       trueType: null,
       falseType: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.checkType = deserializeTSType(pos + 16);
@@ -3768,8 +3707,8 @@ function deserializeTSUnionType(pos) {
     node = (parent = {
       type: "TSUnionType",
       types: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.types = deserializeVecTSType(pos + 16);
@@ -3782,8 +3721,8 @@ function deserializeTSIntersectionType(pos) {
     node = (parent = {
       type: "TSIntersectionType",
       types: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.types = deserializeVecTSType(pos + 16);
@@ -3812,10 +3751,10 @@ function deserializeTSTypeOperator(pos) {
   let previousParent = parent,
     node = (parent = {
       type: "TSTypeOperator",
-      operator: deserializeTSTypeOperatorOperator(pos + 12),
+      operator: TSTypeOperatorOperator_TABLE[uint8[pos + 12]],
       typeAnnotation: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.typeAnnotation = deserializeTSType(pos + 16);
@@ -3823,26 +3762,15 @@ function deserializeTSTypeOperator(pos) {
   return node;
 }
 
-function deserializeTSTypeOperatorOperator(pos) {
-  switch (uint8[pos]) {
-    case 0:
-      return "keyof";
-    case 1:
-      return "unique";
-    case 2:
-      return "readonly";
-    default:
-      throw Error(`Unexpected discriminant ${uint8[pos]} for TSTypeOperatorOperator`);
-  }
-}
+const TSTypeOperatorOperator_TABLE = ["keyof", "unique", "readonly"];
 
 function deserializeTSArrayType(pos) {
   let previousParent = parent,
     node = (parent = {
       type: "TSArrayType",
       elementType: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.elementType = deserializeTSType(pos + 16);
@@ -3856,8 +3784,8 @@ function deserializeTSIndexedAccessType(pos) {
       type: "TSIndexedAccessType",
       objectType: null,
       indexType: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.objectType = deserializeTSType(pos + 16);
@@ -3871,8 +3799,8 @@ function deserializeTSTupleType(pos) {
     node = (parent = {
       type: "TSTupleType",
       elementTypes: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.elementTypes = deserializeVecTSTupleElement(pos + 16);
@@ -3886,9 +3814,9 @@ function deserializeTSNamedTupleMember(pos) {
       type: "TSNamedTupleMember",
       label: null,
       elementType: null,
-      optional: deserializeBool(pos + 12),
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      optional: uint8[pos + 12] === 1,
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.label = deserializeIdentifierName(pos + 16);
@@ -3902,8 +3830,8 @@ function deserializeTSOptionalType(pos) {
     node = (parent = {
       type: "TSOptionalType",
       typeAnnotation: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.typeAnnotation = deserializeTSType(pos + 16);
@@ -3916,8 +3844,8 @@ function deserializeTSRestType(pos) {
     node = (parent = {
       type: "TSRestType",
       typeAnnotation: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.typeAnnotation = deserializeTSType(pos + 16);
@@ -3928,83 +3856,83 @@ function deserializeTSRestType(pos) {
 function deserializeTSTupleElement(pos) {
   switch (uint8[pos]) {
     case 0:
-      return deserializeBoxTSAnyKeyword(pos + 8);
+      return deserializeTSAnyKeyword(int32[(pos >> 2) + 2]);
     case 1:
-      return deserializeBoxTSBigIntKeyword(pos + 8);
+      return deserializeTSBigIntKeyword(int32[(pos >> 2) + 2]);
     case 2:
-      return deserializeBoxTSBooleanKeyword(pos + 8);
+      return deserializeTSBooleanKeyword(int32[(pos >> 2) + 2]);
     case 3:
-      return deserializeBoxTSIntrinsicKeyword(pos + 8);
+      return deserializeTSIntrinsicKeyword(int32[(pos >> 2) + 2]);
     case 4:
-      return deserializeBoxTSNeverKeyword(pos + 8);
+      return deserializeTSNeverKeyword(int32[(pos >> 2) + 2]);
     case 5:
-      return deserializeBoxTSNullKeyword(pos + 8);
+      return deserializeTSNullKeyword(int32[(pos >> 2) + 2]);
     case 6:
-      return deserializeBoxTSNumberKeyword(pos + 8);
+      return deserializeTSNumberKeyword(int32[(pos >> 2) + 2]);
     case 7:
-      return deserializeBoxTSObjectKeyword(pos + 8);
+      return deserializeTSObjectKeyword(int32[(pos >> 2) + 2]);
     case 8:
-      return deserializeBoxTSStringKeyword(pos + 8);
+      return deserializeTSStringKeyword(int32[(pos >> 2) + 2]);
     case 9:
-      return deserializeBoxTSSymbolKeyword(pos + 8);
+      return deserializeTSSymbolKeyword(int32[(pos >> 2) + 2]);
     case 10:
-      return deserializeBoxTSThisType(pos + 8);
+      return deserializeTSThisType(int32[(pos >> 2) + 2]);
     case 11:
-      return deserializeBoxTSUndefinedKeyword(pos + 8);
+      return deserializeTSUndefinedKeyword(int32[(pos >> 2) + 2]);
     case 12:
-      return deserializeBoxTSUnknownKeyword(pos + 8);
+      return deserializeTSUnknownKeyword(int32[(pos >> 2) + 2]);
     case 13:
-      return deserializeBoxTSVoidKeyword(pos + 8);
+      return deserializeTSVoidKeyword(int32[(pos >> 2) + 2]);
     case 14:
-      return deserializeBoxTSArrayType(pos + 8);
+      return deserializeTSArrayType(int32[(pos >> 2) + 2]);
     case 15:
-      return deserializeBoxTSConditionalType(pos + 8);
+      return deserializeTSConditionalType(int32[(pos >> 2) + 2]);
     case 16:
-      return deserializeBoxTSConstructorType(pos + 8);
+      return deserializeTSConstructorType(int32[(pos >> 2) + 2]);
     case 17:
-      return deserializeBoxTSFunctionType(pos + 8);
+      return deserializeTSFunctionType(int32[(pos >> 2) + 2]);
     case 18:
-      return deserializeBoxTSImportType(pos + 8);
+      return deserializeTSImportType(int32[(pos >> 2) + 2]);
     case 19:
-      return deserializeBoxTSIndexedAccessType(pos + 8);
+      return deserializeTSIndexedAccessType(int32[(pos >> 2) + 2]);
     case 20:
-      return deserializeBoxTSInferType(pos + 8);
+      return deserializeTSInferType(int32[(pos >> 2) + 2]);
     case 21:
-      return deserializeBoxTSIntersectionType(pos + 8);
+      return deserializeTSIntersectionType(int32[(pos >> 2) + 2]);
     case 22:
-      return deserializeBoxTSLiteralType(pos + 8);
+      return deserializeTSLiteralType(int32[(pos >> 2) + 2]);
     case 23:
-      return deserializeBoxTSMappedType(pos + 8);
+      return deserializeTSMappedType(int32[(pos >> 2) + 2]);
     case 24:
-      return deserializeBoxTSNamedTupleMember(pos + 8);
+      return deserializeTSNamedTupleMember(int32[(pos >> 2) + 2]);
     case 26:
-      return deserializeBoxTSTemplateLiteralType(pos + 8);
+      return deserializeTSTemplateLiteralType(int32[(pos >> 2) + 2]);
     case 27:
-      return deserializeBoxTSTupleType(pos + 8);
+      return deserializeTSTupleType(int32[(pos >> 2) + 2]);
     case 28:
-      return deserializeBoxTSTypeLiteral(pos + 8);
+      return deserializeTSTypeLiteral(int32[(pos >> 2) + 2]);
     case 29:
-      return deserializeBoxTSTypeOperator(pos + 8);
+      return deserializeTSTypeOperator(int32[(pos >> 2) + 2]);
     case 30:
-      return deserializeBoxTSTypePredicate(pos + 8);
+      return deserializeTSTypePredicate(int32[(pos >> 2) + 2]);
     case 31:
-      return deserializeBoxTSTypeQuery(pos + 8);
+      return deserializeTSTypeQuery(int32[(pos >> 2) + 2]);
     case 32:
-      return deserializeBoxTSTypeReference(pos + 8);
+      return deserializeTSTypeReference(int32[(pos >> 2) + 2]);
     case 33:
-      return deserializeBoxTSUnionType(pos + 8);
+      return deserializeTSUnionType(int32[(pos >> 2) + 2]);
     case 34:
-      return deserializeBoxTSParenthesizedType(pos + 8);
+      return deserializeTSParenthesizedType(int32[(pos >> 2) + 2]);
     case 35:
-      return deserializeBoxJSDocNullableType(pos + 8);
+      return deserializeJSDocNullableType(int32[(pos >> 2) + 2]);
     case 36:
-      return deserializeBoxJSDocNonNullableType(pos + 8);
+      return deserializeJSDocNonNullableType(int32[(pos >> 2) + 2]);
     case 37:
-      return deserializeBoxJSDocUnknownType(pos + 8);
+      return deserializeJSDocUnknownType(int32[(pos >> 2) + 2]);
     case 64:
-      return deserializeBoxTSOptionalType(pos + 8);
+      return deserializeTSOptionalType(int32[(pos >> 2) + 2]);
     case 65:
-      return deserializeBoxTSRestType(pos + 8);
+      return deserializeTSRestType(int32[(pos >> 2) + 2]);
     default:
       throw Error(`Unexpected discriminant ${uint8[pos]} for TSTupleElement`);
   }
@@ -4013,8 +3941,8 @@ function deserializeTSTupleElement(pos) {
 function deserializeTSAnyKeyword(pos) {
   return {
     type: "TSAnyKeyword",
-    start: deserializeI32(pos),
-    end: deserializeI32(pos + 4),
+    start: int32[pos >> 2],
+    end: int32[(pos >> 2) + 1],
     parent,
   };
 }
@@ -4022,8 +3950,8 @@ function deserializeTSAnyKeyword(pos) {
 function deserializeTSStringKeyword(pos) {
   return {
     type: "TSStringKeyword",
-    start: deserializeI32(pos),
-    end: deserializeI32(pos + 4),
+    start: int32[pos >> 2],
+    end: int32[(pos >> 2) + 1],
     parent,
   };
 }
@@ -4031,8 +3959,8 @@ function deserializeTSStringKeyword(pos) {
 function deserializeTSBooleanKeyword(pos) {
   return {
     type: "TSBooleanKeyword",
-    start: deserializeI32(pos),
-    end: deserializeI32(pos + 4),
+    start: int32[pos >> 2],
+    end: int32[(pos >> 2) + 1],
     parent,
   };
 }
@@ -4040,8 +3968,8 @@ function deserializeTSBooleanKeyword(pos) {
 function deserializeTSNumberKeyword(pos) {
   return {
     type: "TSNumberKeyword",
-    start: deserializeI32(pos),
-    end: deserializeI32(pos + 4),
+    start: int32[pos >> 2],
+    end: int32[(pos >> 2) + 1],
     parent,
   };
 }
@@ -4049,8 +3977,8 @@ function deserializeTSNumberKeyword(pos) {
 function deserializeTSNeverKeyword(pos) {
   return {
     type: "TSNeverKeyword",
-    start: deserializeI32(pos),
-    end: deserializeI32(pos + 4),
+    start: int32[pos >> 2],
+    end: int32[(pos >> 2) + 1],
     parent,
   };
 }
@@ -4058,8 +3986,8 @@ function deserializeTSNeverKeyword(pos) {
 function deserializeTSIntrinsicKeyword(pos) {
   return {
     type: "TSIntrinsicKeyword",
-    start: deserializeI32(pos),
-    end: deserializeI32(pos + 4),
+    start: int32[pos >> 2],
+    end: int32[(pos >> 2) + 1],
     parent,
   };
 }
@@ -4067,8 +3995,8 @@ function deserializeTSIntrinsicKeyword(pos) {
 function deserializeTSUnknownKeyword(pos) {
   return {
     type: "TSUnknownKeyword",
-    start: deserializeI32(pos),
-    end: deserializeI32(pos + 4),
+    start: int32[pos >> 2],
+    end: int32[(pos >> 2) + 1],
     parent,
   };
 }
@@ -4076,8 +4004,8 @@ function deserializeTSUnknownKeyword(pos) {
 function deserializeTSNullKeyword(pos) {
   return {
     type: "TSNullKeyword",
-    start: deserializeI32(pos),
-    end: deserializeI32(pos + 4),
+    start: int32[pos >> 2],
+    end: int32[(pos >> 2) + 1],
     parent,
   };
 }
@@ -4085,8 +4013,8 @@ function deserializeTSNullKeyword(pos) {
 function deserializeTSUndefinedKeyword(pos) {
   return {
     type: "TSUndefinedKeyword",
-    start: deserializeI32(pos),
-    end: deserializeI32(pos + 4),
+    start: int32[pos >> 2],
+    end: int32[(pos >> 2) + 1],
     parent,
   };
 }
@@ -4094,8 +4022,8 @@ function deserializeTSUndefinedKeyword(pos) {
 function deserializeTSVoidKeyword(pos) {
   return {
     type: "TSVoidKeyword",
-    start: deserializeI32(pos),
-    end: deserializeI32(pos + 4),
+    start: int32[pos >> 2],
+    end: int32[(pos >> 2) + 1],
     parent,
   };
 }
@@ -4103,8 +4031,8 @@ function deserializeTSVoidKeyword(pos) {
 function deserializeTSSymbolKeyword(pos) {
   return {
     type: "TSSymbolKeyword",
-    start: deserializeI32(pos),
-    end: deserializeI32(pos + 4),
+    start: int32[pos >> 2],
+    end: int32[(pos >> 2) + 1],
     parent,
   };
 }
@@ -4112,8 +4040,8 @@ function deserializeTSSymbolKeyword(pos) {
 function deserializeTSThisType(pos) {
   return {
     type: "TSThisType",
-    start: deserializeI32(pos),
-    end: deserializeI32(pos + 4),
+    start: int32[pos >> 2],
+    end: int32[(pos >> 2) + 1],
     parent,
   };
 }
@@ -4121,8 +4049,8 @@ function deserializeTSThisType(pos) {
 function deserializeTSObjectKeyword(pos) {
   return {
     type: "TSObjectKeyword",
-    start: deserializeI32(pos),
-    end: deserializeI32(pos + 4),
+    start: int32[pos >> 2],
+    end: int32[(pos >> 2) + 1],
     parent,
   };
 }
@@ -4130,8 +4058,8 @@ function deserializeTSObjectKeyword(pos) {
 function deserializeTSBigIntKeyword(pos) {
   return {
     type: "TSBigIntKeyword",
-    start: deserializeI32(pos),
-    end: deserializeI32(pos + 4),
+    start: int32[pos >> 2],
+    end: int32[(pos >> 2) + 1],
     parent,
   };
 }
@@ -4142,8 +4070,8 @@ function deserializeTSTypeReference(pos) {
       type: "TSTypeReference",
       typeName: null,
       typeArguments: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.typeName = deserializeTSTypeName(pos + 16);
@@ -4155,11 +4083,11 @@ function deserializeTSTypeReference(pos) {
 function deserializeTSTypeName(pos) {
   switch (uint8[pos]) {
     case 0:
-      return deserializeBoxIdentifierReference(pos + 8);
+      return deserializeIdentifierReference(int32[(pos >> 2) + 2]);
     case 1:
-      return deserializeBoxTSQualifiedName(pos + 8);
+      return deserializeTSQualifiedName(int32[(pos >> 2) + 2]);
     case 2:
-      return deserializeBoxThisExpression(pos + 8);
+      return deserializeThisExpression(int32[(pos >> 2) + 2]);
     default:
       throw Error(`Unexpected discriminant ${uint8[pos]} for TSTypeName`);
   }
@@ -4171,8 +4099,8 @@ function deserializeTSQualifiedName(pos) {
       type: "TSQualifiedName",
       left: null,
       right: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.left = deserializeTSTypeName(pos + 16);
@@ -4186,8 +4114,8 @@ function deserializeTSTypeParameterInstantiation(pos) {
     node = (parent = {
       type: "TSTypeParameterInstantiation",
       params: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.params = deserializeVecTSType(pos + 16);
@@ -4202,11 +4130,11 @@ function deserializeTSTypeParameter(pos) {
       name: null,
       constraint: null,
       default: null,
-      in: deserializeBool(pos + 12),
-      out: deserializeBool(pos + 13),
-      const: deserializeBool(pos + 14),
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      in: uint8[pos + 12] === 1,
+      out: uint8[pos + 13] === 1,
+      const: uint8[pos + 14] === 1,
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.name = deserializeBindingIdentifier(pos + 16);
@@ -4221,8 +4149,8 @@ function deserializeTSTypeParameterDeclaration(pos) {
     node = (parent = {
       type: "TSTypeParameterDeclaration",
       params: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.params = deserializeVecTSTypeParameter(pos + 16);
@@ -4237,9 +4165,9 @@ function deserializeTSTypeAliasDeclaration(pos) {
       id: null,
       typeParameters: null,
       typeAnnotation: null,
-      declare: deserializeBool(pos + 72),
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      declare: uint8[pos + 72] === 1,
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.id = deserializeBindingIdentifier(pos + 16);
@@ -4268,8 +4196,8 @@ function deserializeTSClassImplements(pos) {
       type: "TSClassImplements",
       expression: null,
       typeArguments: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     }),
     expression = deserializeTSTypeName(pos + 16);
@@ -4321,15 +4249,15 @@ function deserializeTSInterfaceDeclaration(pos) {
       typeParameters: null,
       extends: null,
       body: null,
-      declare: deserializeBool(pos + 88),
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      declare: uint8[pos + 88] === 1,
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.id = deserializeBindingIdentifier(pos + 16);
   node.typeParameters = deserializeOptionBoxTSTypeParameterDeclaration(pos + 48);
   node.extends = deserializeVecTSInterfaceHeritage(pos + 56);
-  node.body = deserializeBoxTSInterfaceBody(pos + 80);
+  node.body = deserializeTSInterfaceBody(int32[(pos >> 2) + 20]);
   parent = previousParent;
   return node;
 }
@@ -4339,8 +4267,8 @@ function deserializeTSInterfaceBody(pos) {
     node = (parent = {
       type: "TSInterfaceBody",
       body: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.body = deserializeVecTSSignature(pos + 16);
@@ -4352,15 +4280,15 @@ function deserializeTSPropertySignature(pos) {
   let previousParent = parent,
     node = (parent = {
       type: "TSPropertySignature",
-      computed: deserializeBool(pos + 12),
-      optional: deserializeBool(pos + 13),
-      readonly: deserializeBool(pos + 14),
+      computed: uint8[pos + 12] === 1,
+      optional: uint8[pos + 13] === 1,
+      readonly: uint8[pos + 14] === 1,
       key: null,
       typeAnnotation: null,
       accessibility: null,
       static: false,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.key = deserializePropertyKey(pos + 16);
@@ -4372,15 +4300,15 @@ function deserializeTSPropertySignature(pos) {
 function deserializeTSSignature(pos) {
   switch (uint8[pos]) {
     case 0:
-      return deserializeBoxTSIndexSignature(pos + 8);
+      return deserializeTSIndexSignature(int32[(pos >> 2) + 2]);
     case 1:
-      return deserializeBoxTSPropertySignature(pos + 8);
+      return deserializeTSPropertySignature(int32[(pos >> 2) + 2]);
     case 2:
-      return deserializeBoxTSCallSignatureDeclaration(pos + 8);
+      return deserializeTSCallSignatureDeclaration(int32[(pos >> 2) + 2]);
     case 3:
-      return deserializeBoxTSConstructSignatureDeclaration(pos + 8);
+      return deserializeTSConstructSignatureDeclaration(int32[(pos >> 2) + 2]);
     case 4:
-      return deserializeBoxTSMethodSignature(pos + 8);
+      return deserializeTSMethodSignature(int32[(pos >> 2) + 2]);
     default:
       throw Error(`Unexpected discriminant ${uint8[pos]} for TSSignature`);
   }
@@ -4392,15 +4320,15 @@ function deserializeTSIndexSignature(pos) {
       type: "TSIndexSignature",
       parameters: null,
       typeAnnotation: null,
-      readonly: deserializeBool(pos + 12),
-      static: deserializeBool(pos + 13),
+      readonly: uint8[pos + 12] === 1,
+      static: uint8[pos + 13] === 1,
       accessibility: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.parameters = [deserializeTSIndexSignatureName(pos + 16)];
-  node.typeAnnotation = deserializeBoxTSTypeAnnotation(pos + 56);
+  node.typeAnnotation = deserializeTSTypeAnnotation(int32[(pos >> 2) + 14]);
   parent = previousParent;
   return node;
 }
@@ -4412,8 +4340,8 @@ function deserializeTSCallSignatureDeclaration(pos) {
       typeParameters: null,
       params: null,
       returnType: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     }),
     params = deserializeBoxFormalParameters(pos + 32),
@@ -4426,35 +4354,24 @@ function deserializeTSCallSignatureDeclaration(pos) {
   return node;
 }
 
-function deserializeTSMethodSignatureKind(pos) {
-  switch (uint8[pos]) {
-    case 0:
-      return "method";
-    case 1:
-      return "get";
-    case 2:
-      return "set";
-    default:
-      throw Error(`Unexpected discriminant ${uint8[pos]} for TSMethodSignatureKind`);
-  }
-}
+const TSMethodSignatureKind_TABLE = ["method", "get", "set"];
 
 function deserializeTSMethodSignature(pos) {
   let previousParent = parent,
     node = (parent = {
       type: "TSMethodSignature",
       key: null,
-      computed: deserializeBool(pos + 64),
-      optional: deserializeBool(pos + 65),
-      kind: deserializeTSMethodSignatureKind(pos + 66),
+      computed: uint8[pos + 64] === 1,
+      optional: uint8[pos + 65] === 1,
+      kind: TSMethodSignatureKind_TABLE[uint8[pos + 66]],
       typeParameters: null,
       params: null,
       returnType: null,
       accessibility: null,
       readonly: false,
       static: false,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     }),
     params = deserializeBoxFormalParameters(pos + 48),
@@ -4475,12 +4392,12 @@ function deserializeTSConstructSignatureDeclaration(pos) {
       typeParameters: null,
       params: null,
       returnType: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.typeParameters = deserializeOptionBoxTSTypeParameterDeclaration(pos + 16);
-  node.params = deserializeBoxFormalParameters(pos + 24);
+  node.params = deserializeFormalParameters(int32[(pos >> 2) + 6]);
   node.returnType = deserializeOptionBoxTSTypeAnnotation(pos + 32);
   parent = previousParent;
   return node;
@@ -4494,11 +4411,11 @@ function deserializeTSIndexSignatureName(pos) {
       name: deserializeStr(pos + 16),
       optional: false,
       typeAnnotation: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
-  node.typeAnnotation = deserializeBoxTSTypeAnnotation(pos + 32);
+  node.typeAnnotation = deserializeTSTypeAnnotation(int32[(pos >> 2) + 8]);
   parent = previousParent;
   return node;
 }
@@ -4509,8 +4426,8 @@ function deserializeTSInterfaceHeritage(pos) {
       type: "TSInterfaceHeritage",
       expression: null,
       typeArguments: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     }),
     expression = deserializeTSTypeName(pos + 16);
@@ -4559,10 +4476,10 @@ function deserializeTSTypePredicate(pos) {
     node = (parent = {
       type: "TSTypePredicate",
       parameterName: null,
-      asserts: deserializeBool(pos + 12),
+      asserts: uint8[pos + 12] === 1,
       typeAnnotation: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.parameterName = deserializeTSTypePredicateName(pos + 16);
@@ -4574,9 +4491,9 @@ function deserializeTSTypePredicate(pos) {
 function deserializeTSTypePredicateName(pos) {
   switch (uint8[pos]) {
     case 0:
-      return deserializeBoxIdentifierName(pos + 8);
+      return deserializeIdentifierName(int32[(pos >> 2) + 2]);
     case 1:
-      return deserializeBoxTSThisType(pos + 8);
+      return deserializeTSThisType(int32[(pos >> 2) + 2]);
     default:
       throw Error(`Unexpected discriminant ${uint8[pos]} for TSTypePredicateName`);
   }
@@ -4688,9 +4605,9 @@ function deserializeTSNamespaceDeclarationKind(pos) {
 function deserializeTSNamespaceDeclarationBody(pos) {
   switch (uint8[pos]) {
     case 0:
-      return deserializeBoxTSNamespaceDeclaration(pos + 8);
+      return deserializeTSNamespaceDeclaration(int32[(pos >> 2) + 2]);
     case 1:
-      return deserializeBoxTSModuleBlock(pos + 8);
+      return deserializeTSModuleBlock(int32[(pos >> 2) + 2]);
     default:
       throw Error(`Unexpected discriminant ${uint8[pos]} for TSNamespaceDeclarationBody`);
   }
@@ -4703,10 +4620,10 @@ function deserializeTSGlobalDeclaration(pos) {
       id: null,
       body: null,
       kind: "global",
-      declare: deserializeBool(pos + 88),
+      declare: uint8[pos + 88] === 1,
       global: true,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.id = {
@@ -4729,12 +4646,16 @@ function deserializeTSModuleBlock(pos) {
     node = (parent = {
       type: "TSModuleBlock",
       body: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     }),
+    body;
+  if (int32[(pos >> 2) + 6] === 0) body = deserializeVecStatement(pos + 40);
+  else {
     body = deserializeVecDirective(pos + 16);
-  body.push(...deserializeVecStatement(pos + 40));
+    body.push(...deserializeVecStatement(pos + 40));
+  }
   node.body = body;
   parent = previousParent;
   return node;
@@ -4745,8 +4666,8 @@ function deserializeTSTypeLiteral(pos) {
     node = (parent = {
       type: "TSTypeLiteral",
       members: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.members = deserializeVecTSSignature(pos + 16);
@@ -4759,11 +4680,11 @@ function deserializeTSInferType(pos) {
     node = (parent = {
       type: "TSInferType",
       typeParameter: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
-  node.typeParameter = deserializeBoxTSTypeParameter(pos + 16);
+  node.typeParameter = deserializeTSTypeParameter(int32[(pos >> 2) + 4]);
   parent = previousParent;
   return node;
 }
@@ -4774,8 +4695,8 @@ function deserializeTSTypeQuery(pos) {
       type: "TSTypeQuery",
       exprName: null,
       typeArguments: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.exprName = deserializeTSTypeQueryExprName(pos + 16);
@@ -4787,13 +4708,13 @@ function deserializeTSTypeQuery(pos) {
 function deserializeTSTypeQueryExprName(pos) {
   switch (uint8[pos]) {
     case 0:
-      return deserializeBoxIdentifierReference(pos + 8);
+      return deserializeIdentifierReference(int32[(pos >> 2) + 2]);
     case 1:
-      return deserializeBoxTSQualifiedName(pos + 8);
+      return deserializeTSQualifiedName(int32[(pos >> 2) + 2]);
     case 2:
-      return deserializeBoxThisExpression(pos + 8);
+      return deserializeThisExpression(int32[(pos >> 2) + 2]);
     case 3:
-      return deserializeBoxTSImportType(pos + 8);
+      return deserializeTSImportType(int32[(pos >> 2) + 2]);
     default:
       throw Error(`Unexpected discriminant ${uint8[pos]} for TSTypeQueryExprName`);
   }
@@ -4807,8 +4728,8 @@ function deserializeTSImportType(pos) {
       options: null,
       qualifier: null,
       typeArguments: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.source = deserializeStringLiteral(pos + 16);
@@ -4822,9 +4743,9 @@ function deserializeTSImportType(pos) {
 function deserializeTSImportTypeQualifier(pos) {
   switch (uint8[pos]) {
     case 0:
-      return deserializeBoxIdentifierName(pos + 8);
+      return deserializeIdentifierName(int32[(pos >> 2) + 2]);
     case 1:
-      return deserializeBoxTSImportTypeQualifiedName(pos + 8);
+      return deserializeTSImportTypeQualifiedName(int32[(pos >> 2) + 2]);
     default:
       throw Error(`Unexpected discriminant ${uint8[pos]} for TSImportTypeQualifier`);
   }
@@ -4836,8 +4757,8 @@ function deserializeTSImportTypeQualifiedName(pos) {
       type: "TSQualifiedName",
       left: null,
       right: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.left = deserializeTSImportTypeQualifier(pos + 16);
@@ -4853,8 +4774,8 @@ function deserializeTSFunctionType(pos) {
       typeParameters: null,
       params: null,
       returnType: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     }),
     params = deserializeBoxFormalParameters(pos + 32),
@@ -4862,7 +4783,7 @@ function deserializeTSFunctionType(pos) {
   thisParam !== null && params.unshift(thisParam);
   node.typeParameters = deserializeOptionBoxTSTypeParameterDeclaration(pos + 16);
   node.params = params;
-  node.returnType = deserializeBoxTSTypeAnnotation(pos + 40);
+  node.returnType = deserializeTSTypeAnnotation(int32[(pos >> 2) + 10]);
   parent = previousParent;
   return node;
 }
@@ -4871,17 +4792,17 @@ function deserializeTSConstructorType(pos) {
   let previousParent = parent,
     node = (parent = {
       type: "TSConstructorType",
-      abstract: deserializeBool(pos + 40),
+      abstract: uint8[pos + 40] === 1,
       typeParameters: null,
       params: null,
       returnType: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.typeParameters = deserializeOptionBoxTSTypeParameterDeclaration(pos + 16);
-  node.params = deserializeBoxFormalParameters(pos + 24);
-  node.returnType = deserializeBoxTSTypeAnnotation(pos + 32);
+  node.params = deserializeFormalParameters(int32[(pos >> 2) + 6]);
+  node.returnType = deserializeTSTypeAnnotation(int32[(pos >> 2) + 8]);
   parent = previousParent;
   return node;
 }
@@ -4896,8 +4817,8 @@ function deserializeTSMappedType(pos) {
       typeAnnotation: null,
       optional: null,
       readonly: deserializeOptionTSMappedTypeModifierOperator(pos + 97),
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     }),
     optional = deserializeOptionTSMappedTypeModifierOperator(pos + 96);
@@ -4930,8 +4851,8 @@ function deserializeTSTemplateLiteralType(pos) {
       type: "TSTemplateLiteralType",
       quasis: null,
       types: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.quasis = deserializeVecTemplateElement(pos + 16);
@@ -4946,8 +4867,8 @@ function deserializeTSAsExpression(pos) {
       type: "TSAsExpression",
       expression: null,
       typeAnnotation: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.expression = deserializeExpression(pos + 16);
@@ -4962,8 +4883,8 @@ function deserializeTSSatisfiesExpression(pos) {
       type: "TSSatisfiesExpression",
       expression: null,
       typeAnnotation: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.expression = deserializeExpression(pos + 16);
@@ -4978,8 +4899,8 @@ function deserializeTSTypeAssertion(pos) {
       type: "TSTypeAssertion",
       typeAnnotation: null,
       expression: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.typeAnnotation = deserializeTSType(pos + 16);
@@ -4994,9 +4915,9 @@ function deserializeTSImportEqualsDeclaration(pos) {
       type: "TSImportEqualsDeclaration",
       id: null,
       moduleReference: null,
-      importKind: deserializeImportOrExportKind(pos + 12),
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      importKind: uint8[pos + 12] === 0 ? "value" : "type",
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.id = deserializeBindingIdentifier(pos + 16);
@@ -5008,11 +4929,11 @@ function deserializeTSImportEqualsDeclaration(pos) {
 function deserializeTSModuleReference(pos) {
   switch (uint8[pos]) {
     case 0:
-      return deserializeBoxTSExternalModuleReference(pos + 8);
+      return deserializeTSExternalModuleReference(int32[(pos >> 2) + 2]);
     case 1:
-      return deserializeBoxIdentifierReference(pos + 8);
+      return deserializeIdentifierReference(int32[(pos >> 2) + 2]);
     case 2:
-      return deserializeBoxTSQualifiedName(pos + 8);
+      return deserializeTSQualifiedName(int32[(pos >> 2) + 2]);
     default:
       throw Error(`Unexpected discriminant ${uint8[pos]} for TSModuleReference`);
   }
@@ -5023,8 +4944,8 @@ function deserializeTSExternalModuleReference(pos) {
     node = (parent = {
       type: "TSExternalModuleReference",
       expression: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.expression = deserializeStringLiteral(pos + 16);
@@ -5037,8 +4958,8 @@ function deserializeTSNonNullExpression(pos) {
     node = (parent = {
       type: "TSNonNullExpression",
       expression: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.expression = deserializeExpression(pos + 16);
@@ -5051,8 +4972,8 @@ function deserializeDecorator(pos) {
     node = (parent = {
       type: "Decorator",
       expression: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.expression = deserializeExpression(pos + 16);
@@ -5065,8 +4986,8 @@ function deserializeTSExportAssignment(pos) {
     node = (parent = {
       type: "TSExportAssignment",
       expression: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.expression = deserializeExpression(pos + 16);
@@ -5079,8 +5000,8 @@ function deserializeTSNamespaceExportDeclaration(pos) {
     node = (parent = {
       type: "TSNamespaceExportDeclaration",
       id: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.id = deserializeIdentifierName(pos + 16);
@@ -5094,25 +5015,14 @@ function deserializeTSInstantiationExpression(pos) {
       type: "TSInstantiationExpression",
       expression: null,
       typeArguments: null,
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.expression = deserializeExpression(pos + 16);
-  node.typeArguments = deserializeBoxTSTypeParameterInstantiation(pos + 32);
+  node.typeArguments = deserializeTSTypeParameterInstantiation(int32[(pos >> 2) + 8]);
   parent = previousParent;
   return node;
-}
-
-function deserializeImportOrExportKind(pos) {
-  switch (uint8[pos]) {
-    case 0:
-      return "value";
-    case 1:
-      return "type";
-    default:
-      throw Error(`Unexpected discriminant ${uint8[pos]} for ImportOrExportKind`);
-  }
 }
 
 function deserializeJSDocNullableType(pos) {
@@ -5120,9 +5030,9 @@ function deserializeJSDocNullableType(pos) {
     node = (parent = {
       type: "TSJSDocNullableType",
       typeAnnotation: null,
-      postfix: deserializeBool(pos + 12),
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      postfix: uint8[pos + 12] === 1,
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.typeAnnotation = deserializeTSType(pos + 16);
@@ -5135,9 +5045,9 @@ function deserializeJSDocNonNullableType(pos) {
     node = (parent = {
       type: "TSJSDocNonNullableType",
       typeAnnotation: null,
-      postfix: deserializeBool(pos + 12),
-      start: deserializeI32(pos),
-      end: deserializeI32(pos + 4),
+      postfix: uint8[pos + 12] === 1,
+      start: int32[pos >> 2],
+      end: int32[(pos >> 2) + 1],
       parent,
     });
   node.typeAnnotation = deserializeTSType(pos + 16);
@@ -5148,39 +5058,9 @@ function deserializeJSDocNonNullableType(pos) {
 function deserializeJSDocUnknownType(pos) {
   return {
     type: "TSJSDocUnknownType",
-    start: deserializeI32(pos),
-    end: deserializeI32(pos + 4),
+    start: int32[pos >> 2],
+    end: int32[(pos >> 2) + 1],
     parent,
-  };
-}
-
-function deserializeCommentKind(pos) {
-  switch (uint8[pos]) {
-    case 0:
-      return "Line";
-    case 1:
-      return "Block";
-    case 2:
-      return "Block";
-    case 3:
-      return "Line";
-    case 4:
-      return "Line";
-    default:
-      throw Error(`Unexpected discriminant ${uint8[pos]} for CommentKind`);
-  }
-}
-
-function deserializeComment(pos) {
-  let type = deserializeCommentKind(pos + 17),
-    start = deserializeI32(pos),
-    end = deserializeI32(pos + 4),
-    kind = deserializeU8(pos + 17);
-  return {
-    type,
-    value: sourceText.slice(start + (kind < 3 ? 2 : kind), end - (type === "Line" ? 0 : 2)),
-    start,
-    end,
   };
 }
 
@@ -5199,16 +5079,16 @@ function deserializeModuleKind(pos) {
 
 function deserializeSpan(pos) {
   return {
-    start: deserializeI32(pos),
-    end: deserializeI32(pos + 4),
+    start: int32[pos >> 2],
+    end: int32[(pos >> 2) + 1],
   };
 }
 
 function deserializeNameSpan(pos) {
   return {
     value: deserializeStr(pos + 8),
-    start: deserializeI32(pos),
-    end: deserializeI32(pos + 4),
+    start: int32[pos >> 2],
+    end: int32[(pos >> 2) + 1],
   };
 }
 
@@ -5216,7 +5096,7 @@ function deserializeImportEntry(pos) {
   return {
     importName: deserializeImportImportName(pos + 32),
     localName: deserializeNameSpan(pos + 64),
-    isType: deserializeBool(pos + 88),
+    isType: uint8[pos + 88] === 1,
   };
 }
 
@@ -5256,9 +5136,9 @@ function deserializeExportEntry(pos) {
     importName: deserializeExportImportName(pos + 40),
     exportName: deserializeExportExportName(pos + 72),
     localName: deserializeExportLocalName(pos + 104),
-    isType: deserializeBool(pos + 136),
-    start: deserializeI32(pos),
-    end: deserializeI32(pos + 4),
+    isType: uint8[pos + 136] === 1,
+    start: int32[pos >> 2],
+    end: int32[(pos >> 2) + 1],
   };
 }
 
@@ -5361,158 +5241,129 @@ function deserializeExportLocalName(pos) {
 function deserializeDynamicImport(pos) {
   return {
     moduleRequest: deserializeSpan(pos + 8),
-    start: deserializeI32(pos),
-    end: deserializeI32(pos + 4),
+    start: int32[pos >> 2],
+    end: int32[(pos >> 2) + 1],
   };
 }
 
-function deserializeAssignmentOperator(pos) {
-  switch (uint8[pos]) {
-    case 0:
-      return "=";
-    case 1:
-      return "+=";
-    case 2:
-      return "-=";
-    case 3:
-      return "*=";
-    case 4:
-      return "/=";
-    case 5:
-      return "%=";
-    case 6:
-      return "**=";
-    case 7:
-      return "<<=";
-    case 8:
-      return ">>=";
-    case 9:
-      return ">>>=";
-    case 10:
-      return "|=";
-    case 11:
-      return "^=";
-    case 12:
-      return "&=";
-    case 13:
-      return "||=";
-    case 14:
-      return "&&=";
-    case 15:
-      return "??=";
-    default:
-      throw Error(`Unexpected discriminant ${uint8[pos]} for AssignmentOperator`);
-  }
-}
+const AssignmentOperator_TABLE = [
+    "=",
+    "+=",
+    "-=",
+    "*=",
+    "/=",
+    "%=",
+    "**=",
+    "<<=",
+    ">>=",
+    ">>>=",
+    "|=",
+    "^=",
+    "&=",
+    "||=",
+    "&&=",
+    "??=",
+  ],
+  BinaryOperator_TABLE = [
+    "==",
+    "!=",
+    "===",
+    "!==",
+    "<",
+    "<=",
+    ">",
+    ">=",
+    "+",
+    "-",
+    "*",
+    "/",
+    "%",
+    "**",
+    "<<",
+    ">>",
+    ">>>",
+    "|",
+    "^",
+    "&",
+    "in",
+    "instanceof",
+  ],
+  LogicalOperator_TABLE = ["||", "&&", "??"],
+  UnaryOperator_TABLE = ["+", "-", "!", "~", "typeof", "void", "delete"];
 
-function deserializeBinaryOperator(pos) {
-  switch (uint8[pos]) {
-    case 0:
-      return "==";
-    case 1:
-      return "!=";
-    case 2:
-      return "===";
-    case 3:
-      return "!==";
-    case 4:
-      return "<";
-    case 5:
-      return "<=";
-    case 6:
-      return ">";
-    case 7:
-      return ">=";
-    case 8:
-      return "+";
-    case 9:
-      return "-";
-    case 10:
-      return "*";
-    case 11:
-      return "/";
-    case 12:
-      return "%";
-    case 13:
-      return "**";
-    case 14:
-      return "<<";
-    case 15:
-      return ">>";
-    case 16:
-      return ">>>";
-    case 17:
-      return "|";
-    case 18:
-      return "^";
-    case 19:
-      return "&";
-    case 20:
-      return "in";
-    case 21:
-      return "instanceof";
-    default:
-      throw Error(`Unexpected discriminant ${uint8[pos]} for BinaryOperator`);
+function deserializeComments(raw, src) {
+  let raw32 = new Int32Array(raw.buffer, raw.byteOffset, raw.byteLength >> 2),
+    len = raw.byteLength / 24,
+    arr = Array(len);
+  for (let i = 0, pos = 0; i < len; i++, pos += 24) {
+    let pos32 = pos >> 2,
+      start = raw32[pos32],
+      end = raw32[pos32 + 1],
+      kind = raw[pos + 17];
+    kind === 1 || kind === 2
+      ? (arr[i] = {
+          type: "Block",
+          value: src.slice(start + 2, end - 2),
+          start,
+          end,
+        })
+      : (arr[i] = {
+          type: "Line",
+          value: src.slice(start + (kind === 0 ? 2 : kind), end),
+          start,
+          end,
+        });
   }
-}
-
-function deserializeLogicalOperator(pos) {
-  switch (uint8[pos]) {
-    case 0:
-      return "||";
-    case 1:
-      return "&&";
-    case 2:
-      return "??";
-    default:
-      throw Error(`Unexpected discriminant ${uint8[pos]} for LogicalOperator`);
-  }
-}
-
-function deserializeUnaryOperator(pos) {
-  switch (uint8[pos]) {
-    case 0:
-      return "+";
-    case 1:
-      return "-";
-    case 2:
-      return "!";
-    case 3:
-      return "~";
-    case 4:
-      return "typeof";
-    case 5:
-      return "void";
-    case 6:
-      return "delete";
-    default:
-      throw Error(`Unexpected discriminant ${uint8[pos]} for UnaryOperator`);
-  }
-}
-
-function deserializeUpdateOperator(pos) {
-  switch (uint8[pos]) {
-    case 0:
-      return "++";
-    case 1:
-      return "--";
-    default:
-      throw Error(`Unexpected discriminant ${uint8[pos]} for UpdateOperator`);
-  }
+  return arr;
 }
 
 function deserializeRawTransferData(pos) {
+  let pos32 = pos >> 2,
+    commentsLen = int32[pos32 + 38],
+    comments = null,
+    rawComments = null,
+    rawSourceText = null;
+  if (commentsLen === 0) comments = [];
+  else {
+    let commentsPtr = int32[pos32 + 36];
+    rawComments = uint8.slice(commentsPtr, commentsPtr + commentsLen * 24);
+    rawSourceText = sourceText;
+  }
+  let program = deserializeProgram(pos),
+    module =
+      (int32[pos32 + 44] | int32[pos32 + 50] | int32[pos32 + 56] | int32[pos32 + 62]) === 0
+        ? {
+            hasModuleSyntax: uint8[pos + 264] === 1,
+            staticImports: [],
+            staticExports: [],
+            dynamicImports: [],
+            importMetas: [],
+          }
+        : deserializeEcmaScriptModule(pos + 168),
+    errors = int32[pos32 + 70] === 0 ? [] : deserializeVecError(pos + 272);
   return {
-    program: deserializeProgram(pos),
-    comments: deserializeVecComment(pos + 144),
-    module: deserializeEcmaScriptModule(pos + 168),
-    errors: deserializeVecError(pos + 272),
+    get program() {
+      return program;
+    },
+    get module() {
+      return module;
+    },
+    get comments() {
+      if (comments === null) {
+        comments = deserializeComments(rawComments, rawSourceText);
+        rawComments = rawSourceText = null;
+      }
+      return comments;
+    },
+    get errors() {
+      return errors;
+    },
   };
 }
 
 function deserializeError(pos) {
   return {
-    severity: deserializeErrorSeverity(pos + 72),
+    severity: ErrorSeverity_TABLE[uint8[pos + 72]],
     message: deserializeStr(pos),
     labels: deserializeVecErrorLabel(pos + 16),
     helpMessage: deserializeOptionStr(pos + 40),
@@ -5520,30 +5371,19 @@ function deserializeError(pos) {
   };
 }
 
-function deserializeErrorSeverity(pos) {
-  switch (uint8[pos]) {
-    case 0:
-      return "Error";
-    case 1:
-      return "Warning";
-    case 2:
-      return "Advice";
-    default:
-      throw Error(`Unexpected discriminant ${uint8[pos]} for ErrorSeverity`);
-  }
-}
+const ErrorSeverity_TABLE = ["Error", "Warning", "Advice"];
 
 function deserializeErrorLabel(pos) {
   return {
     message: deserializeOptionStr(pos + 8),
-    start: deserializeI32(pos),
-    end: deserializeI32(pos + 4),
+    start: int32[pos >> 2],
+    end: int32[(pos >> 2) + 1],
   };
 }
 
 function deserializeEcmaScriptModule(pos) {
   return {
-    hasModuleSyntax: deserializeBool(pos + 96),
+    hasModuleSyntax: uint8[pos + 96] === 1,
     staticImports: deserializeVecStaticImport(pos),
     staticExports: deserializeVecStaticExport(pos + 24),
     dynamicImports: deserializeVecDynamicImport(pos + 48),
@@ -5555,16 +5395,16 @@ function deserializeStaticImport(pos) {
   return {
     moduleRequest: deserializeNameSpan(pos + 8),
     entries: deserializeVecImportEntry(pos + 32),
-    start: deserializeI32(pos),
-    end: deserializeI32(pos + 4),
+    start: int32[pos >> 2],
+    end: int32[(pos >> 2) + 1],
   };
 }
 
 function deserializeStaticExport(pos) {
   return {
     entries: deserializeVecExportEntry(pos + 8),
-    start: deserializeI32(pos),
-    end: deserializeI32(pos + 4),
+    start: int32[pos >> 2],
+    end: int32[(pos >> 2) + 1],
   };
 }
 
@@ -5573,20 +5413,11 @@ function deserializeStr(pos) {
     len = int32[pos32 + 2];
   if (len === 0) return "";
   pos = int32[pos32];
-  let end = pos + len,
-    isInSourceRegion = pos >= sourceStartPos;
-  if (isInSourceRegion && end <= firstNonAsciiPos)
-    return sourceTextLatin.substr(pos - sourceStartPos, len);
+  let end = pos + len;
+  if (pos >= sourceStartPos && end <= firstNonAsciiPos)
+    return sourceText.substr(pos - sourceStartPos, len);
   // Use `utf8Slice` for strings longer than 64 bytes
   if (len > 64) return utf8Slice.call(uint8, pos, end);
-  // If string is in source region, use slice of `sourceTextLatin` if all ASCII
-  if (isInSourceRegion) {
-    // Check if all bytes are ASCII, use `utf8Slice` if not
-    for (let i = pos; i < end; i++) if (uint8[i] >= 128) return utf8Slice.call(uint8, pos, end);
-    // String is all ASCII, so slice from `sourceTextLatin`
-    return sourceTextLatin.substr(pos - sourceStartPos, len);
-  }
-  // String is not in source region - use `fromCharCode.apply` with a temp array of correct length.
   // Copy bytes into temp array.
   // If any byte is non-ASCII, use `utf8Slice`.
   let arr = stringDecodeArrays[len];
@@ -5599,18 +5430,6 @@ function deserializeStr(pos) {
   return fromCharCode.apply(null, arr);
 }
 
-function deserializeVecComment(pos) {
-  let arr = [],
-    pos32 = pos >> 2;
-  pos = int32[pos32];
-  let endPos = pos + int32[pos32 + 2] * 24;
-  for (; pos !== endPos;) {
-    arr.push(deserializeComment(pos));
-    pos += 24;
-  }
-  return arr;
-}
-
 function deserializeOptionHashbang(pos) {
   return int32[(pos >> 2) + 4] === 0 && int32[(pos >> 2) + 5] === 0
     ? null
@@ -5618,273 +5437,99 @@ function deserializeOptionHashbang(pos) {
 }
 
 function deserializeVecDirective(pos) {
-  let arr = [],
-    pos32 = pos >> 2;
+  let pos32 = pos >> 2,
+    len = int32[pos32 + 2];
+  if (len === 0) return [];
   pos = int32[pos32];
-  let endPos = pos + int32[pos32 + 2] * 80;
-  for (; pos !== endPos;) {
-    arr.push(deserializeDirective(pos));
+  let arr = Array(len);
+  for (let i = 0; i < len; i++) {
+    arr[i] = deserializeDirective(pos);
     pos += 80;
   }
   return arr;
 }
 
 function deserializeVecStatement(pos) {
-  let arr = [],
-    pos32 = pos >> 2;
+  let pos32 = pos >> 2,
+    len = int32[pos32 + 2];
+  if (len === 0) return [];
   pos = int32[pos32];
-  let endPos = pos + (int32[pos32 + 2] << 4);
-  for (; pos !== endPos;) {
-    arr.push(deserializeStatement(pos));
+  let arr = Array(len);
+  for (let i = 0; i < len; i++) {
+    arr[i] = deserializeStatement(pos);
     pos += 16;
   }
   return arr;
-}
-
-function deserializeBoxBooleanLiteral(pos) {
-  return deserializeBooleanLiteral(int32[pos >> 2]);
-}
-
-function deserializeBoxNullLiteral(pos) {
-  return deserializeNullLiteral(int32[pos >> 2]);
-}
-
-function deserializeBoxNumericLiteral(pos) {
-  return deserializeNumericLiteral(int32[pos >> 2]);
-}
-
-function deserializeBoxBigIntLiteral(pos) {
-  return deserializeBigIntLiteral(int32[pos >> 2]);
-}
-
-function deserializeBoxRegExpLiteral(pos) {
-  return deserializeRegExpLiteral(int32[pos >> 2]);
-}
-
-function deserializeBoxStringLiteral(pos) {
-  return deserializeStringLiteral(int32[pos >> 2]);
-}
-
-function deserializeBoxTemplateLiteral(pos) {
-  return deserializeTemplateLiteral(int32[pos >> 2]);
 }
 
 function deserializeBoxIdentifierReference(pos) {
   return deserializeIdentifierReference(int32[pos >> 2]);
 }
 
-function deserializeBoxSuper(pos) {
-  return deserializeSuper(int32[pos >> 2]);
-}
-
-function deserializeBoxArrayExpression(pos) {
-  return deserializeArrayExpression(int32[pos >> 2]);
-}
-
-function deserializeBoxArrowFunctionExpression(pos) {
-  return deserializeArrowFunctionExpression(int32[pos >> 2]);
-}
-
-function deserializeBoxAssignmentExpression(pos) {
-  return deserializeAssignmentExpression(int32[pos >> 2]);
-}
-
-function deserializeBoxAwaitExpression(pos) {
-  return deserializeAwaitExpression(int32[pos >> 2]);
-}
-
-function deserializeBoxBinaryExpression(pos) {
-  return deserializeBinaryExpression(int32[pos >> 2]);
-}
-
-function deserializeBoxCallExpression(pos) {
-  return deserializeCallExpression(int32[pos >> 2]);
-}
-
-function deserializeBoxChainExpression(pos) {
-  return deserializeChainExpression(int32[pos >> 2]);
-}
-
-function deserializeBoxClass(pos) {
-  return deserializeClass(int32[pos >> 2]);
-}
-
-function deserializeBoxConditionalExpression(pos) {
-  return deserializeConditionalExpression(int32[pos >> 2]);
-}
-
-function deserializeBoxFunction(pos) {
-  return deserializeFunction(int32[pos >> 2]);
-}
-
-function deserializeBoxImportExpression(pos) {
-  return deserializeImportExpression(int32[pos >> 2]);
-}
-
-function deserializeBoxLogicalExpression(pos) {
-  return deserializeLogicalExpression(int32[pos >> 2]);
-}
-
-function deserializeBoxNewExpression(pos) {
-  return deserializeNewExpression(int32[pos >> 2]);
-}
-
-function deserializeBoxObjectExpression(pos) {
-  return deserializeObjectExpression(int32[pos >> 2]);
-}
-
-function deserializeBoxParenthesizedExpression(pos) {
-  return deserializeParenthesizedExpression(int32[pos >> 2]);
-}
-
-function deserializeBoxSequenceExpression(pos) {
-  return deserializeSequenceExpression(int32[pos >> 2]);
-}
-
-function deserializeBoxTaggedTemplateExpression(pos) {
-  return deserializeTaggedTemplateExpression(int32[pos >> 2]);
-}
-
 function deserializeBoxThisExpression(pos) {
   return deserializeThisExpression(int32[pos >> 2]);
 }
 
-function deserializeBoxUnaryExpression(pos) {
-  return deserializeUnaryExpression(int32[pos >> 2]);
-}
-
-function deserializeBoxUpdateExpression(pos) {
-  return deserializeUpdateExpression(int32[pos >> 2]);
-}
-
-function deserializeBoxYieldExpression(pos) {
-  return deserializeYieldExpression(int32[pos >> 2]);
-}
-
-function deserializeBoxPrivateInExpression(pos) {
-  return deserializePrivateInExpression(int32[pos >> 2]);
-}
-
-function deserializeBoxImportMeta(pos) {
-  return deserializeImportMeta(int32[pos >> 2]);
-}
-
-function deserializeBoxNewTarget(pos) {
-  return deserializeNewTarget(int32[pos >> 2]);
-}
-
-function deserializeBoxJSXElement(pos) {
-  return deserializeJSXElement(int32[pos >> 2]);
-}
-
-function deserializeBoxJSXFragment(pos) {
-  return deserializeJSXFragment(int32[pos >> 2]);
-}
-
-function deserializeBoxTSAsExpression(pos) {
-  return deserializeTSAsExpression(int32[pos >> 2]);
-}
-
-function deserializeBoxTSSatisfiesExpression(pos) {
-  return deserializeTSSatisfiesExpression(int32[pos >> 2]);
-}
-
-function deserializeBoxTSTypeAssertion(pos) {
-  return deserializeTSTypeAssertion(int32[pos >> 2]);
-}
-
-function deserializeBoxTSNonNullExpression(pos) {
-  return deserializeTSNonNullExpression(int32[pos >> 2]);
-}
-
-function deserializeBoxTSInstantiationExpression(pos) {
-  return deserializeTSInstantiationExpression(int32[pos >> 2]);
-}
-
-function deserializeBoxV8IntrinsicExpression(pos) {
-  return deserializeV8IntrinsicExpression(int32[pos >> 2]);
-}
-
 function deserializeVecArrayExpressionElement(pos) {
-  let arr = [],
-    pos32 = pos >> 2;
+  let pos32 = pos >> 2,
+    len = int32[pos32 + 2];
+  if (len === 0) return [];
   pos = int32[pos32];
-  let endPos = pos + (int32[pos32 + 2] << 4);
-  for (; pos !== endPos;) {
-    arr.push(deserializeArrayExpressionElement(pos));
+  let arr = Array(len);
+  for (let i = 0; i < len; i++) {
+    arr[i] = deserializeArrayExpressionElement(pos);
     pos += 16;
   }
   return arr;
-}
-
-function deserializeBoxSpreadElement(pos) {
-  return deserializeSpreadElement(int32[pos >> 2]);
-}
-
-function deserializeBoxElision(pos) {
-  return deserializeElision(int32[pos >> 2]);
 }
 
 function deserializeVecObjectPropertyKind(pos) {
-  let arr = [],
-    pos32 = pos >> 2;
+  let pos32 = pos >> 2,
+    len = int32[pos32 + 2];
+  if (len === 0) return [];
   pos = int32[pos32];
-  let endPos = pos + (int32[pos32 + 2] << 4);
-  for (; pos !== endPos;) {
-    arr.push(deserializeObjectPropertyKind(pos));
+  let arr = Array(len);
+  for (let i = 0; i < len; i++) {
+    arr[i] = deserializeObjectPropertyKind(pos);
     pos += 16;
   }
   return arr;
-}
-
-function deserializeBoxObjectProperty(pos) {
-  return deserializeObjectProperty(int32[pos >> 2]);
 }
 
 function deserializeBool(pos) {
   return uint8[pos] === 1;
 }
 
-function deserializeBoxIdentifierName(pos) {
-  return deserializeIdentifierName(int32[pos >> 2]);
-}
-
-function deserializeBoxPrivateIdentifier(pos) {
-  return deserializePrivateIdentifier(int32[pos >> 2]);
-}
-
 function deserializeVecTemplateElement(pos) {
-  let arr = [],
-    pos32 = pos >> 2;
+  let pos32 = pos >> 2,
+    len = int32[pos32 + 2];
+  if (len === 0) return [];
   pos = int32[pos32];
-  let endPos = pos + int32[pos32 + 2] * 48;
-  for (; pos !== endPos;) {
-    arr.push(deserializeTemplateElement(pos));
+  let arr = Array(len);
+  for (let i = 0; i < len; i++) {
+    arr[i] = deserializeTemplateElement(pos);
     pos += 48;
   }
   return arr;
 }
 
 function deserializeVecExpression(pos) {
-  let arr = [],
-    pos32 = pos >> 2;
+  let pos32 = pos >> 2,
+    len = int32[pos32 + 2];
+  if (len === 0) return [];
   pos = int32[pos32];
-  let endPos = pos + (int32[pos32 + 2] << 4);
-  for (; pos !== endPos;) {
-    arr.push(deserializeExpression(pos));
+  let arr = Array(len);
+  for (let i = 0; i < len; i++) {
+    arr[i] = deserializeExpression(pos);
     pos += 16;
   }
   return arr;
 }
 
-function deserializeBoxTSTypeParameterInstantiation(pos) {
-  return deserializeTSTypeParameterInstantiation(int32[pos >> 2]);
-}
-
 function deserializeOptionBoxTSTypeParameterInstantiation(pos) {
   return int32[pos >> 2] === 0 && int32[(pos >> 2) + 1] === 0
     ? null
-    : deserializeBoxTSTypeParameterInstantiation(pos);
+    : deserializeTSTypeParameterInstantiation(int32[pos >> 2]);
 }
 
 function deserializeJSStr(pos) {
@@ -5919,36 +5564,17 @@ function deserializeOptionJSStr(pos) {
   return uint8[pos + 12] === 2 ? null : deserializeJSStr(pos);
 }
 
-function deserializeBoxComputedMemberExpression(pos) {
-  return deserializeComputedMemberExpression(int32[pos >> 2]);
-}
-
-function deserializeBoxStaticMemberExpression(pos) {
-  return deserializeStaticMemberExpression(int32[pos >> 2]);
-}
-
-function deserializeBoxPrivateFieldExpression(pos) {
-  return deserializePrivateFieldExpression(int32[pos >> 2]);
-}
-
 function deserializeVecArgument(pos) {
-  let arr = [],
-    pos32 = pos >> 2;
+  let pos32 = pos >> 2,
+    len = int32[pos32 + 2];
+  if (len === 0) return [];
   pos = int32[pos32];
-  let endPos = pos + (int32[pos32 + 2] << 4);
-  for (; pos !== endPos;) {
-    arr.push(deserializeArgument(pos));
+  let arr = Array(len);
+  for (let i = 0; i < len; i++) {
+    arr[i] = deserializeArgument(pos);
     pos += 16;
   }
   return arr;
-}
-
-function deserializeBoxArrayAssignmentTarget(pos) {
-  return deserializeArrayAssignmentTarget(int32[pos >> 2]);
-}
-
-function deserializeBoxObjectAssignmentTarget(pos) {
-  return deserializeObjectAssignmentTarget(int32[pos >> 2]);
 }
 
 function deserializeOptionAssignmentTargetMaybeDefault(pos) {
@@ -5956,179 +5582,58 @@ function deserializeOptionAssignmentTargetMaybeDefault(pos) {
 }
 
 function deserializeVecOptionAssignmentTargetMaybeDefault(pos) {
-  let arr = [],
-    pos32 = pos >> 2;
+  let pos32 = pos >> 2,
+    len = int32[pos32 + 2];
+  if (len === 0) return [];
   pos = int32[pos32];
-  let endPos = pos + (int32[pos32 + 2] << 4);
-  for (; pos !== endPos;) {
-    arr.push(deserializeOptionAssignmentTargetMaybeDefault(pos));
+  let arr = Array(len);
+  for (let i = 0; i < len; i++) {
+    arr[i] = deserializeOptionAssignmentTargetMaybeDefault(pos);
     pos += 16;
   }
   return arr;
-}
-
-function deserializeBoxAssignmentTargetRest(pos) {
-  return deserializeAssignmentTargetRest(int32[pos >> 2]);
 }
 
 function deserializeOptionBoxAssignmentTargetRest(pos) {
   return int32[pos >> 2] === 0 && int32[(pos >> 2) + 1] === 0
     ? null
-    : deserializeBoxAssignmentTargetRest(pos);
+    : deserializeAssignmentTargetRest(int32[pos >> 2]);
 }
 
 function deserializeVecAssignmentTargetProperty(pos) {
-  let arr = [],
-    pos32 = pos >> 2;
+  let pos32 = pos >> 2,
+    len = int32[pos32 + 2];
+  if (len === 0) return [];
   pos = int32[pos32];
-  let endPos = pos + (int32[pos32 + 2] << 4);
-  for (; pos !== endPos;) {
-    arr.push(deserializeAssignmentTargetProperty(pos));
+  let arr = Array(len);
+  for (let i = 0; i < len; i++) {
+    arr[i] = deserializeAssignmentTargetProperty(pos);
     pos += 16;
   }
   return arr;
-}
-
-function deserializeBoxAssignmentTargetWithDefault(pos) {
-  return deserializeAssignmentTargetWithDefault(int32[pos >> 2]);
-}
-
-function deserializeBoxAssignmentTargetPropertyIdentifier(pos) {
-  return deserializeAssignmentTargetPropertyIdentifier(int32[pos >> 2]);
-}
-
-function deserializeBoxAssignmentTargetPropertyProperty(pos) {
-  return deserializeAssignmentTargetPropertyProperty(int32[pos >> 2]);
 }
 
 function deserializeOptionExpression(pos) {
   return uint8[pos] === 255 ? null : deserializeExpression(pos);
 }
 
-function deserializeBoxBlockStatement(pos) {
-  return deserializeBlockStatement(int32[pos >> 2]);
-}
-
-function deserializeBoxBreakStatement(pos) {
-  return deserializeBreakStatement(int32[pos >> 2]);
-}
-
-function deserializeBoxContinueStatement(pos) {
-  return deserializeContinueStatement(int32[pos >> 2]);
-}
-
-function deserializeBoxDebuggerStatement(pos) {
-  return deserializeDebuggerStatement(int32[pos >> 2]);
-}
-
-function deserializeBoxDoWhileStatement(pos) {
-  return deserializeDoWhileStatement(int32[pos >> 2]);
-}
-
-function deserializeBoxEmptyStatement(pos) {
-  return deserializeEmptyStatement(int32[pos >> 2]);
-}
-
-function deserializeBoxExpressionStatement(pos) {
-  return deserializeExpressionStatement(int32[pos >> 2]);
-}
-
-function deserializeBoxForInStatement(pos) {
-  return deserializeForInStatement(int32[pos >> 2]);
-}
-
-function deserializeBoxForOfStatement(pos) {
-  return deserializeForOfStatement(int32[pos >> 2]);
-}
-
-function deserializeBoxForStatement(pos) {
-  return deserializeForStatement(int32[pos >> 2]);
-}
-
-function deserializeBoxIfStatement(pos) {
-  return deserializeIfStatement(int32[pos >> 2]);
-}
-
-function deserializeBoxLabeledStatement(pos) {
-  return deserializeLabeledStatement(int32[pos >> 2]);
-}
-
-function deserializeBoxReturnStatement(pos) {
-  return deserializeReturnStatement(int32[pos >> 2]);
-}
-
-function deserializeBoxSwitchStatement(pos) {
-  return deserializeSwitchStatement(int32[pos >> 2]);
-}
-
-function deserializeBoxThrowStatement(pos) {
-  return deserializeThrowStatement(int32[pos >> 2]);
-}
-
-function deserializeBoxTryStatement(pos) {
-  return deserializeTryStatement(int32[pos >> 2]);
-}
-
-function deserializeBoxWhileStatement(pos) {
-  return deserializeWhileStatement(int32[pos >> 2]);
-}
-
-function deserializeBoxWithStatement(pos) {
-  return deserializeWithStatement(int32[pos >> 2]);
-}
-
-function deserializeBoxVariableDeclaration(pos) {
-  return deserializeVariableDeclaration(int32[pos >> 2]);
-}
-
-function deserializeBoxTSTypeAliasDeclaration(pos) {
-  return deserializeTSTypeAliasDeclaration(int32[pos >> 2]);
-}
-
-function deserializeBoxTSInterfaceDeclaration(pos) {
-  return deserializeTSInterfaceDeclaration(int32[pos >> 2]);
-}
-
-function deserializeBoxTSEnumDeclaration(pos) {
-  return deserializeTSEnumDeclaration(int32[pos >> 2]);
-}
-
-function deserializeBoxTSExternalModuleDeclaration(pos) {
-  return deserializeTSExternalModuleDeclaration(int32[pos >> 2]);
-}
-
-function deserializeBoxTSNamespaceDeclaration(pos) {
-  return deserializeTSNamespaceDeclaration(int32[pos >> 2]);
-}
-
-function deserializeBoxTSGlobalDeclaration(pos) {
-  return deserializeTSGlobalDeclaration(int32[pos >> 2]);
-}
-
-function deserializeBoxTSImportEqualsDeclaration(pos) {
-  return deserializeTSImportEqualsDeclaration(int32[pos >> 2]);
-}
-
 function deserializeVecVariableDeclarator(pos) {
-  let arr = [],
-    pos32 = pos >> 2;
+  let pos32 = pos >> 2,
+    len = int32[pos32 + 2];
+  if (len === 0) return [];
   pos = int32[pos32];
-  let endPos = pos + int32[pos32 + 2] * 56;
-  for (; pos !== endPos;) {
-    arr.push(deserializeVariableDeclarator(pos));
+  let arr = Array(len);
+  for (let i = 0; i < len; i++) {
+    arr[i] = deserializeVariableDeclarator(pos);
     pos += 56;
   }
   return arr;
 }
 
-function deserializeBoxTSTypeAnnotation(pos) {
-  return deserializeTSTypeAnnotation(int32[pos >> 2]);
-}
-
 function deserializeOptionBoxTSTypeAnnotation(pos) {
   return int32[pos >> 2] === 0 && int32[(pos >> 2) + 1] === 0
     ? null
-    : deserializeBoxTSTypeAnnotation(pos);
+    : deserializeTSTypeAnnotation(int32[pos >> 2]);
 }
 
 function deserializeOptionStatement(pos) {
@@ -6146,73 +5651,51 @@ function deserializeOptionLabelIdentifier(pos) {
 }
 
 function deserializeVecSwitchCase(pos) {
-  let arr = [],
-    pos32 = pos >> 2;
+  let pos32 = pos >> 2,
+    len = int32[pos32 + 2];
+  if (len === 0) return [];
   pos = int32[pos32];
-  let endPos = pos + int32[pos32 + 2] * 56;
-  for (; pos !== endPos;) {
-    arr.push(deserializeSwitchCase(pos));
+  let arr = Array(len);
+  for (let i = 0; i < len; i++) {
+    arr[i] = deserializeSwitchCase(pos);
     pos += 56;
   }
   return arr;
 }
 
-function deserializeBoxCatchClause(pos) {
-  return deserializeCatchClause(int32[pos >> 2]);
-}
-
 function deserializeOptionBoxCatchClause(pos) {
   return int32[pos >> 2] === 0 && int32[(pos >> 2) + 1] === 0
     ? null
-    : deserializeBoxCatchClause(pos);
+    : deserializeCatchClause(int32[pos >> 2]);
 }
 
 function deserializeOptionBoxBlockStatement(pos) {
   return int32[pos >> 2] === 0 && int32[(pos >> 2) + 1] === 0
     ? null
-    : deserializeBoxBlockStatement(pos);
+    : deserializeBlockStatement(int32[pos >> 2]);
 }
 
 function deserializeOptionCatchParameter(pos) {
   return uint8[pos + 16] === 255 ? null : deserializeCatchParameter(pos);
 }
 
-function deserializeBoxBindingIdentifier(pos) {
-  return deserializeBindingIdentifier(int32[pos >> 2]);
-}
-
-function deserializeBoxObjectPattern(pos) {
-  return deserializeObjectPattern(int32[pos >> 2]);
-}
-
-function deserializeBoxArrayPattern(pos) {
-  return deserializeArrayPattern(int32[pos >> 2]);
-}
-
-function deserializeBoxAssignmentPattern(pos) {
-  return deserializeAssignmentPattern(int32[pos >> 2]);
-}
-
 function deserializeVecBindingProperty(pos) {
-  let arr = [],
-    pos32 = pos >> 2;
+  let pos32 = pos >> 2,
+    len = int32[pos32 + 2];
+  if (len === 0) return [];
   pos = int32[pos32];
-  let endPos = pos + int32[pos32 + 2] * 48;
-  for (; pos !== endPos;) {
-    arr.push(deserializeBindingProperty(pos));
+  let arr = Array(len);
+  for (let i = 0; i < len; i++) {
+    arr[i] = deserializeBindingProperty(pos);
     pos += 48;
   }
   return arr;
 }
 
-function deserializeBoxBindingRestElement(pos) {
-  return deserializeBindingRestElement(int32[pos >> 2]);
-}
-
 function deserializeOptionBoxBindingRestElement(pos) {
   return int32[pos >> 2] === 0 && int32[(pos >> 2) + 1] === 0
     ? null
-    : deserializeBoxBindingRestElement(pos);
+    : deserializeBindingRestElement(int32[pos >> 2]);
 }
 
 function deserializeOptionBindingPattern(pos) {
@@ -6220,12 +5703,13 @@ function deserializeOptionBindingPattern(pos) {
 }
 
 function deserializeVecOptionBindingPattern(pos) {
-  let arr = [],
-    pos32 = pos >> 2;
+  let pos32 = pos >> 2,
+    len = int32[pos32 + 2];
+  if (len === 0) return [];
   pos = int32[pos32];
-  let endPos = pos + (int32[pos32 + 2] << 4);
-  for (; pos !== endPos;) {
-    arr.push(deserializeOptionBindingPattern(pos));
+  let arr = Array(len);
+  for (let i = 0; i < len; i++) {
+    arr[i] = deserializeOptionBindingPattern(pos);
     pos += 16;
   }
   return arr;
@@ -6237,72 +5721,58 @@ function deserializeOptionBindingIdentifier(pos) {
     : deserializeBindingIdentifier(pos);
 }
 
-function deserializeBoxTSTypeParameterDeclaration(pos) {
-  return deserializeTSTypeParameterDeclaration(int32[pos >> 2]);
-}
-
 function deserializeOptionBoxTSTypeParameterDeclaration(pos) {
   return int32[pos >> 2] === 0 && int32[(pos >> 2) + 1] === 0
     ? null
-    : deserializeBoxTSTypeParameterDeclaration(pos);
-}
-
-function deserializeBoxTSThisParameter(pos) {
-  return deserializeTSThisParameter(int32[pos >> 2]);
+    : deserializeTSTypeParameterDeclaration(int32[pos >> 2]);
 }
 
 function deserializeOptionBoxTSThisParameter(pos) {
   return int32[pos >> 2] === 0 && int32[(pos >> 2) + 1] === 0
     ? null
-    : deserializeBoxTSThisParameter(pos);
+    : deserializeTSThisParameter(int32[pos >> 2]);
 }
 
 function deserializeBoxFormalParameters(pos) {
   return deserializeFormalParameters(int32[pos >> 2]);
 }
 
-function deserializeBoxFunctionBody(pos) {
-  return deserializeFunctionBody(int32[pos >> 2]);
-}
-
 function deserializeOptionBoxFunctionBody(pos) {
   return int32[pos >> 2] === 0 && int32[(pos >> 2) + 1] === 0
     ? null
-    : deserializeBoxFunctionBody(pos);
+    : deserializeFunctionBody(int32[pos >> 2]);
 }
 
 function deserializeVecFormalParameter(pos) {
-  let arr = [],
-    pos32 = pos >> 2;
+  let pos32 = pos >> 2,
+    len = int32[pos32 + 2];
+  if (len === 0) return [];
   pos = int32[pos32];
-  let endPos = pos + int32[pos32 + 2] * 72;
-  for (; pos !== endPos;) {
-    arr.push(deserializeFormalParameter(pos));
+  let arr = Array(len);
+  for (let i = 0; i < len; i++) {
+    arr[i] = deserializeFormalParameter(pos);
     pos += 72;
   }
   return arr;
 }
 
 function deserializeVecDecorator(pos) {
-  let arr = [],
-    pos32 = pos >> 2;
+  let pos32 = pos >> 2,
+    len = int32[pos32 + 2];
+  if (len === 0) return [];
   pos = int32[pos32];
-  let endPos = pos + (int32[pos32 + 2] << 5);
-  for (; pos !== endPos;) {
-    arr.push(deserializeDecorator(pos));
+  let arr = Array(len);
+  for (let i = 0; i < len; i++) {
+    arr[i] = deserializeDecorator(pos);
     pos += 32;
   }
   return arr;
 }
 
-function deserializeBoxExpression(pos) {
-  return deserializeExpression(int32[pos >> 2]);
-}
-
 function deserializeOptionBoxExpression(pos) {
   return int32[pos >> 2] === 0 && int32[(pos >> 2) + 1] === 0
     ? null
-    : deserializeBoxExpression(pos);
+    : deserializeExpression(int32[pos >> 2]);
 }
 
 function deserializeOptionTSAccessibility(pos) {
@@ -6310,83 +5780,29 @@ function deserializeOptionTSAccessibility(pos) {
 }
 
 function deserializeVecTSClassImplements(pos) {
-  let arr = [],
-    pos32 = pos >> 2;
+  let pos32 = pos >> 2,
+    len = int32[pos32 + 2];
+  if (len === 0) return [];
   pos = int32[pos32];
-  let endPos = pos + int32[pos32 + 2] * 40;
-  for (; pos !== endPos;) {
-    arr.push(deserializeTSClassImplements(pos));
+  let arr = Array(len);
+  for (let i = 0; i < len; i++) {
+    arr[i] = deserializeTSClassImplements(pos);
     pos += 40;
   }
   return arr;
 }
 
-function deserializeBoxClassBody(pos) {
-  return deserializeClassBody(int32[pos >> 2]);
-}
-
 function deserializeVecClassElement(pos) {
-  let arr = [],
-    pos32 = pos >> 2;
+  let pos32 = pos >> 2,
+    len = int32[pos32 + 2];
+  if (len === 0) return [];
   pos = int32[pos32];
-  let endPos = pos + (int32[pos32 + 2] << 4);
-  for (; pos !== endPos;) {
-    arr.push(deserializeClassElement(pos));
+  let arr = Array(len);
+  for (let i = 0; i < len; i++) {
+    arr[i] = deserializeClassElement(pos);
     pos += 16;
   }
   return arr;
-}
-
-function deserializeBoxStaticBlock(pos) {
-  return deserializeStaticBlock(int32[pos >> 2]);
-}
-
-function deserializeBoxMethodDefinition(pos) {
-  return deserializeMethodDefinition(int32[pos >> 2]);
-}
-
-function deserializeBoxPropertyDefinition(pos) {
-  return deserializePropertyDefinition(int32[pos >> 2]);
-}
-
-function deserializeBoxAccessorProperty(pos) {
-  return deserializeAccessorProperty(int32[pos >> 2]);
-}
-
-function deserializeBoxTSIndexSignature(pos) {
-  return deserializeTSIndexSignature(int32[pos >> 2]);
-}
-
-function deserializeBoxImportDeclaration(pos) {
-  return deserializeImportDeclaration(int32[pos >> 2]);
-}
-
-function deserializeBoxExportAllDeclaration(pos) {
-  return deserializeExportAllDeclaration(int32[pos >> 2]);
-}
-
-function deserializeBoxExportDefaultDeclaration(pos) {
-  return deserializeExportDefaultDeclaration(int32[pos >> 2]);
-}
-
-function deserializeBoxExportDeclaration(pos) {
-  return deserializeExportDeclaration(int32[pos >> 2]);
-}
-
-function deserializeBoxExportNamedDeclaration(pos) {
-  return deserializeExportNamedDeclaration(int32[pos >> 2]);
-}
-
-function deserializeBoxExportFromDeclaration(pos) {
-  return deserializeExportFromDeclaration(int32[pos >> 2]);
-}
-
-function deserializeBoxTSExportAssignment(pos) {
-  return deserializeTSExportAssignment(int32[pos >> 2]);
-}
-
-function deserializeBoxTSNamespaceExportDeclaration(pos) {
-  return deserializeTSNamespaceExportDeclaration(int32[pos >> 2]);
 }
 
 function deserializeOptionImportPhase(pos) {
@@ -6394,12 +5810,13 @@ function deserializeOptionImportPhase(pos) {
 }
 
 function deserializeVecImportDeclarationSpecifier(pos) {
-  let arr = [],
-    pos32 = pos >> 2;
+  let pos32 = pos >> 2,
+    len = int32[pos32 + 2];
+  if (len === 0) return [];
   pos = int32[pos32];
-  let endPos = pos + (int32[pos32 + 2] << 4);
-  for (; pos !== endPos;) {
-    arr.push(deserializeImportDeclarationSpecifier(pos));
+  let arr = Array(len);
+  for (let i = 0; i < len; i++) {
+    arr[i] = deserializeImportDeclarationSpecifier(pos);
     pos += 16;
   }
   return arr;
@@ -6411,47 +5828,33 @@ function deserializeOptionVecImportDeclarationSpecifier(pos) {
     : deserializeVecImportDeclarationSpecifier(pos);
 }
 
-function deserializeBoxWithClause(pos) {
-  return deserializeWithClause(int32[pos >> 2]);
-}
-
 function deserializeOptionBoxWithClause(pos) {
   return int32[pos >> 2] === 0 && int32[(pos >> 2) + 1] === 0
     ? null
-    : deserializeBoxWithClause(pos);
-}
-
-function deserializeBoxImportSpecifier(pos) {
-  return deserializeImportSpecifier(int32[pos >> 2]);
-}
-
-function deserializeBoxImportDefaultSpecifier(pos) {
-  return deserializeImportDefaultSpecifier(int32[pos >> 2]);
-}
-
-function deserializeBoxImportNamespaceSpecifier(pos) {
-  return deserializeImportNamespaceSpecifier(int32[pos >> 2]);
+    : deserializeWithClause(int32[pos >> 2]);
 }
 
 function deserializeVecImportAttribute(pos) {
-  let arr = [],
-    pos32 = pos >> 2;
+  let pos32 = pos >> 2,
+    len = int32[pos32 + 2];
+  if (len === 0) return [];
   pos = int32[pos32];
-  let endPos = pos + int32[pos32 + 2] * 120;
-  for (; pos !== endPos;) {
-    arr.push(deserializeImportAttribute(pos));
+  let arr = Array(len);
+  for (let i = 0; i < len; i++) {
+    arr[i] = deserializeImportAttribute(pos);
     pos += 120;
   }
   return arr;
 }
 
 function deserializeVecExportSpecifier(pos) {
-  let arr = [],
-    pos32 = pos >> 2;
+  let pos32 = pos >> 2,
+    len = int32[pos32 + 2];
+  if (len === 0) return [];
   pos = int32[pos32];
-  let endPos = pos + (int32[pos32 + 2] << 7);
-  for (; pos !== endPos;) {
-    arr.push(deserializeExportSpecifier(pos));
+  let arr = Array(len);
+  for (let i = 0; i < len; i++) {
+    arr[i] = deserializeExportSpecifier(pos);
     pos += 128;
   }
   return arr;
@@ -6459,10 +5862,6 @@ function deserializeVecExportSpecifier(pos) {
 
 function deserializeOptionModuleExportName(pos) {
   return uint8[pos] === 255 ? null : deserializeModuleExportName(pos);
-}
-
-function deserializeF64(pos) {
-  return float64[pos >> 3];
 }
 
 function deserializeOptionStr(pos) {
@@ -6478,273 +5877,78 @@ function deserializeBoxJSXOpeningElement(pos) {
 }
 
 function deserializeVecJSXChild(pos) {
-  let arr = [],
-    pos32 = pos >> 2;
+  let pos32 = pos >> 2,
+    len = int32[pos32 + 2];
+  if (len === 0) return [];
   pos = int32[pos32];
-  let endPos = pos + (int32[pos32 + 2] << 4);
-  for (; pos !== endPos;) {
-    arr.push(deserializeJSXChild(pos));
+  let arr = Array(len);
+  for (let i = 0; i < len; i++) {
+    arr[i] = deserializeJSXChild(pos);
     pos += 16;
   }
   return arr;
-}
-
-function deserializeBoxJSXClosingElement(pos) {
-  return deserializeJSXClosingElement(int32[pos >> 2]);
 }
 
 function deserializeOptionBoxJSXClosingElement(pos) {
   return int32[pos >> 2] === 0 && int32[(pos >> 2) + 1] === 0
     ? null
-    : deserializeBoxJSXClosingElement(pos);
+    : deserializeJSXClosingElement(int32[pos >> 2]);
 }
 
 function deserializeVecJSXAttributeItem(pos) {
-  let arr = [],
-    pos32 = pos >> 2;
+  let pos32 = pos >> 2,
+    len = int32[pos32 + 2];
+  if (len === 0) return [];
   pos = int32[pos32];
-  let endPos = pos + (int32[pos32 + 2] << 4);
-  for (; pos !== endPos;) {
-    arr.push(deserializeJSXAttributeItem(pos));
+  let arr = Array(len);
+  for (let i = 0; i < len; i++) {
+    arr[i] = deserializeJSXAttributeItem(pos);
     pos += 16;
   }
   return arr;
-}
-
-function deserializeBoxJSXIdentifier(pos) {
-  return deserializeJSXIdentifier(int32[pos >> 2]);
-}
-
-function deserializeBoxJSXNamespacedName(pos) {
-  return deserializeJSXNamespacedName(int32[pos >> 2]);
-}
-
-function deserializeBoxJSXMemberExpression(pos) {
-  return deserializeJSXMemberExpression(int32[pos >> 2]);
-}
-
-function deserializeBoxJSXEmptyExpression(pos) {
-  return deserializeJSXEmptyExpression(int32[pos >> 2]);
-}
-
-function deserializeBoxJSXAttribute(pos) {
-  return deserializeJSXAttribute(int32[pos >> 2]);
-}
-
-function deserializeBoxJSXSpreadAttribute(pos) {
-  return deserializeJSXSpreadAttribute(int32[pos >> 2]);
 }
 
 function deserializeOptionJSXAttributeValue(pos) {
   return uint8[pos] === 255 ? null : deserializeJSXAttributeValue(pos);
 }
 
-function deserializeBoxJSXExpressionContainer(pos) {
-  return deserializeJSXExpressionContainer(int32[pos >> 2]);
-}
-
-function deserializeBoxJSXText(pos) {
-  return deserializeJSXText(int32[pos >> 2]);
-}
-
-function deserializeBoxJSXSpreadChild(pos) {
-  return deserializeJSXSpreadChild(int32[pos >> 2]);
-}
-
 function deserializeVecTSEnumMember(pos) {
-  let arr = [],
-    pos32 = pos >> 2;
+  let pos32 = pos >> 2,
+    len = int32[pos32 + 2];
+  if (len === 0) return [];
   pos = int32[pos32];
-  let endPos = pos + int32[pos32 + 2] * 48;
-  for (; pos !== endPos;) {
-    arr.push(deserializeTSEnumMember(pos));
+  let arr = Array(len);
+  for (let i = 0; i < len; i++) {
+    arr[i] = deserializeTSEnumMember(pos);
     pos += 48;
   }
   return arr;
 }
 
-function deserializeBoxTSAnyKeyword(pos) {
-  return deserializeTSAnyKeyword(int32[pos >> 2]);
-}
-
-function deserializeBoxTSBigIntKeyword(pos) {
-  return deserializeTSBigIntKeyword(int32[pos >> 2]);
-}
-
-function deserializeBoxTSBooleanKeyword(pos) {
-  return deserializeTSBooleanKeyword(int32[pos >> 2]);
-}
-
-function deserializeBoxTSIntrinsicKeyword(pos) {
-  return deserializeTSIntrinsicKeyword(int32[pos >> 2]);
-}
-
-function deserializeBoxTSNeverKeyword(pos) {
-  return deserializeTSNeverKeyword(int32[pos >> 2]);
-}
-
-function deserializeBoxTSNullKeyword(pos) {
-  return deserializeTSNullKeyword(int32[pos >> 2]);
-}
-
-function deserializeBoxTSNumberKeyword(pos) {
-  return deserializeTSNumberKeyword(int32[pos >> 2]);
-}
-
-function deserializeBoxTSObjectKeyword(pos) {
-  return deserializeTSObjectKeyword(int32[pos >> 2]);
-}
-
-function deserializeBoxTSStringKeyword(pos) {
-  return deserializeTSStringKeyword(int32[pos >> 2]);
-}
-
-function deserializeBoxTSSymbolKeyword(pos) {
-  return deserializeTSSymbolKeyword(int32[pos >> 2]);
-}
-
-function deserializeBoxTSUndefinedKeyword(pos) {
-  return deserializeTSUndefinedKeyword(int32[pos >> 2]);
-}
-
-function deserializeBoxTSUnknownKeyword(pos) {
-  return deserializeTSUnknownKeyword(int32[pos >> 2]);
-}
-
-function deserializeBoxTSVoidKeyword(pos) {
-  return deserializeTSVoidKeyword(int32[pos >> 2]);
-}
-
-function deserializeBoxTSArrayType(pos) {
-  return deserializeTSArrayType(int32[pos >> 2]);
-}
-
-function deserializeBoxTSConditionalType(pos) {
-  return deserializeTSConditionalType(int32[pos >> 2]);
-}
-
-function deserializeBoxTSConstructorType(pos) {
-  return deserializeTSConstructorType(int32[pos >> 2]);
-}
-
-function deserializeBoxTSFunctionType(pos) {
-  return deserializeTSFunctionType(int32[pos >> 2]);
-}
-
-function deserializeBoxTSImportType(pos) {
-  return deserializeTSImportType(int32[pos >> 2]);
-}
-
-function deserializeBoxTSIndexedAccessType(pos) {
-  return deserializeTSIndexedAccessType(int32[pos >> 2]);
-}
-
-function deserializeBoxTSInferType(pos) {
-  return deserializeTSInferType(int32[pos >> 2]);
-}
-
-function deserializeBoxTSIntersectionType(pos) {
-  return deserializeTSIntersectionType(int32[pos >> 2]);
-}
-
-function deserializeBoxTSLiteralType(pos) {
-  return deserializeTSLiteralType(int32[pos >> 2]);
-}
-
-function deserializeBoxTSMappedType(pos) {
-  return deserializeTSMappedType(int32[pos >> 2]);
-}
-
-function deserializeBoxTSNamedTupleMember(pos) {
-  return deserializeTSNamedTupleMember(int32[pos >> 2]);
-}
-
-function deserializeBoxTSTemplateLiteralType(pos) {
-  return deserializeTSTemplateLiteralType(int32[pos >> 2]);
-}
-
-function deserializeBoxTSThisType(pos) {
-  return deserializeTSThisType(int32[pos >> 2]);
-}
-
-function deserializeBoxTSTupleType(pos) {
-  return deserializeTSTupleType(int32[pos >> 2]);
-}
-
-function deserializeBoxTSTypeLiteral(pos) {
-  return deserializeTSTypeLiteral(int32[pos >> 2]);
-}
-
-function deserializeBoxTSTypeOperator(pos) {
-  return deserializeTSTypeOperator(int32[pos >> 2]);
-}
-
-function deserializeBoxTSTypePredicate(pos) {
-  return deserializeTSTypePredicate(int32[pos >> 2]);
-}
-
-function deserializeBoxTSTypeQuery(pos) {
-  return deserializeTSTypeQuery(int32[pos >> 2]);
-}
-
-function deserializeBoxTSTypeReference(pos) {
-  return deserializeTSTypeReference(int32[pos >> 2]);
-}
-
-function deserializeBoxTSUnionType(pos) {
-  return deserializeTSUnionType(int32[pos >> 2]);
-}
-
-function deserializeBoxTSParenthesizedType(pos) {
-  return deserializeTSParenthesizedType(int32[pos >> 2]);
-}
-
-function deserializeBoxJSDocNullableType(pos) {
-  return deserializeJSDocNullableType(int32[pos >> 2]);
-}
-
-function deserializeBoxJSDocNonNullableType(pos) {
-  return deserializeJSDocNonNullableType(int32[pos >> 2]);
-}
-
-function deserializeBoxJSDocUnknownType(pos) {
-  return deserializeJSDocUnknownType(int32[pos >> 2]);
-}
-
 function deserializeVecTSType(pos) {
-  let arr = [],
-    pos32 = pos >> 2;
+  let pos32 = pos >> 2,
+    len = int32[pos32 + 2];
+  if (len === 0) return [];
   pos = int32[pos32];
-  let endPos = pos + (int32[pos32 + 2] << 4);
-  for (; pos !== endPos;) {
-    arr.push(deserializeTSType(pos));
+  let arr = Array(len);
+  for (let i = 0; i < len; i++) {
+    arr[i] = deserializeTSType(pos);
     pos += 16;
   }
   return arr;
 }
 
 function deserializeVecTSTupleElement(pos) {
-  let arr = [],
-    pos32 = pos >> 2;
+  let pos32 = pos >> 2,
+    len = int32[pos32 + 2];
+  if (len === 0) return [];
   pos = int32[pos32];
-  let endPos = pos + (int32[pos32 + 2] << 4);
-  for (; pos !== endPos;) {
-    arr.push(deserializeTSTupleElement(pos));
+  let arr = Array(len);
+  for (let i = 0; i < len; i++) {
+    arr[i] = deserializeTSTupleElement(pos);
     pos += 16;
   }
   return arr;
-}
-
-function deserializeBoxTSOptionalType(pos) {
-  return deserializeTSOptionalType(int32[pos >> 2]);
-}
-
-function deserializeBoxTSRestType(pos) {
-  return deserializeTSRestType(int32[pos >> 2]);
-}
-
-function deserializeBoxTSQualifiedName(pos) {
-  return deserializeTSQualifiedName(int32[pos >> 2]);
 }
 
 function deserializeOptionTSType(pos) {
@@ -6752,95 +5956,62 @@ function deserializeOptionTSType(pos) {
 }
 
 function deserializeVecTSTypeParameter(pos) {
-  let arr = [],
-    pos32 = pos >> 2;
+  let pos32 = pos >> 2,
+    len = int32[pos32 + 2];
+  if (len === 0) return [];
   pos = int32[pos32];
-  let endPos = pos + int32[pos32 + 2] * 80;
-  for (; pos !== endPos;) {
-    arr.push(deserializeTSTypeParameter(pos));
+  let arr = Array(len);
+  for (let i = 0; i < len; i++) {
+    arr[i] = deserializeTSTypeParameter(pos);
     pos += 80;
   }
   return arr;
 }
 
 function deserializeVecTSInterfaceHeritage(pos) {
-  let arr = [],
-    pos32 = pos >> 2;
+  let pos32 = pos >> 2,
+    len = int32[pos32 + 2];
+  if (len === 0) return [];
   pos = int32[pos32];
-  let endPos = pos + int32[pos32 + 2] * 40;
-  for (; pos !== endPos;) {
-    arr.push(deserializeTSInterfaceHeritage(pos));
+  let arr = Array(len);
+  for (let i = 0; i < len; i++) {
+    arr[i] = deserializeTSInterfaceHeritage(pos);
     pos += 40;
   }
   return arr;
 }
 
-function deserializeBoxTSInterfaceBody(pos) {
-  return deserializeTSInterfaceBody(int32[pos >> 2]);
-}
-
 function deserializeVecTSSignature(pos) {
-  let arr = [],
-    pos32 = pos >> 2;
+  let pos32 = pos >> 2,
+    len = int32[pos32 + 2];
+  if (len === 0) return [];
   pos = int32[pos32];
-  let endPos = pos + (int32[pos32 + 2] << 4);
-  for (; pos !== endPos;) {
-    arr.push(deserializeTSSignature(pos));
+  let arr = Array(len);
+  for (let i = 0; i < len; i++) {
+    arr[i] = deserializeTSSignature(pos);
     pos += 16;
   }
   return arr;
 }
 
-function deserializeBoxTSPropertySignature(pos) {
-  return deserializeTSPropertySignature(int32[pos >> 2]);
-}
-
-function deserializeBoxTSCallSignatureDeclaration(pos) {
-  return deserializeTSCallSignatureDeclaration(int32[pos >> 2]);
-}
-
-function deserializeBoxTSConstructSignatureDeclaration(pos) {
-  return deserializeTSConstructSignatureDeclaration(int32[pos >> 2]);
-}
-
-function deserializeBoxTSMethodSignature(pos) {
-  return deserializeTSMethodSignature(int32[pos >> 2]);
-}
-
-function deserializeBoxTSModuleBlock(pos) {
-  return deserializeTSModuleBlock(int32[pos >> 2]);
-}
-
 function deserializeOptionBoxTSModuleBlock(pos) {
   return int32[pos >> 2] === 0 && int32[(pos >> 2) + 1] === 0
     ? null
-    : deserializeBoxTSModuleBlock(pos);
-}
-
-function deserializeBoxTSTypeParameter(pos) {
-  return deserializeTSTypeParameter(int32[pos >> 2]);
+    : deserializeTSModuleBlock(int32[pos >> 2]);
 }
 
 function deserializeOptionBoxObjectExpression(pos) {
   return int32[pos >> 2] === 0 && int32[(pos >> 2) + 1] === 0
     ? null
-    : deserializeBoxObjectExpression(pos);
+    : deserializeObjectExpression(int32[pos >> 2]);
 }
 
 function deserializeOptionTSImportTypeQualifier(pos) {
   return uint8[pos] === 2 ? null : deserializeTSImportTypeQualifier(pos);
 }
 
-function deserializeBoxTSImportTypeQualifiedName(pos) {
-  return deserializeTSImportTypeQualifiedName(int32[pos >> 2]);
-}
-
 function deserializeOptionTSMappedTypeModifierOperator(pos) {
   return uint8[pos] === 255 ? null : deserializeTSMappedTypeModifierOperator(pos);
-}
-
-function deserializeBoxTSExternalModuleReference(pos) {
-  return deserializeTSExternalModuleReference(int32[pos >> 2]);
 }
 
 function deserializeI32(pos) {
@@ -6854,96 +6025,104 @@ function deserializeOptionNameSpan(pos) {
 }
 
 function deserializeVecError(pos) {
-  let arr = [],
-    pos32 = pos >> 2;
+  let pos32 = pos >> 2,
+    len = int32[pos32 + 2];
+  if (len === 0) return [];
   pos = int32[pos32];
-  let endPos = pos + int32[pos32 + 2] * 80;
-  for (; pos !== endPos;) {
-    arr.push(deserializeError(pos));
+  let arr = Array(len);
+  for (let i = 0; i < len; i++) {
+    arr[i] = deserializeError(pos);
     pos += 80;
   }
   return arr;
 }
 
 function deserializeVecErrorLabel(pos) {
-  let arr = [],
-    pos32 = pos >> 2;
+  let pos32 = pos >> 2,
+    len = int32[pos32 + 2];
+  if (len === 0) return [];
   pos = int32[pos32];
-  let endPos = pos + int32[pos32 + 2] * 24;
-  for (; pos !== endPos;) {
-    arr.push(deserializeErrorLabel(pos));
+  let arr = Array(len);
+  for (let i = 0; i < len; i++) {
+    arr[i] = deserializeErrorLabel(pos);
     pos += 24;
   }
   return arr;
 }
 
 function deserializeVecStaticImport(pos) {
-  let arr = [],
-    pos32 = pos >> 2;
+  let pos32 = pos >> 2,
+    len = int32[pos32 + 2];
+  if (len === 0) return [];
   pos = int32[pos32];
-  let endPos = pos + int32[pos32 + 2] * 56;
-  for (; pos !== endPos;) {
-    arr.push(deserializeStaticImport(pos));
+  let arr = Array(len);
+  for (let i = 0; i < len; i++) {
+    arr[i] = deserializeStaticImport(pos);
     pos += 56;
   }
   return arr;
 }
 
 function deserializeVecStaticExport(pos) {
-  let arr = [],
-    pos32 = pos >> 2;
+  let pos32 = pos >> 2,
+    len = int32[pos32 + 2];
+  if (len === 0) return [];
   pos = int32[pos32];
-  let endPos = pos + (int32[pos32 + 2] << 5);
-  for (; pos !== endPos;) {
-    arr.push(deserializeStaticExport(pos));
+  let arr = Array(len);
+  for (let i = 0; i < len; i++) {
+    arr[i] = deserializeStaticExport(pos);
     pos += 32;
   }
   return arr;
 }
 
 function deserializeVecDynamicImport(pos) {
-  let arr = [],
-    pos32 = pos >> 2;
+  let pos32 = pos >> 2,
+    len = int32[pos32 + 2];
+  if (len === 0) return [];
   pos = int32[pos32];
-  let endPos = pos + (int32[pos32 + 2] << 4);
-  for (; pos !== endPos;) {
-    arr.push(deserializeDynamicImport(pos));
+  let arr = Array(len);
+  for (let i = 0; i < len; i++) {
+    arr[i] = deserializeDynamicImport(pos);
     pos += 16;
   }
   return arr;
 }
 
 function deserializeVecSpan(pos) {
-  let arr = [],
-    pos32 = pos >> 2;
+  let pos32 = pos >> 2,
+    len = int32[pos32 + 2];
+  if (len === 0) return [];
   pos = int32[pos32];
-  let endPos = pos + (int32[pos32 + 2] << 3);
-  for (; pos !== endPos;) {
-    arr.push(deserializeSpan(pos));
+  let arr = Array(len);
+  for (let i = 0; i < len; i++) {
+    arr[i] = deserializeSpan(pos);
     pos += 8;
   }
   return arr;
 }
 
 function deserializeVecImportEntry(pos) {
-  let arr = [],
-    pos32 = pos >> 2;
+  let pos32 = pos >> 2,
+    len = int32[pos32 + 2];
+  if (len === 0) return [];
   pos = int32[pos32];
-  let endPos = pos + int32[pos32 + 2] * 96;
-  for (; pos !== endPos;) {
-    arr.push(deserializeImportEntry(pos));
+  let arr = Array(len);
+  for (let i = 0; i < len; i++) {
+    arr[i] = deserializeImportEntry(pos);
     pos += 96;
   }
   return arr;
 }
 
 function deserializeVecExportEntry(pos) {
-  let arr = [],
-    pos32 = pos >> 2;
+  let pos32 = pos >> 2,
+    len = int32[pos32 + 2];
+  if (len === 0) return [];
   pos = int32[pos32];
-  let endPos = pos + int32[pos32 + 2] * 144;
-  for (; pos !== endPos;) {
-    arr.push(deserializeExportEntry(pos));
+  let arr = Array(len);
+  for (let i = 0; i < len; i++) {
+    arr[i] = deserializeExportEntry(pos);
     pos += 144;
   }
   return arr;

@@ -910,6 +910,45 @@ describe("error", () => {
 
     expect(raw.errors[0].codeframe).toBe(standard.errors[0].codeframe);
   });
+
+  it("preserves lazy raw-transfer comments across buffer reuse and unicode strings", () => {
+    const ret1 = parseRawSync(
+      "a.jsx",
+      "/* first 😀 */ const a_1 = '🚀', \\u0062 = <div>🐈</div>;",
+      {
+        experimentalRawTransfer: true,
+        range: true,
+      },
+    );
+    const ret2 = parseRawSync("b.js", "#!/usr/bin/env node\n// second 🌟\nconst b_2 = 2;", {
+      experimentalRawTransfer: true,
+    });
+
+    expect(ret1.comments).toBe(ret1.comments);
+    expect(ret1.comments).toEqual([
+      {
+        type: "Block",
+        value: " first 😀 ",
+        start: 0,
+        end: 14,
+        range: [0, 14],
+      },
+    ]);
+    expect(ret2.comments).toEqual([
+      {
+        type: "Line",
+        value: "/usr/bin/env node",
+        start: 0,
+        end: 19,
+      },
+      {
+        type: "Line",
+        value: " second 🌟",
+        start: 20,
+        end: 32,
+      },
+    ]);
+  });
 });
 
 describe("worker", () => {
