@@ -68,6 +68,61 @@ export class NodeArray extends Array {
     return new NodeArrayEntriesIterator(this);
   }
 
+  every(callbackFn, thisArg) {
+    const internal = this[ARRAY].#internal,
+      { length, stride, construct, ast } = internal;
+    let { pos } = internal;
+    for (let i = 0; i < length; i++) {
+      if (!callbackFn.call(thisArg, construct(pos, ast), i, this)) return false;
+      pos += stride;
+    }
+    return true;
+  }
+
+  some(callbackFn, thisArg) {
+    const internal = this[ARRAY].#internal,
+      { length, stride, construct, ast } = internal;
+    let { pos } = internal;
+    for (let i = 0; i < length; i++) {
+      if (callbackFn.call(thisArg, construct(pos, ast), i, this)) return true;
+      pos += stride;
+    }
+    return false;
+  }
+
+  find(callbackFn, thisArg) {
+    const internal = this[ARRAY].#internal,
+      { length, stride, construct, ast } = internal;
+    let { pos } = internal;
+    for (let i = 0; i < length; i++) {
+      const elem = construct(pos, ast);
+      if (callbackFn.call(thisArg, elem, i, this)) return elem;
+      pos += stride;
+    }
+    return void 0;
+  }
+
+  findIndex(callbackFn, thisArg) {
+    const internal = this[ARRAY].#internal,
+      { length, stride, construct, ast } = internal;
+    let { pos } = internal;
+    for (let i = 0; i < length; i++) {
+      if (callbackFn.call(thisArg, construct(pos, ast), i, this)) return i;
+      pos += stride;
+    }
+    return -1;
+  }
+
+  forEach(callbackFn, thisArg) {
+    const internal = this[ARRAY].#internal,
+      { length, stride, construct, ast } = internal;
+    let { pos } = internal;
+    for (let i = 0; i < length; i++) {
+      callbackFn.call(thisArg, construct(pos, ast), i, this);
+      pos += stride;
+    }
+  }
+
   // This method is overwritten with reference to `values` method below.
   // Defining dummy method here to prevent the later assignment altering the shape of class prototype.
   [Symbol.iterator]() {}
@@ -339,16 +394,22 @@ const PROXY_HANDLERS = {
  */
 function toIndex(key) {
   if (typeof key === "string") {
-    if (key === "0") return 0;
-    if (INDEX_REGEX.test(key)) {
-      const index = +key;
-      if (index < 4294967295) return index;
+    const len = key.length;
+    if (len === 0 || len > 10) return null;
+    const c0 = key.charCodeAt(0) - 48;
+    if (c0 < 0 || c0 > 9) return null;
+    if (len === 1) return c0;
+    if (c0 === 0) return null;
+    let index = c0;
+    for (let i = 1; i < len; i++) {
+      const d = key.charCodeAt(i) - 48;
+      if (d < 0 || d > 9) return null;
+      index = index * 10 + d;
     }
+    if (index < 4294967295) return index;
   }
   return null;
 }
-
-const INDEX_REGEX = /^[1-9]\d*$/;
 
 /**
  * Convert value to integer.

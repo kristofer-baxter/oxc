@@ -314,7 +314,9 @@ unsafe fn parse_raw_impl(
 
         // Convert spans to UTF-16
         span_converter.convert_program_and_comments(&mut program);
-        span_converter.convert_module_record(&mut module_record);
+        if module_record.has_module_syntax || !module_record.dynamic_imports.is_empty() {
+            span_converter.convert_module_record(&mut module_record);
+        }
         if let Some(mut converter) = span_converter.converter() {
             for error in &mut errors {
                 for label in &mut error.labels {

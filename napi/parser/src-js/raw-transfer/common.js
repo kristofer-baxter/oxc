@@ -174,7 +174,7 @@ const buffers = [],
   oldBuffers = [];
 let clearBuffersTimeout = null;
 
-const textEncoder = new TextEncoder();
+const { utf8Write } = Buffer.prototype;
 
 /**
  * Get a buffer (from cache if possible), and copy source text into it.
@@ -187,12 +187,6 @@ const textEncoder = new TextEncoder();
  *     (which may not be equal to `sourceText.length` if source contains non-ASCII characters).
  */
 export function prepareRaw(sourceText) {
-  // Cancel timeout for clearing buffers
-  if (clearBuffersTimeout !== null) {
-    clearTimeout(clearBuffersTimeout);
-    clearBuffersTimeout = null;
-  }
-
   // Revive any discarded buffers which have not yet been garbage collected
   if (oldBuffers.length > 0) {
     const revivedBuffers = [];
@@ -217,13 +211,7 @@ export function prepareRaw(sourceText) {
   if (maxSourceByteLen > ONE_GIB) throw new Error("Source text is too long");
   const sourceStartPos = ACTIVE_SIZE - maxSourceByteLen;
 
-  const sourceBuffer = new Uint8Array(
-    buffer.buffer,
-    buffer.byteOffset + sourceStartPos,
-    maxSourceByteLen,
-  );
-  const { read, written: sourceByteLen } = textEncoder.encodeInto(sourceText, sourceBuffer);
-  if (read !== sourceText.length) throw new Error("Failed to write source text into buffer");
+  const sourceByteLen = utf8Write.call(buffer, sourceText, sourceStartPos, maxSourceByteLen);
 
   return { buffer, sourceStartPos, sourceByteLen };
 }
@@ -249,9 +237,12 @@ export function isJsAst(buffer) {
 export function returnBufferToCache(buffer) {
   buffers.push(buffer);
 
-  if (clearBuffersTimeout !== null) clearTimeout(clearBuffersTimeout);
-  clearBuffersTimeout = setTimeout(clearBuffersCache, CLEAR_BUFFERS_TIMEOUT);
-  clearBuffersTimeout.unref();
+  if (clearBuffersTimeout !== null) {
+    clearBuffersTimeout.refresh();
+  } else {
+    clearBuffersTimeout = setTimeout(clearBuffersCache, CLEAR_BUFFERS_TIMEOUT);
+    clearBuffersTimeout.unref();
+  }
 }
 
 /**

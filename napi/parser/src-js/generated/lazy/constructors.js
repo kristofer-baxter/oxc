@@ -193,7 +193,10 @@ export class IdentifierName {
     const internal = this.#internal,
       cached = internal.$name;
     if (cached !== void 0) return cached;
-    return (internal.$name = constructStr(internal.pos + 16, internal.ast));
+    return (internal.$name =
+      internal.ast.buffer.int32[(internal.pos >> 2) + 4] >= internal.ast.sourceStartPos
+        ? internal.ast.sourceText.slice(this.start, this.end)
+        : constructStr(internal.pos + 16, internal.ast));
   }
 
   toJSON() {
@@ -241,7 +244,10 @@ export class IdentifierReference {
     const internal = this.#internal,
       cached = internal.$name;
     if (cached !== void 0) return cached;
-    return (internal.$name = constructStr(internal.pos + 16, internal.ast));
+    return (internal.$name =
+      internal.ast.buffer.int32[(internal.pos >> 2) + 4] >= internal.ast.sourceStartPos
+        ? internal.ast.sourceText.slice(this.start, this.end)
+        : constructStr(internal.pos + 16, internal.ast));
   }
 
   toJSON() {
@@ -289,7 +295,10 @@ export class BindingIdentifier {
     const internal = this.#internal,
       cached = internal.$name;
     if (cached !== void 0) return cached;
-    return (internal.$name = constructStr(internal.pos + 16, internal.ast));
+    return (internal.$name =
+      internal.ast.buffer.int32[(internal.pos >> 2) + 4] >= internal.ast.sourceStartPos
+        ? internal.ast.sourceText.slice(this.start, this.end)
+        : constructStr(internal.pos + 16, internal.ast));
   }
 
   toJSON() {
@@ -337,7 +346,10 @@ export class LabelIdentifier {
     const internal = this.#internal,
       cached = internal.$name;
     if (cached !== void 0) return cached;
-    return (internal.$name = constructStr(internal.pos + 16, internal.ast));
+    return (internal.$name =
+      internal.ast.buffer.int32[(internal.pos >> 2) + 4] >= internal.ast.sourceStartPos
+        ? internal.ast.sourceText.slice(this.start, this.end)
+        : constructStr(internal.pos + 16, internal.ast));
   }
 
   toJSON() {
@@ -5407,7 +5419,10 @@ export class PrivateIdentifier {
     const internal = this.#internal,
       cached = internal.$name;
     if (cached !== void 0) return cached;
-    return (internal.$name = constructStr(internal.pos + 16, internal.ast));
+    return (internal.$name =
+      internal.ast.buffer.int32[(internal.pos >> 2) + 4] >= internal.ast.sourceStartPos
+        ? internal.ast.sourceText.slice(this.start + 1, this.end)
+        : constructStr(internal.pos + 16, internal.ast));
   }
 
   toJSON() {
@@ -6685,7 +6700,10 @@ export class StringLiteral {
     const internal = this.#internal,
       cached = internal.$value;
     if (cached !== void 0) return cached;
-    return (internal.$value = constructJSStr(internal.pos + 16, internal.ast));
+    return (internal.$value =
+      internal.ast.buffer.int32[(internal.pos >> 2) + 4] >= internal.ast.sourceStartPos
+        ? internal.ast.sourceText.slice(this.start + 1, this.end - 1)
+        : constructJSStr(internal.pos + 16, internal.ast));
   }
 
   get raw() {
@@ -7707,7 +7725,10 @@ export class JSXIdentifier {
     const internal = this.#internal,
       cached = internal.$name;
     if (cached !== void 0) return cached;
-    return (internal.$name = constructStr(internal.pos + 16, internal.ast));
+    return (internal.$name =
+      internal.ast.buffer.int32[(internal.pos >> 2) + 4] >= internal.ast.sourceStartPos
+        ? internal.ast.sourceText.slice(this.start, this.end)
+        : constructStr(internal.pos + 16, internal.ast));
   }
 
   toJSON() {
@@ -7818,7 +7839,10 @@ export class JSXText {
     const internal = this.#internal,
       cached = internal.$value;
     if (cached !== void 0) return cached;
-    return (internal.$value = constructStr(internal.pos + 16, internal.ast));
+    return (internal.$value =
+      internal.ast.buffer.int32[(internal.pos >> 2) + 4] >= internal.ast.sourceStartPos
+        ? internal.ast.sourceText.slice(this.start, this.end)
+        : constructStr(internal.pos + 16, internal.ast));
   }
 
   get raw() {

@@ -105,8 +105,6 @@ function deserialize(buffer, sourceText, sourceStartPos, sourceByteLen, options)
   // Return buffer to cache, to be reused
   returnBufferToCache(buffer);
 
-  // We cannot lazily deserialize in the getters, because the buffer might be re-used to parse
-  // another file before the getter is called
   if (tokens !== null) {
     return {
       get program() {
@@ -127,20 +125,7 @@ function deserialize(buffer, sourceText, sourceStartPos, sourceByteLen, options)
     };
   }
 
-  return {
-    get program() {
-      return data.program;
-    },
-    get module() {
-      return data.module;
-    },
-    get comments() {
-      return data.comments;
-    },
-    get errors() {
-      return data.errors;
-    },
-  };
+  return data;
 }
 
 // `ESTreeKind` discriminants (set by Rust side)
@@ -181,11 +166,9 @@ function deserializeTokens(buffer, sourceText, isJs) {
 
   let pos = int32[TOKENS_OFFSET_POS_32];
   const len = int32[TOKENS_LEN_POS_32];
-  const endPos = pos + len * TOKEN_SIZE;
-
-  const tokens = [];
-  while (pos < endPos) {
-    tokens.push(deserializeToken(pos, int32, sourceText, isJs));
+  const tokens = new Array(len);
+  for (let i = 0; i < len; i++) {
+    tokens[i] = deserializeToken(pos, int32, sourceText, isJs);
     pos += TOKEN_SIZE;
   }
   return tokens;
