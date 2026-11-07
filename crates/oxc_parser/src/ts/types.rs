@@ -60,25 +60,14 @@ impl<'a, C: Config> ParserImpl<'a, C> {
                 | Kind::Object
                 | Kind::Symbol
                 | Kind::BigInt
-        ) && (kind == Kind::Void || !self.lexer.next_token_may_start_with(|b| b == b'.'))
-        {
+        ) {
             let start = self.cur_start();
-            let span = self.cur_token().span();
-            self.advance(kind);
-            let ty = match kind {
-                Kind::Void => TSType::new_ts_void_keyword(span, self),
-                Kind::String => TSType::new_ts_string_keyword(span, self),
-                Kind::Number => TSType::new_ts_number_keyword(span, self),
-                Kind::Boolean => TSType::new_ts_boolean_keyword(span, self),
-                Kind::Any => TSType::new_ts_any_keyword(span, self),
-                Kind::Unknown => TSType::new_ts_unknown_keyword(span, self),
-                Kind::Undefined => TSType::new_ts_undefined_keyword(span, self),
-                Kind::Null => TSType::new_ts_null_keyword(span, self),
-                Kind::Never => TSType::new_ts_never_keyword(span, self),
-                Kind::Object => TSType::new_ts_object_keyword(span, self),
-                Kind::Symbol => TSType::new_ts_symbol_keyword(span, self),
-                Kind::BigInt => TSType::new_ts_big_int_keyword(span, self),
-                _ => unreachable!(),
+            let ty = if kind == Kind::Void {
+                let span = self.cur_token().span();
+                self.advance(Kind::Void);
+                TSType::new_ts_void_keyword(span, self)
+            } else {
+                self.parse_keyword_type()
             };
             if !matches!(
                 self.cur_kind(),
@@ -303,16 +292,21 @@ impl<'a, C: Config> ParserImpl<'a, C> {
         self.parse_ts_type_parameters_impl(false)
     }
 
+    #[inline]
     fn parse_ts_type_parameters_impl(
         &mut self,
         allow_variance: bool,
     ) -> (Option<ArenaBox<'a, TSTypeParameterDeclaration<'a>>>, bool) {
-        if !self.is_ts {
+        if !self.is_ts || !self.at(Kind::LAngle) {
             return (None, false);
         }
-        if !self.at(Kind::LAngle) {
-            return (None, false);
-        }
+        self.parse_ts_type_parameters_worker(allow_variance)
+    }
+
+    fn parse_ts_type_parameters_worker(
+        &mut self,
+        allow_variance: bool,
+    ) -> (Option<ArenaBox<'a, TSTypeParameterDeclaration<'a>>>, bool) {
         let start = self.cur_start();
         let opening_span = self.cur_token().span();
         self.advance(Kind::LAngle);
@@ -587,15 +581,7 @@ impl<'a, C: Config> ParserImpl<'a, C> {
             | Kind::Never
             | Kind::Object
             // Parse `null` as `TSNullKeyword` instead of null literal to align with typescript eslint.
-            | Kind::Null => {
-                if self.lexer.next_token_may_start_with(|b| b == b'.')
-                    && self.lexer.peek_token().kind() == Kind::Dot
-                {
-                    self.parse_type_reference()
-                } else {
-                    self.parse_keyword_type()
-                }
-            }
+            | Kind::Null => self.parse_keyword_type(),
             // TODO: js doc types: `JSDocAllType`, `JSDocFunctionType`
             // Kind::StarEq => {
             // scanner.reScanAsteriskEqualsToken();
@@ -677,53 +663,35 @@ impl<'a, C: Config> ParserImpl<'a, C> {
 
     #[inline]
     fn parse_keyword_type(&mut self) -> TSType<'a> {
-        let span = self.cur_token().span();
-        match self.cur_kind() {
-            Kind::Any => {
-                self.advance(Kind::Any);
-                TSType::new_ts_any_keyword(span, self)
-            }
-            Kind::BigInt => {
-                self.advance(Kind::BigInt);
-                TSType::new_ts_big_int_keyword(span, self)
-            }
-            Kind::Boolean => {
-                self.advance(Kind::Boolean);
-                TSType::new_ts_boolean_keyword(span, self)
-            }
-            Kind::Never => {
-                self.advance(Kind::Never);
-                TSType::new_ts_never_keyword(span, self)
-            }
-            Kind::Number => {
-                self.advance(Kind::Number);
-                TSType::new_ts_number_keyword(span, self)
-            }
-            Kind::Object => {
-                self.advance(Kind::Object);
-                TSType::new_ts_object_keyword(span, self)
-            }
-            Kind::String => {
-                self.advance(Kind::String);
-                TSType::new_ts_string_keyword(span, self)
-            }
-            Kind::Symbol => {
-                self.advance(Kind::Symbol);
-                TSType::new_ts_symbol_keyword(span, self)
-            }
-            Kind::Undefined => {
-                self.advance(Kind::Undefined);
-                TSType::new_ts_undefined_keyword(span, self)
-            }
-            Kind::Unknown => {
-                self.advance(Kind::Unknown);
-                TSType::new_ts_unknown_keyword(span, self)
-            }
-            Kind::Null => {
-                self.advance(Kind::Null);
-                TSType::new_ts_null_keyword(span, self)
-            }
-            _ => self.unexpected(),
+        let token = self.cur_token();
+        // Escaped keywords are allowed as the first part of a qualified type name,
+        // but not as keyword types. Keep lookahead only for this uncommon case.
+        if token.escaped() && self.lexer.peek_token().kind() == Kind::Dot {
+            return self.parse_type_reference();
+        }
+        self.bump_any();
+        let span = token.span();
+        // A keyword and a qualified name both consume the first token, so decide
+        // between them afterwards instead of lexing the following token twice.
+        if self.at(Kind::Dot) {
+            let ident = IdentifierName::new(span, self.ident(self.token_source(&token)), self);
+            let name = TSTypeName::new_identifier_reference(ident.span, ident.name, self);
+            let name = self.parse_ts_qualified_type_name(span.start, name);
+            return self.parse_type_reference_with_name(span.start, name);
+        }
+        match token.kind() {
+            Kind::Any => TSType::new_ts_any_keyword(span, self),
+            Kind::BigInt => TSType::new_ts_big_int_keyword(span, self),
+            Kind::Boolean => TSType::new_ts_boolean_keyword(span, self),
+            Kind::Never => TSType::new_ts_never_keyword(span, self),
+            Kind::Number => TSType::new_ts_number_keyword(span, self),
+            Kind::Object => TSType::new_ts_object_keyword(span, self),
+            Kind::String => TSType::new_ts_string_keyword(span, self),
+            Kind::Symbol => TSType::new_ts_symbol_keyword(span, self),
+            Kind::Undefined => TSType::new_ts_undefined_keyword(span, self),
+            Kind::Unknown => TSType::new_ts_unknown_keyword(span, self),
+            Kind::Null => TSType::new_ts_null_keyword(span, self),
+            _ => unreachable!(),
         }
     }
 
@@ -1070,15 +1038,25 @@ impl<'a, C: Config> ParserImpl<'a, C> {
         None
     }
 
+    #[inline]
     pub(crate) fn parse_type_arguments_of_type_reference(
         &mut self,
     ) -> Option<ArenaBox<'a, TSTypeParameterInstantiation<'a>>> {
-        if matches!(
-            self.cur_kind(),
-            Kind::LAngle | Kind::ShiftLeft | Kind::LtEq | Kind::ShiftLeftEq
-        ) && !self.cur_token().is_on_new_line()
-            && self.re_lex_ts_l_angle()
+        if self.cur_token().is_on_new_line()
+            || !matches!(
+                self.cur_kind(),
+                Kind::LAngle | Kind::ShiftLeft | Kind::LtEq | Kind::ShiftLeftEq
+            )
         {
+            return None;
+        }
+        self.parse_type_arguments_of_type_reference_impl()
+    }
+
+    fn parse_type_arguments_of_type_reference_impl(
+        &mut self,
+    ) -> Option<ArenaBox<'a, TSTypeParameterInstantiation<'a>>> {
+        if self.re_lex_ts_l_angle() {
             let start = self.cur_start();
             let opening_span = self.cur_token().span();
             debug_assert!(self.at(Kind::LAngle));
