@@ -4,10 +4,10 @@ use std::{
     sync::OnceLock,
 };
 
+use oxc_simd::{Neon, cpu_version};
 use oxc_span::Span;
 
 use crate::{
-    cpu::{Neon, cpu_version},
     pipeline::lanes::Lanes,
     token::{TRIVIA_MAX, TRIVIA_MIN, is_trivia_byte, matches_tk, tk},
 };

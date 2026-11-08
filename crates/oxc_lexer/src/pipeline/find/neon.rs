@@ -1,9 +1,8 @@
 use std::arch::aarch64::*;
 
-use crate::{
-    cpu::{Neon, cpu_version},
-    pipeline::chunk::{load128, mm16_nibble, mm64_neon, veq128},
-};
+use oxc_simd::{Neon, cpu_version};
+
+use crate::pipeline::chunk::{load128, mm16_nibble, mm64_neon, veq128};
 
 /// First byte at or after `i` that is one of `needles`, or `n`.
 #[cpu_version(Neon)]

@@ -44,8 +44,9 @@ pub(super) fn bracket_bits(src: &[u8], base: usize, cpu: impl Cpu) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use oxc_simd::DynCpu;
+
     use super::bracket_bits;
-    use crate::cpu::DynCpu;
 
     #[test]
     fn bracket_bits_matches_all_256_bytes() {

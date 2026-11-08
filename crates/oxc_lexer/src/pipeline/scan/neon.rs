@@ -1,9 +1,8 @@
 use std::arch::aarch64::*;
 
-use crate::{
-    cpu::{Neon, cpu_version},
-    pipeline::chunk::{load128, mm16_nibble, veq128},
-};
+use oxc_simd::{Neon, cpu_version};
+
+use crate::pipeline::chunk::{load128, mm16_nibble, veq128};
 
 use super::common::lic_verify_at;
 
