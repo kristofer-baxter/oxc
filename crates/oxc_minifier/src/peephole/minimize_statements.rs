@@ -51,43 +51,66 @@ impl<'a> PeepholeOptimizations {
     /// ## MinimizeExitPoints:
     /// <https://github.com/google/closure-compiler/blob/v20240609/src/com/google/javascript/jscomp/MinimizeExitPoints.java>
     pub fn minimize_statements(stmts: &mut ArenaVec<'a, Statement<'a>>, ctx: &mut TraverseCtx<'a>) {
-        let mut new_stmts = ArenaVec::with_capacity_in(stmts.len(), ctx);
-        let mut old_stmts = stmts.take_in(ctx).into_iter();
+        if stmts.is_empty() {
+            return;
+        }
+        let mut old_vec = stmts.take_in(ctx);
+        let old_cap = old_vec.capacity();
+        // SAFETY: `old_vec` is non-empty (`!stmts.is_empty()`), so its buffer pointer is non-null.
+        let old_ptr = unsafe { std::ptr::NonNull::new_unchecked(old_vec.as_mut_ptr()) };
+
+        let empty_scratch = ArenaVec::new_in(&ctx.ast);
+        let mut new_stmts = std::mem::replace(&mut ctx.state.stmts_scratch, empty_scratch);
+        new_stmts.clear();
+        if new_stmts.capacity() == 0 {
+            new_stmts.reserve(old_vec.len().max(16));
+        } else {
+            new_stmts.reserve(old_vec.len());
+        }
+
         let mut is_control_flow_dead = false;
         let mut keep_var = KeepVar::new();
         let mut identity_drops = 0u32;
-        while let Some(stmt) = old_stmts.next() {
-            if is_control_flow_dead
-                && !stmt.is_module_declaration()
-                && !matches!(stmt.as_declaration(), Some(Declaration::FunctionDeclaration(_)))
-            {
-                // Harvest any `var` bindings so they re-emit at the end of
-                // the block (see `keep_var.get_variable_declaration_statement`
-                // below).
-                keep_var.visit_statement(&stmt);
-                // Re-flag the peephole loop so the next iteration runs with
-                // refreshed reference counts and the unused-declarator pass
-                // can remove bindings that this drop just orphaned (e.g.
-                // `var x = {}` after dropping `module.exports = x;`).
-                if dead_drop_mutates_ast(&stmt) {
-                    ctx.drop_statement(&stmt);
-                } else {
-                    identity_drops += 1;
+        {
+            let mut old_stmts = old_vec.into_iter();
+            while let Some(stmt) = old_stmts.next() {
+                if is_control_flow_dead
+                    && !stmt.is_module_declaration()
+                    && !matches!(stmt.as_declaration(), Some(Declaration::FunctionDeclaration(_)))
+                {
+                    // Harvest any `var` bindings so they re-emit at the end of
+                    // the block (see `keep_var.get_variable_declaration_statement`
+                    // below).
+                    keep_var.visit_statement(&stmt);
+                    // Re-flag the peephole loop so the next iteration runs with
+                    // refreshed reference counts and the unused-declarator pass
+                    // can remove bindings that this drop just orphaned (e.g.
+                    // `var x = {}` after dropping `module.exports = x;`).
+                    if dead_drop_mutates_ast(&stmt) {
+                        ctx.drop_statement(&stmt);
+                    } else {
+                        identity_drops += 1;
+                    }
+                    continue; // drop: `stmt` is intentionally not pushed into `new_stmts`.
                 }
-                continue; // drop: `stmt` is intentionally not pushed into `new_stmts`.
-            }
-            Self::minimize_statement(stmt, &mut old_stmts, &mut new_stmts, ctx);
-            // A statement that never completes normally — a direct jump, a
-            // kept block ending in a jump, an if/else or try/catch where
-            // every branch jumps — makes the rest of the list unreachable.
-            // https://github.com/rolldown/rolldown/issues/10184
-            if !is_control_flow_dead
-                && !old_stmts.as_slice().is_empty()
-                && new_stmts.last().is_some_and(Statement::is_terminated)
-            {
-                is_control_flow_dead = true;
+                Self::minimize_statement(stmt, &mut old_stmts, &mut new_stmts, ctx);
+                // A statement that never completes normally — a direct jump, a
+                // kept block ending in a jump, an if/else or try/catch where
+                // every branch jumps — makes the rest of the list unreachable.
+                // https://github.com/rolldown/rolldown/issues/10184
+                if !is_control_flow_dead
+                    && !old_stmts.as_slice().is_empty()
+                    && new_stmts.last().is_some_and(Statement::is_terminated)
+                {
+                    is_control_flow_dead = true;
+                }
             }
         }
+        // SAFETY: `old_stmts` has been dropped above, exhausting all elements from `old_ptr`,
+        // and `Statement` does not implement `Drop`. `old_ptr` and `old_cap` came from `old_vec`
+        // in the same arena `&ctx.ast` and are no longer aliased.
+        let mut old_vec = unsafe { ArenaVec::from_raw_parts_in(old_ptr, 0, old_cap, &ctx.ast) };
+
         if let Some(stmt) = keep_var.get_variable_declaration_statement(&ctx.ast) {
             match Self::remove_unused_variable_declaration(stmt, ctx) {
                 // Multiple identity-dropped `var x;`s coalesce into a single
@@ -114,7 +137,19 @@ impl<'a> PeepholeOptimizations {
             let dropped = new_stmts.pop().unwrap();
             ctx.drop_statement(&dropped);
         }
-        *stmts = new_stmts;
+
+        if new_stmts.len() <= old_vec.capacity() {
+            old_vec.extend(new_stmts.drain(..));
+            *stmts = old_vec;
+            if new_stmts.capacity() > ctx.state.stmts_scratch.capacity() {
+                ctx.state.stmts_scratch = new_stmts;
+            }
+        } else {
+            *stmts = new_stmts;
+            if old_vec.capacity() > ctx.state.stmts_scratch.capacity() {
+                ctx.state.stmts_scratch = old_vec;
+            }
+        }
     }
 
     /// Some parsers cannot parse long conditional expressions.
@@ -231,8 +266,11 @@ impl<'a> PeepholeOptimizations {
             ctx,
         );
 
-        // If `join_vars` is off, but there are unused declarators ... just join them to make our code simpler.
-        if !ctx.options().join_vars
+        let can_merge_with_prev = matches!(
+            result.last(),
+            Some(Statement::VariableDeclaration(prev_var_decl)) if var_decl.kind == prev_var_decl.kind
+        );
+        if (!ctx.options().join_vars || !can_merge_with_prev)
             && var_decl
                 .declarations
                 .iter()
@@ -242,9 +280,7 @@ impl<'a> PeepholeOptimizations {
             return;
         }
 
-        if let Some(Statement::VariableDeclaration(prev_var_decl)) = result.last()
-            && var_decl.kind == prev_var_decl.kind
-        {
+        if can_merge_with_prev {
             ctx.notice_change();
         }
         let VariableDeclaration { span, kind, declarations, declare, .. } = var_decl.unbox();
@@ -269,6 +305,10 @@ impl<'a> PeepholeOptimizations {
                 if let Some(Statement::VariableDeclaration(prev_var_decl)) = result.last_mut()
                     && kind == prev_var_decl.kind
                 {
+                    let len = prev_var_decl.declarations.len();
+                    if len == prev_var_decl.declarations.capacity() && len < 4 {
+                        prev_var_decl.declarations.reserve(4 - len);
+                    }
                     prev_var_decl.declarations.push(decl);
                     continue;
                 }

@@ -112,8 +112,9 @@ impl Codegen<'_> {
         }
     }
 
+    #[inline]
     pub(crate) fn has_comment(&self, start: u32) -> bool {
-        self.comments.contains_key(&start)
+        !self.comments.is_empty() && self.comments.contains_key(&start)
     }
 
     /// Emit a pure / no-side-effects annotation comment for the AST node at

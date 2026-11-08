@@ -4,7 +4,7 @@ use rustc_hash::{FxBuildHasher, FxHashMap};
 use oxc_allocator::GetAddress;
 use oxc_ast::{AstKind, ast::*};
 use oxc_ecmascript::{BoundNames, IsSimpleParameterList, PropName};
-use oxc_span::{Span, best_match};
+use oxc_span::{GetSpan, Span, best_match};
 use oxc_str::Ident;
 use oxc_syntax::{
     class::{ClassId, ElementKind},
@@ -57,7 +57,10 @@ pub fn check_unresolved_exports(program: &Program<'_>, ctx: &SemanticBuilder<'_>
 /// also occurs in the VarDeclaredNames or LexicallyDeclaredNames of ModuleItemList.
 /// <https://tc39.es/ecma262/#sec-imports-static-semantics-early-errors>
 pub fn check_import_value_redeclarations(ctx: &SemanticBuilder<'_>) {
-    if !ctx.source_type.is_module() || ctx.source_type.is_typescript() {
+    if !ctx.source_type.is_module()
+        || ctx.source_type.is_typescript()
+        || !ctx.scoping.has_symbol_redeclarations()
+    {
         return;
     }
 
@@ -83,22 +86,22 @@ pub fn check_import_value_redeclarations(ctx: &SemanticBuilder<'_>) {
 
 pub fn check_duplicate_class_elements(ctx: &SemanticBuilder<'_>) {
     let classes = &ctx.class_table_builder.classes;
-    let is_typescript = ctx.source_type.is_typescript();
-    classes.iter_enumerated().for_each(|(class_id, _)| {
+    if classes.len() == 0 {
+        return;
+    }
+    let is_ts = ctx.source_type.is_typescript();
+    let mut defined_elements = FxHashMap::with_hasher(FxBuildHasher);
+    for (class_id, _) in classes.iter_enumerated() {
         let elements = &classes.elements[class_id];
         if elements.len() < 2 {
-            return;
+            continue;
         }
-        let mut defined_elements = None;
+        defined_elements.clear();
         for (element_id, element) in elements.iter_enumerated() {
-            // JavaScript permits duplicate public names. Constructors are checked separately.
-            if !element.is_private && !is_typescript {
+            // In JavaScript, public class elements cannot produce duplicate errors.
+            if !is_ts && !element.is_private {
                 continue;
             }
-            // All-public JavaScript classes need no duplicate-name map.
-            let defined_elements = defined_elements.get_or_insert_with(|| {
-                FxHashMap::with_capacity_and_hasher(elements.len(), FxBuildHasher)
-            });
             // Public and private names belong to separate namespaces.
             let previous =
                 defined_elements.entry((&element.name, element.is_private)).or_insert([None; 2]);
@@ -164,10 +167,51 @@ pub fn check_duplicate_class_elements(ctx: &SemanticBuilder<'_>) {
                 }
             }
         }
-    });
+    }
 }
 
+const CHECKED_IDENT_MASK_BY_LEN: [u32; 11] = [
+    0,
+    0,
+    0,
+    1 << (b'l' - b'a'),                          // 3: "let"
+    0,                                           // 4: none
+    1 | (1 << (b'y' - b'a')),                    // 5: "await", "yield"
+    (1 << (b'p' - b'a')) | (1 << (b's' - b'a')), // 6: "public", "static"
+    1 << (b'p' - b'a'),                          // 7: "package", "private"
+    0,                                           // 8: none
+    (1 << (b'i' - b'a')) | (1 << (b'p' - b'a')), // 9: "interface", "protected"
+    1 << (b'i' - b'a'),                          // 10: "implements"
+];
+
+#[inline]
+fn may_be_checked_ident(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    let len = bytes.len();
+    if !(3..=10).contains(&len) {
+        return false;
+    }
+    let idx = bytes[0].wrapping_sub(b'a');
+    idx < 26 && (CHECKED_IDENT_MASK_BY_LEN[len] & (1 << idx)) != 0
+}
+
+#[inline]
 pub fn check_identifier(name: &str, span: Span, ctx: &SemanticBuilder<'_>) {
+    if may_be_checked_ident(name) {
+        check_identifier_slow(name, span, ctx, false);
+    }
+}
+
+#[inline]
+pub fn check_identifier_leaf(name: &str, span: Span, ctx: &SemanticBuilder<'_>) {
+    if may_be_checked_ident(name) {
+        check_identifier_slow(name, span, ctx, true);
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn check_identifier_slow(name: &str, span: Span, ctx: &SemanticBuilder<'_>, leaf_not_pushed: bool) {
     match name {
         "await" => {
             if ctx.in_ambient_context() {
@@ -193,14 +237,18 @@ pub fn check_identifier(name: &str, span: Span, ctx: &SemanticBuilder<'_>) {
                 return;
             }
             // It is a Syntax Error if this phrase is contained in strict mode code and the StringValue of IdentifierName is: "implements", "interface", "let", "package", "private", "protected", "public", "static", or "yield".
-            let context =
-                if ctx.ancestry().ancestor_kinds().any(|kind| matches!(kind, AstKind::Class(_))) {
-                    diagnostics::ReservedKeywordContext::Class
-                } else if ctx.source_type.is_module() {
-                    diagnostics::ReservedKeywordContext::Module
-                } else {
-                    diagnostics::ReservedKeywordContext::StrictMode
-                };
+            let start = if leaf_not_pushed { None } else { Some(ctx.ancestry().parent_node_id()) };
+            let context = if ctx
+                .ancestry()
+                .ancestor_kinds_from(start)
+                .any(|kind| matches!(kind, AstKind::Class(_)))
+            {
+                diagnostics::ReservedKeywordContext::Class
+            } else if ctx.source_type.is_module() {
+                diagnostics::ReservedKeywordContext::Module
+            } else {
+                diagnostics::ReservedKeywordContext::StrictMode
+            };
             ctx.error(diagnostics::reserved_keyword(name, span, context));
         }
         _ => {}
@@ -209,8 +257,10 @@ pub fn check_identifier(name: &str, span: Span, ctx: &SemanticBuilder<'_>) {
 
 fn unexpected_identifier_assign_context(
     ctx: &SemanticBuilder<'_>,
+    leaf_not_pushed: bool,
 ) -> diagnostics::UnexpectedIdentifierAssignContext {
-    if ctx.ancestry().ancestor_kinds().any(|kind| matches!(kind, AstKind::Class(_))) {
+    let start = if leaf_not_pushed { None } else { Some(ctx.ancestry().parent_node_id()) };
+    if ctx.ancestry().ancestor_kinds_from(start).any(|kind| matches!(kind, AstKind::Class(_))) {
         diagnostics::UnexpectedIdentifierAssignContext::Class
     } else if ctx.source_type.is_module() {
         diagnostics::UnexpectedIdentifierAssignContext::Module
@@ -219,7 +269,37 @@ fn unexpected_identifier_assign_context(
     }
 }
 
+#[inline]
 pub fn check_binding_identifier(ident: &BindingIdentifier, ctx: &SemanticBuilder<'_>) {
+    let bytes = ident.name.as_bytes();
+    let len = bytes.len();
+    if (len == 3 && bytes[0] == b'l' && bytes[1] == b'e')
+        || (len == 4 && bytes[0] == b'e' && bytes[1] == b'v')
+        || (len == 9 && bytes[0] == b'a' && bytes[1] == b'r')
+    {
+        check_binding_identifier_slow(ident, ctx, false);
+    }
+}
+
+#[inline]
+pub fn check_binding_identifier_leaf(ident: &BindingIdentifier, ctx: &SemanticBuilder<'_>) {
+    let bytes = ident.name.as_bytes();
+    let len = bytes.len();
+    if (len == 3 && bytes[0] == b'l' && bytes[1] == b'e')
+        || (len == 4 && bytes[0] == b'e' && bytes[1] == b'v')
+        || (len == 9 && bytes[0] == b'a' && bytes[1] == b'r')
+    {
+        check_binding_identifier_slow(ident, ctx, true);
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn check_binding_identifier_slow(
+    ident: &BindingIdentifier,
+    ctx: &SemanticBuilder<'_>,
+    leaf_not_pushed: bool,
+) {
     // `.d.ts` files do not generate runtime bindings, so TypeScript permits `eval` and
     // `arguments` as binding identifiers even when the declaration file is a module.
     if ctx.source_type.is_typescript_definition() {
@@ -241,11 +321,19 @@ pub fn check_binding_identifier(ident: &BindingIdentifier, ctx: &SemanticBuilder
             // declare function g({eval, arguments}: {eval: number, arguments: number}): number; // Error
             // declare function h([eval, arguments]: [number, number]): number; // Error
 
-            let parent = ctx.ancestry().parent_kind();
+            let parent = if leaf_not_pushed {
+                ctx.ancestry().current_kind()
+            } else {
+                ctx.ancestry().parent_kind()
+            };
             // Direct rest parameters and destructuring rest elements share the same AST kind.
             let is_direct_rest_parameter = matches!(parent, AstKind::BindingRestElement(_))
                 && matches!(
-                    ctx.ancestry().ancestor_kinds().nth(1),
+                    if leaf_not_pushed {
+                        ctx.ancestry().ancestor_kinds().next()
+                    } else {
+                        ctx.ancestry().ancestor_kinds().nth(1)
+                    },
                     Some(AstKind::FormalParameterRest(_))
                 );
             let is_ok = ctx.in_ambient_context()
@@ -263,14 +351,18 @@ pub fn check_binding_identifier(ident: &BindingIdentifier, ctx: &SemanticBuilder
                 ctx.error(diagnostics::unexpected_identifier_assign(
                     &ident.name,
                     ident.span,
-                    unexpected_identifier_assign_context(ctx),
+                    unexpected_identifier_assign_context(ctx, leaf_not_pushed),
                 ));
             }
         }
         "let" if !ctx.strict_mode() => {
             // LexicalDeclaration : LetOrConst BindingList ;
             // * It is a Syntax Error if the BoundNames of BindingList contains "let".
-            for node_kind in ctx.ancestry().ancestor_kinds() {
+            for node_kind in ctx.ancestry().ancestor_kinds_from(if leaf_not_pushed {
+                None
+            } else {
+                Some(ctx.ancestry().parent_node_id())
+            }) {
                 match node_kind {
                     AstKind::VariableDeclaration(decl) => {
                         if decl.kind.is_lexical() {
@@ -290,7 +382,35 @@ pub fn check_binding_identifier(ident: &BindingIdentifier, ctx: &SemanticBuilder
     }
 }
 
+#[inline]
 pub fn check_identifier_reference(ident: &IdentifierReference, ctx: &SemanticBuilder<'_>) {
+    let bytes = ident.name.as_bytes();
+    let len = bytes.len();
+    if (len == 4 && bytes[0] == b'e' && bytes[1] == b'v')
+        || (len == 9 && bytes[0] == b'a' && bytes[1] == b'r')
+    {
+        check_identifier_reference_slow(ident, ctx, false);
+    }
+}
+
+#[inline]
+pub fn check_identifier_reference_leaf(ident: &IdentifierReference, ctx: &SemanticBuilder<'_>) {
+    let bytes = ident.name.as_bytes();
+    let len = bytes.len();
+    if (len == 4 && bytes[0] == b'e' && bytes[1] == b'v')
+        || (len == 9 && bytes[0] == b'a' && bytes[1] == b'r')
+    {
+        check_identifier_reference_slow(ident, ctx, true);
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn check_identifier_reference_slow(
+    ident: &IdentifierReference,
+    ctx: &SemanticBuilder<'_>,
+    leaf_not_pushed: bool,
+) {
     // `.d.ts` files are allowed to use `eval` and `arguments` as identifier references
     if ctx.source_type.is_typescript_definition() {
         return;
@@ -307,7 +427,7 @@ pub fn check_identifier_reference(ident: &IdentifierReference, ctx: &SemanticBui
         return ctx.error(diagnostics::unexpected_identifier_assign(
             &ident.name,
             ident.span,
-            unexpected_identifier_assign_context(ctx),
+            unexpected_identifier_assign_context(ctx, leaf_not_pushed),
         ));
     }
 
@@ -317,8 +437,14 @@ pub fn check_identifier_reference(ident: &IdentifierReference, ctx: &SemanticBui
     //   It is a Syntax Error if ContainsArguments of ClassStaticBlockStatementList is true.
 
     if ident.name == "arguments" && ctx.class_table_builder.current_class_id.is_some() {
-        let mut previous_node_address = ctx.ancestry().current_address();
-        for node_kind in ctx.ancestry().ancestor_kinds() {
+        let start = if leaf_not_pushed { None } else { Some(ctx.ancestry().parent_node_id()) };
+        let mut previous_node_address = if leaf_not_pushed {
+            use oxc_allocator::UnstableAddress;
+            ident.unstable_address()
+        } else {
+            ctx.ancestry().current_address()
+        };
+        for node_kind in ctx.ancestry().ancestor_kinds_from(start) {
             match node_kind {
                 AstKind::Function(_) => break,
                 AstKind::PropertyDefinition(prop)
@@ -418,76 +544,92 @@ pub fn check_number_literal(lit: &NumericLiteral, ctx: &SemanticBuilder<'_>) {
 const MIN_STRING_SIZE_FOR_BATCH_CHECK: usize = 16;
 
 pub fn check_string_literal(lit: &StringLiteral, ctx: &SemanticBuilder<'_>) {
+    check_string_literal_impl(lit, ctx, false);
+}
+
+#[inline]
+pub fn check_string_literal_leaf(lit: &StringLiteral, ctx: &SemanticBuilder<'_>) {
+    check_string_literal_impl(lit, ctx, true);
+}
+
+#[inline]
+fn check_string_literal_impl(
+    lit: &StringLiteral,
+    ctx: &SemanticBuilder<'_>,
+    leaf_not_pushed: bool,
+) {
     // 12.9.4.1 Static Semantics: Early Errors
     // EscapeSequence ::
     //   legacy_octalEscapeSequence
     //   non_octal_decimal_escape_sequence
     // It is a Syntax Error if the source text matched by this production is strict mode code.
-    if !ctx.strict_mode() || matches!(ctx.ancestry().parent_kind(), AstKind::JSXAttribute(_)) {
+    // Quotes contribute two bytes, and every escape contracts the cooked WTF-8 value.
+    // Equal content lengths therefore prove that there are no escapes to check.
+    if (lit.span.size() as usize) == lit.value.len() + 2 || !ctx.strict_mode() {
+        return;
+    }
+    let parent_kind =
+        if leaf_not_pushed { ctx.ancestry().current_kind() } else { ctx.ancestry().parent_kind() };
+    if matches!(parent_kind, AstKind::JSXAttribute(_)) {
         return;
     }
     let raw = lit.span.source_text(ctx.source_text);
     let raw_len = raw.len();
-    // Quotes contribute two bytes, and every escape contracts the cooked WTF-8 value.
-    // Equal content lengths therefore prove that there are no escapes to check.
-    if raw_len != lit.value.len() + 2 {
-        if raw_len >= MIN_STRING_SIZE_FOR_BATCH_CHECK {
-            let raw_bytes = raw.as_bytes();
-            // Exclude the last byte (closing quote) from the search haystack.
-            // This ensures any backslash found has at least one byte following it.
-            let haystack = &raw_bytes[..raw_len - 1];
-            let mut skip_next_backslash = false;
-            for backslash_index in memchr_iter(b'\\', haystack) {
-                if skip_next_backslash {
-                    skip_next_backslash = false;
-                    continue;
+    if raw_len >= MIN_STRING_SIZE_FOR_BATCH_CHECK {
+        let raw_bytes = raw.as_bytes();
+        // Exclude the last byte (closing quote) from the search haystack.
+        // This ensures any backslash found has at least one byte following it.
+        let haystack = &raw_bytes[..raw_len - 1];
+        let mut skip_next_backslash = false;
+        for backslash_index in memchr_iter(b'\\', haystack) {
+            if skip_next_backslash {
+                skip_next_backslash = false;
+                continue;
+            }
+            debug_assert!(
+                backslash_index + 1 < raw_bytes.len(),
+                "backslash at index {} has no following byte in string of length {}",
+                backslash_index,
+                raw_bytes.len()
+            );
+            // SAFETY: We search `haystack` which excludes the last byte, so any backslash
+            // found is at index < raw_len - 1, meaning backslash_index + 1 < raw_len.
+            let next_byte = unsafe { *raw_bytes.get_unchecked(backslash_index + 1) };
+            match next_byte {
+                b'\\' => {
+                    // Escaped backslash - skip the next backslash in memchr results
+                    skip_next_backslash = true;
                 }
-                debug_assert!(
-                    backslash_index + 1 < raw_bytes.len(),
-                    "backslash at index {} has no following byte in string of length {}",
-                    backslash_index,
-                    raw_bytes.len()
-                );
-                // SAFETY: We search `haystack` which excludes the last byte, so any backslash
-                // found is at index < raw_len - 1, meaning backslash_index + 1 < raw_len.
-                let next_byte = unsafe { *raw_bytes.get_unchecked(backslash_index + 1) };
-                match next_byte {
-                    b'\\' => {
-                        // Escaped backslash - skip the next backslash in memchr results
-                        skip_next_backslash = true;
-                    }
-                    b'0' => {
-                        let following_byte = raw_bytes.get(backslash_index + 2);
-                        if following_byte.is_some_and(u8::is_ascii_digit) {
-                            return ctx.error(diagnostics::legacy_octal(lit.span));
-                        }
-                    }
-                    b'1'..=b'7' => {
+                b'0' => {
+                    let following_byte = raw_bytes.get(backslash_index + 2);
+                    if following_byte.is_some_and(u8::is_ascii_digit) {
                         return ctx.error(diagnostics::legacy_octal(lit.span));
                     }
-                    b'8'..=b'9' => {
+                }
+                b'1'..=b'7' => {
+                    return ctx.error(diagnostics::legacy_octal(lit.span));
+                }
+                b'8'..=b'9' => {
+                    return ctx.error(diagnostics::non_octal_decimal_escape_sequence(lit.span));
+                }
+                _ => {}
+            }
+        }
+    } else {
+        let mut bytes = raw.bytes().peekable();
+        while let Some(b) = bytes.next() {
+            if b == b'\\' {
+                match bytes.next() {
+                    Some(b'0') if bytes.peek().is_some_and(u8::is_ascii_digit) => {
+                        return ctx.error(diagnostics::legacy_octal(lit.span));
+                    }
+                    Some(b'1'..=b'7') => {
+                        return ctx.error(diagnostics::legacy_octal(lit.span));
+                    }
+                    Some(b'8'..=b'9') => {
                         return ctx.error(diagnostics::non_octal_decimal_escape_sequence(lit.span));
                     }
                     _ => {}
-                }
-            }
-        } else {
-            let mut bytes = raw.bytes().peekable();
-            while let Some(b) = bytes.next() {
-                if b == b'\\' {
-                    match bytes.next() {
-                        Some(b'0') if bytes.peek().is_some_and(u8::is_ascii_digit) => {
-                            return ctx.error(diagnostics::legacy_octal(lit.span));
-                        }
-                        Some(b'1'..=b'7') => {
-                            return ctx.error(diagnostics::legacy_octal(lit.span));
-                        }
-                        Some(b'8'..=b'9') => {
-                            return ctx
-                                .error(diagnostics::non_octal_decimal_escape_sequence(lit.span));
-                        }
-                        _ => {}
-                    }
                 }
             }
         }
@@ -583,6 +725,9 @@ pub fn check_variable_declarator_redeclaration(
     decl: &VariableDeclarator,
     ctx: &SemanticBuilder<'_>,
 ) {
+    if !ctx.scoping.has_symbol_redeclarations() {
+        return;
+    }
     let AstKind::VariableDeclaration(declaration) = ctx.ancestry().parent_kind() else {
         unreachable!();
     };
@@ -943,8 +1088,12 @@ pub fn check_class(class: &Class, ctx: &SemanticBuilder<'_>) {
 pub fn check_super(sup: &Super, ctx: &SemanticBuilder<'_>) {
     // `Some` for `super()`, `None` for `super.foo` / `super.bar()` etc
     let super_call_span = match ctx.ancestry().parent_kind() {
-        AstKind::CallExpression(expr) => Some(expr.span),
-        AstKind::NewExpression(expr) => Some(expr.span),
+        AstKind::CallExpression(expr) if matches!(&expr.callee, Expression::Super(s) if s.span == sup.span) => {
+            Some(expr.span)
+        }
+        AstKind::NewExpression(expr) if matches!(&expr.callee, Expression::Super(s) if s.span == sup.span) => {
+            Some(expr.span)
+        }
         _ => None,
     };
 
@@ -1075,8 +1224,7 @@ pub fn check_super(sup: &Super, ctx: &SemanticBuilder<'_>) {
                 previous_scope_id = Some(scope_id);
 
                 // We're now in the parent class
-                let parent_class_id =
-                    ctx.class_table_builder.classes.parent_ids.get(&class_id).copied();
+                let parent_class_id = ctx.class_table_builder.classes.parent_ids[class_id];
                 (class_scope_id, class_id) = get_class_details(parent_class_id, ctx);
 
                 continue 'scopes;
@@ -1227,12 +1375,20 @@ pub fn check_object_expression(obj_expr: &ObjectExpression, ctx: &SemanticBuilde
         if let ObjectPropertyKind::ObjectProperty(obj_prop) = prop {
             // Skip if not a property definition production:
             // PropertyDefinition : PropertyName : AssignmentExpression
-            if obj_prop.kind != PropertyKind::Init || obj_prop.method {
+            if obj_prop.kind != PropertyKind::Init
+                || obj_prop.method
+                || obj_prop.shorthand
+                || obj_prop.computed
+            {
                 continue;
             }
-            if let Some((prop_name, span)) = prop.prop_name()
-                && prop_name == "__proto__"
-            {
+            let is_proto = match &obj_prop.key {
+                PropertyKey::StaticIdentifier(id) => id.name == oxc_str::static_ident!("__proto__"),
+                PropertyKey::StringLiteral(s) => s.value == "__proto__",
+                _ => false,
+            };
+            if is_proto {
+                let span = obj_prop.key.span();
                 if let Some(prev_span) = prev_proto {
                     ctx.error(diagnostics::redeclaration("__proto__", prev_span, span));
                 }

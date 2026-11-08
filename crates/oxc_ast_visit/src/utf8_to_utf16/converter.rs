@@ -1,6 +1,6 @@
 use std::cmp::min;
 
-use oxc_ast::ast::Program;
+use oxc_ast::ast::{Comment, Program};
 use oxc_span::Span;
 use oxc_syntax::module_record::VisitMutModuleRecord;
 
@@ -287,6 +287,41 @@ impl<'t> Utf8ToUtf16Converter<'t> {
     #[inline] // Because it just delegates
     pub fn convert_program(&mut self, program: &mut Program<'_>) {
         self.visit_program(program);
+    }
+
+    /// Returns the end of the initial ASCII-only prefix when offsets in `0..prefix_end` require no
+    /// adjustment (`utf16_difference == 0`).
+    #[inline]
+    #[cfg_attr(feature = "conformance", expect(clippy::unused_self))]
+    pub(crate) fn ascii_prefix_end(&self) -> u32 {
+        #[cfg(feature = "conformance")]
+        {
+            0
+        }
+        #[cfg(not(feature = "conformance"))]
+        {
+            if self.index == 0
+                && self.range_start_utf8 == 0
+                && self.range_start_utf16 == 0
+                && self.translations.len() >= 2
+                && self.translations[1].utf16_difference < self.translations[1].utf8_offset
+            {
+                self.range_len_utf8
+            } else {
+                0
+            }
+        }
+    }
+
+    /// Convert all spans in comments to UTF-16.
+    pub fn convert_comments(&mut self, comments: &mut [Comment]) {
+        for comment in comments {
+            let ascii_end = self.ascii_prefix_end();
+            if ascii_end > 0 && comment.span.start < ascii_end && comment.span.end < ascii_end {
+                continue;
+            }
+            self.convert_span(&mut comment.span);
+        }
     }
 
     /// Convert [`Span`] from UTF-8 offsets to UTF-16 offsets.

@@ -107,6 +107,10 @@ benchmark:
 benchmark-one *args:
   cargo benchmark --bench {{args}} --no-default-features --features {{ if args == "linter" { "linter" } else { "compiler" } }}
 
+# Run the performance & benchmark integrity gate (static invariants, allocs, semantic parity, and A/B benchmarks)
+perf-gate *args='':
+  node .github/scripts/perf-gate.js {{args}}
+
 # ==================== TESTING & CONFORMANCE ====================
 
 # Run all conformance tests

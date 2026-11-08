@@ -155,6 +155,13 @@ impl<'a, C: Config> ParserImpl<'a, C> {
                 }
             }
             _ => {
+                if !second.is_binding_identifier()
+                    && second != Kind::This
+                    && !second.is_modifier_kind()
+                {
+                    return Tristate::False;
+                }
+
                 let third = self.lexer.next_token().kind();
 
                 // Check for "(xxx yyy", where xxx is a modifier and yyy is an identifier. This

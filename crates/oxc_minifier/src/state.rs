@@ -108,6 +108,11 @@ pub struct MinifierState<'a> {
     /// Per-pass change accumulator populated by typed mutation helpers and
     /// consumed by `compression_pass` after Normalize and every peephole pass.
     pub(crate) pass_changes: PassChanges<'a>,
+
+    /// Reusable scratch buffer for `PeepholeOptimizations::minimize_statements`
+    /// so statement lists can be minimized in place without reallocating in the
+    /// bump arena on every pass.
+    pub(crate) stmts_scratch: oxc_allocator::Vec<'a, oxc_ast::ast::Statement<'a>>,
 }
 
 impl<'a> MinifierState<'a> {
@@ -129,6 +134,7 @@ impl<'a> MinifierState<'a> {
                 this_initialized_at: None,
             }),
             pass_changes: PassChanges::new(scoping.references_len(), allocator),
+            stmts_scratch: oxc_allocator::Vec::new_in(&allocator),
         }
     }
 

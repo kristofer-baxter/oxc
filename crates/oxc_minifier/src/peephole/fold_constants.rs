@@ -1003,7 +1003,8 @@ impl<'a> PeepholeOptimizations {
         // ran in an `.any()` pre-scan and then again in the drain loop) and collect the inline-able
         // expressions as `(index, value)`. Bail out cheaply when there is nothing to inline, leaving
         // `t.expressions` untouched (no drain, no allocation — `inline_exprs` only allocates on push).
-        let mut inline_exprs = Vec::new();
+        let mut first_inline: Option<(usize, JSStr<'a>)> = None;
+        let mut more_inline: Vec<(usize, JSStr<'a>)> = Vec::new();
         for (idx, expr) in t.expressions.iter().enumerate() {
             if expr.may_have_side_effects(ctx) {
                 continue;
@@ -1011,29 +1012,36 @@ impl<'a> PeepholeOptimizations {
             let Some(value) = evaluate_to_js_string(expr, ctx) else {
                 continue;
             };
-            inline_exprs.push((idx, value));
-        }
-        if inline_exprs.is_empty() {
-            return;
-        }
-
-        // Rebuild `expressions`, dropping the inline-able ones (their indices are in ascending order)
-        // without recomputing the checks above.
-        let mut kept = ArenaVec::with_capacity_in(t.expressions.len() - inline_exprs.len(), ctx);
-        let mut inline_idxs = inline_exprs.iter().map(|(idx, _)| *idx).peekable();
-        for (idx, expr) in t.expressions.drain(..).enumerate() {
-            if inline_idxs.peek() == Some(&idx) {
-                inline_idxs.next();
-                ctx.drop_expression(&expr);
+            if first_inline.is_none() {
+                first_inline = Some((idx, value));
             } else {
-                kept.push(expr);
+                more_inline.push((idx, value));
             }
         }
-        t.expressions = kept;
+        let Some(first) = first_inline else {
+            return;
+        };
+
+        // Drop the inline-able expressions in place (their indices are in ascending order)
+        // without allocating a second `ArenaVec`.
+        let mut inline_idxs =
+            std::iter::once(first.0).chain(more_inline.iter().map(|(idx, _)| *idx)).peekable();
+        let mut idx = 0usize;
+        t.expressions.retain_mut(|expr| {
+            let cur = idx;
+            idx += 1;
+            if inline_idxs.peek() == Some(&cur) {
+                inline_idxs.next();
+                ctx.drop_expression(expr);
+                false
+            } else {
+                true
+            }
+        });
 
         // inline the extracted inline-able expressions into quasis
         // "current_quasis + extracted_value + next_quasis"
-        for (i, (idx, value)) in inline_exprs.into_iter().enumerate() {
+        for (i, (idx, value)) in std::iter::once(first).chain(more_inline).enumerate() {
             let idx = idx - i;
             let next_quasi = (idx + 1 < t.quasis.len()).then(|| t.quasis.remove(idx + 1));
             let quasi = &mut t.quasis[idx];

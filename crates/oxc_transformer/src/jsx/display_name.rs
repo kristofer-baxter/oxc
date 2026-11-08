@@ -113,7 +113,7 @@ impl<'a> Traverse<'a, TransformState<'a>> for ReactDisplayName {
                 // `export default React.createClass({})`
                 // Uses the current file name as the display name.
                 Ancestor::ExportDefaultDeclarationDeclaration(_) => {
-                    break JSStr::from_str_in(&ctx.state.filename, ctx);
+                    break JSStr::from_str_in(&ctx.state.filename(), ctx);
                 }
                 // Stop crawling up when hit a statement
                 _ if ancestor.is_parent_of_statement() => return,

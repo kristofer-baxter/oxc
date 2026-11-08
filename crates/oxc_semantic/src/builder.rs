@@ -8,7 +8,7 @@ use std::{
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
-use oxc_allocator::{Address, ArenaVec};
+use oxc_allocator::{Address, ArenaVec, CloneIn};
 use oxc_ast::{AstKind, ast::*};
 use oxc_ast_visit::Visit;
 #[cfg(feature = "cfg")]
@@ -327,13 +327,20 @@ impl<'a> SemanticBuilder<'a> {
         // Avoiding this growth produces up to 30% perf boost on our benchmarks.
         //
         // If user did not provide existing `Stats`, calculate them by visiting AST.
-        #[cfg_attr(not(debug_assertions), expect(unused_variables))]
-        let (stats, check_stats) = if let Some(stats) = self.stats {
-            (stats, None)
+        #[cfg(debug_assertions)]
+        let (stats, raw_references, check_stats) = if let Some(stats) = self.stats {
+            (stats, stats.references, None)
         } else {
             let stats = Stats::count(program);
             let stats_with_excess = stats.increase_by(self.excess_capacity);
-            (stats_with_excess, Some(stats))
+            (stats_with_excess, stats.references, Some(stats))
+        };
+        #[cfg(not(debug_assertions))]
+        let (stats, raw_references) = if let Some(stats) = self.stats {
+            (stats, stats.references)
+        } else {
+            let raw = Stats::count(program);
+            (raw.increase_by(self.excess_capacity), raw.references)
         };
         self.node_store.reserve(stats.nodes as usize);
         self.scoping.reserve(
@@ -341,7 +348,7 @@ impl<'a> SemanticBuilder<'a> {
             stats.references as usize,
             stats.scopes as usize,
         );
-        self.unresolved_references.reserve_exact(stats.references as usize);
+        self.unresolved_references.reserve_exact(raw_references as usize);
 
         self.class_table_builder.enabled |= self.check_syntax_error;
 
@@ -430,7 +437,8 @@ impl<'a> SemanticBuilder<'a> {
         }
     }
 
-    fn create_ast_node(&mut self, kind: AstKind<'a>) {
+    #[inline]
+    fn create_ast_node(&mut self, node_id: NodeId, kind: AstKind<'a>) {
         #[cfg(not(feature = "jsdoc"))]
         let flags = NodeFlags::empty();
         #[cfg(feature = "jsdoc")]
@@ -440,9 +448,6 @@ impl<'a> SemanticBuilder<'a> {
             flags |= NodeFlags::JSDoc;
         }
 
-        // 1. Standalone node-id increment.
-        let node_id = self.node_store.alloc_node_id();
-        kind.set_node_id(node_id);
         let parent_node_id = self.node_store.current_node_id;
         self.node_store.current_node_id = node_id;
 
@@ -462,7 +467,7 @@ impl<'a> SemanticBuilder<'a> {
                     flags,
                 );
             }
-            AstNodeStoreKind::Ancestry(stack) => stack.push(kind),
+            AstNodeStoreKind::Ancestry(stack) => stack.push(kind, node_id),
         }
         self.record_ast_node();
     }
@@ -476,8 +481,7 @@ impl<'a> SemanticBuilder<'a> {
                 self.node_store.current_node_id = nodes.parent_id(self.node_store.current_node_id);
             }
             AstNodeStoreKind::Ancestry(stack) => {
-                stack.pop();
-                self.node_store.current_node_id = stack.current_node_id();
+                self.node_store.current_node_id = stack.pop();
             }
         }
     }
@@ -546,7 +550,9 @@ impl<'a> SemanticBuilder<'a> {
     ) -> SymbolId {
         // A `var` hoisted through this scope is bound in an outer scope. Interfaces and type aliases
         // live in a separate declaration space, so they get their own symbol in this scope.
-        if let Some(symbol_id) = self.check_redeclaration(scope_id, span, name, excludes)
+        let bit = crate::scoping::ident_bloom_bit(name);
+        if (*self.scoping.scope_table.bloom(scope_id) & bit) != 0
+            && let Some(symbol_id) = self.check_redeclaration(scope_id, span, name, excludes)
             && (includes.intersects(SymbolFlags::Value)
                 || self.scoping.scope_has_binding(scope_id, name))
         {
@@ -555,17 +561,24 @@ impl<'a> SemanticBuilder<'a> {
             return symbol_id;
         }
 
-        self.scoping.create_symbol_with_binding(
+        let symbol_id = self.scoping.symbol_table.push(
             span,
-            name,
             includes,
             scope_id,
-            scope_id,
             self.node_store.current_node_id,
-        )
+        );
+        *self.scoping.scope_table.bloom_mut(scope_id) |= bit;
+        self.scoping.cell.with_dependent_mut(|allocator, cell| {
+            let name = name.clone_in(allocator);
+            cell.symbol_names.push(name);
+            cell.resolved_references.push(ArenaVec::new_in(&allocator));
+            cell.bindings[scope_id].insert(name, symbol_id);
+        });
+        symbol_id
     }
 
     /// Declare a new symbol on the current scope.
+    #[inline]
     pub(crate) fn declare_symbol(
         &mut self,
         span: Span,
@@ -585,7 +598,12 @@ impl<'a> SemanticBuilder<'a> {
         name: Ident<'a>,
         excludes: SymbolFlags,
     ) -> Option<SymbolId> {
-        let binding_id = self.scoping.get_binding(scope_id, name);
+        if (*self.scoping.scope_table.bloom(scope_id) & crate::scoping::ident_bloom_bit(name)) == 0
+        {
+            return None;
+        }
+        let binding_id =
+            self.scoping.cell.borrow_dependent().bindings[scope_id].get(&name).copied();
 
         if let Some(symbol_id) = binding_id {
             let flags = self.scoping.symbol_flags(symbol_id);
@@ -607,7 +625,9 @@ impl<'a> SemanticBuilder<'a> {
         // `{ var x; interface x {} let x; }`
         // Only the value meaning conflicts. A type sharing the symbol belongs to the outer scope:
         // `type x = 0; { var x; interface x {} }`
-        let hoisted_id = self.hoisting_variables.get(&(scope_id, name)).copied();
+        let hoisted_id = (!self.hoisting_variables.is_empty())
+            .then(|| self.hoisting_variables.get(&(scope_id, name)).copied())
+            .flatten();
         if let Some(symbol_id) = hoisted_id
             && self.scoping.symbol_flags(symbol_id).intersects(excludes & SymbolFlags::Value)
         {
@@ -664,12 +684,172 @@ impl<'a> SemanticBuilder<'a> {
     fn resolve_all_references(&mut self) {
         let root_scope_id = self.scoping.root_scope_id();
         let refs = self.unresolved_references.take();
-        for unresolved in refs {
-            if !self.resolve_reference(unresolved, root_scope_id) {
-                self.scoping
-                    .add_root_unresolved_reference(unresolved.name, unresolved.reference_id);
+        let scope_table = &self.scoping.scope_table;
+        let symbol_table = &self.scoping.symbol_table;
+        let references = &mut self.scoping.references;
+        self.scoping.cell.with_dependent_mut(|allocator, cell| {
+            let bindings = &cell.bindings;
+            let resolved_references = &mut cell.resolved_references;
+            let root_unresolved = &mut cell.root_unresolved_references;
+
+            for unresolved in refs {
+                if unresolved.name == oxc_str::static_ident!("arguments") {
+                    let flags = references[unresolved.reference_id].flags();
+                    if flags.intersects(ReferenceFlags::Value | ReferenceFlags::ValueAsType) {
+                        let mut current_scope_id = Some(unresolved.lookup_scope_id);
+                        let mut done = false;
+                        while let Some(scope_id) = current_scope_id {
+                            let bit = crate::scoping::ident_bloom_bit(unresolved.name);
+                            if (*scope_table.bloom(scope_id) & bit) != 0
+                                && let Some(&symbol_id) = bindings[scope_id].get(&unresolved.name)
+                            {
+                                let symbol_flags = *symbol_table.symbol_flags(symbol_id);
+                                if !symbol_flags.contains(SymbolFlags::FunctionExpression)
+                                    && Self::try_resolve_with_tables(
+                                        unresolved.reference_id,
+                                        symbol_id,
+                                        symbol_flags,
+                                        references,
+                                        resolved_references,
+                                    )
+                                {
+                                    done = true;
+                                    break;
+                                }
+                            }
+                            let scope_flags = *scope_table.flags(scope_id);
+                            if scope_flags.is_function() && !scope_flags.is_arrow() {
+                                Self::record_unresolved_reference(
+                                    root_unresolved,
+                                    allocator,
+                                    unresolved.name,
+                                    unresolved.reference_id,
+                                );
+                                done = true;
+                                break;
+                            }
+                            if scope_id == root_scope_id {
+                                break;
+                            }
+                            current_scope_id = *scope_table.parent_ids(scope_id);
+                        }
+                        if !done {
+                            Self::record_unresolved_reference(
+                                root_unresolved,
+                                allocator,
+                                unresolved.name,
+                                unresolved.reference_id,
+                            );
+                        }
+                        continue;
+                    }
+                }
+
+                let bit = crate::scoping::ident_bloom_bit(unresolved.name);
+                let mut current_scope_id = Some(unresolved.lookup_scope_id);
+                let mut resolved = false;
+                while let Some(scope_id) = current_scope_id {
+                    if (*scope_table.bloom(scope_id) & bit) != 0
+                        && let Some(&symbol_id) = bindings[scope_id].get(&unresolved.name)
+                    {
+                        let symbol_flags = *symbol_table.symbol_flags(symbol_id);
+                        if Self::try_resolve_with_tables(
+                            unresolved.reference_id,
+                            symbol_id,
+                            symbol_flags,
+                            references,
+                            resolved_references,
+                        ) {
+                            resolved = true;
+                            break;
+                        }
+                    }
+                    if scope_id == root_scope_id {
+                        break;
+                    }
+                    current_scope_id = *scope_table.parent_ids(scope_id);
+                }
+                if !resolved {
+                    Self::record_unresolved_reference(
+                        root_unresolved,
+                        allocator,
+                        unresolved.name,
+                        unresolved.reference_id,
+                    );
+                }
+            }
+        });
+    }
+
+    #[inline(never)]
+    fn record_unresolved_reference<'cell>(
+        root_unresolved: &mut crate::scoping::UnresolvedReferences<'cell>,
+        allocator: &'cell oxc_allocator::Allocator,
+        name: Ident<'a>,
+        reference_id: ReferenceId,
+    ) {
+        #[repr(transparent)]
+        struct IdentKey<'k>(Ident<'k>);
+
+        impl std::hash::Hash for IdentKey<'_> {
+            #[inline]
+            fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+                self.0.hash(state);
             }
         }
+
+        impl oxc_allocator::hash_map::Equivalent<Ident<'_>> for IdentKey<'_> {
+            #[inline]
+            fn equivalent(&self, key: &Ident<'_>) -> bool {
+                self.0.as_str() == key.as_str()
+            }
+        }
+
+        if let Some(list) = root_unresolved.get_mut(&IdentKey(name)) {
+            list.push(reference_id);
+        } else {
+            root_unresolved.insert(
+                name.clone_in(allocator),
+                ArenaVec::from_array_in([reference_id], &allocator),
+            );
+        }
+    }
+
+    #[expect(clippy::inline_always)]
+    #[inline(always)]
+    fn try_resolve_with_tables<'cell>(
+        reference_id: ReferenceId,
+        symbol_id: SymbolId,
+        symbol_flags: SymbolFlags,
+        references: &mut oxc_index::IndexVec<ReferenceId, Reference>,
+        resolved_references: &mut ArenaVec<'cell, ArenaVec<'cell, ReferenceId>>,
+    ) -> bool {
+        let reference = &mut references[reference_id];
+        let flags = reference.flags_mut();
+
+        if !flags.intersects(
+            ReferenceFlags::Namespace | ReferenceFlags::Type | ReferenceFlags::ValueAsType,
+        ) && symbol_flags.is_value()
+        {
+            reference.set_symbol_id(symbol_id);
+            resolved_references[symbol_id.index()].push(reference_id);
+            return true;
+        }
+
+        if !Self::can_resolve_slow(*flags, symbol_flags) {
+            return false;
+        }
+
+        if (symbol_flags.is_value() && flags.is_value())
+            || (flags.is_namespace() && flags.is_read())
+        {
+            *flags -= ReferenceFlags::Type;
+        } else {
+            *flags = ReferenceFlags::Type;
+        }
+        reference.set_symbol_id(symbol_id);
+        resolved_references[symbol_id.index()].push(reference_id);
+        true
     }
 
     /// Resolve a reference by walking up the scope chain through `last_scope_id`.
@@ -683,7 +863,7 @@ impl<'a> SemanticBuilder<'a> {
         unresolved: UnresolvedReference<'a>,
         last_scope_id: ScopeId,
     ) -> bool {
-        if unresolved.name == "arguments" {
+        if unresolved.name == oxc_str::static_ident!("arguments") {
             return self.resolve_arguments_reference(unresolved, last_scope_id);
         }
         self.walk_up_resolve_reference(unresolved, last_scope_id)
@@ -697,19 +877,78 @@ impl<'a> SemanticBuilder<'a> {
         unresolved: UnresolvedReference<'a>,
         last_scope_id: ScopeId,
     ) -> bool {
+        let bit = crate::scoping::ident_bloom_bit(unresolved.name);
         let mut current_scope_id = Some(unresolved.lookup_scope_id);
+        let bindings = &self.scoping.cell.borrow_dependent().bindings;
+        let mut matched_symbol_id = None;
         while let Some(scope_id) = current_scope_id {
-            if let Some(symbol_id) = self.scoping.get_binding(scope_id, unresolved.name)
-                && self.try_resolve_reference(unresolved.reference_id, symbol_id)
+            if (*self.scoping.scope_table.bloom(scope_id) & bit) != 0
+                && let Some(&symbol_id) = bindings[scope_id].get(&unresolved.name)
             {
-                return true;
+                let symbol_flags = self.scoping.symbol_flags(symbol_id);
+                let ref_flags = self.scoping.references[unresolved.reference_id].flags();
+                if (!ref_flags.intersects(
+                    ReferenceFlags::Namespace | ReferenceFlags::Type | ReferenceFlags::ValueAsType,
+                ) && symbol_flags.is_value())
+                    || Self::can_resolve_slow(ref_flags, symbol_flags)
+                {
+                    matched_symbol_id = Some(symbol_id);
+                    break;
+                }
             }
             if scope_id == last_scope_id {
                 return false;
             }
-            current_scope_id = self.scoping.scope_parent_id(scope_id);
+            current_scope_id = *self.scoping.scope_table.parent_ids(scope_id);
         }
-        false
+        if let Some(symbol_id) = matched_symbol_id {
+            self.finish_resolve_reference(unresolved.reference_id, symbol_id);
+            true
+        } else {
+            false
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn can_resolve_slow(flags: ReferenceFlags, symbol_flags: SymbolFlags) -> bool {
+        if flags.is_namespace()
+            && !flags.is_value_as_type()
+            && !symbol_flags.can_be_referenced_as_namespace()
+        {
+            false
+        } else {
+            (flags.is_value() && symbol_flags.can_be_referenced_by_value())
+                || (flags.is_type() && symbol_flags.can_be_referenced_by_type())
+                || (flags.is_value_as_type() && symbol_flags.can_be_referenced_by_value_as_type())
+        }
+    }
+
+    #[expect(clippy::inline_always)]
+    #[inline(always)]
+    fn finish_resolve_reference(&mut self, reference_id: ReferenceId, symbol_id: SymbolId) {
+        let symbol_flags = self.scoping.symbol_flags(symbol_id);
+        let reference = &mut self.scoping.references[reference_id];
+        let flags = reference.flags_mut();
+
+        if !flags.intersects(
+            ReferenceFlags::Namespace | ReferenceFlags::Type | ReferenceFlags::ValueAsType,
+        ) && symbol_flags.is_value()
+        {
+            reference.set_symbol_id(symbol_id);
+            self.scoping.add_resolved_reference(symbol_id, reference_id);
+            return;
+        }
+
+        if (symbol_flags.is_value() && flags.is_value())
+            || (flags.is_namespace() && flags.is_read())
+        {
+            *flags -= ReferenceFlags::Type;
+        } else {
+            *flags = ReferenceFlags::Type;
+        }
+        reference.set_symbol_id(symbol_id);
+        self.scoping.add_resolved_reference(symbol_id, reference_id);
     }
 
     /// Resolve a reference named `arguments`.
@@ -757,10 +996,21 @@ impl<'a> SemanticBuilder<'a> {
     }
 
     /// Try to resolve a reference to a symbol. Returns `true` if resolved.
+    #[inline]
     fn try_resolve_reference(&mut self, reference_id: ReferenceId, symbol_id: SymbolId) -> bool {
         let symbol_flags = self.scoping.symbol_flags(symbol_id);
         let reference = &mut self.scoping.references[reference_id];
         let flags = reference.flags_mut();
+
+        // Fast path for normal value references (`Read`, `Write`, `Read | Write`) to value symbols.
+        if !flags.intersects(
+            ReferenceFlags::Namespace | ReferenceFlags::Type | ReferenceFlags::ValueAsType,
+        ) && symbol_flags.is_value()
+        {
+            reference.set_symbol_id(symbol_id);
+            self.scoping.add_resolved_reference(symbol_id, reference_id);
+            return true;
+        }
 
         // Determine whether the symbol can be referenced by this reference.
         // Namespace-qualified references must resolve to namespace-capable symbols
@@ -835,10 +1085,38 @@ impl<'a> SemanticBuilder<'a> {
         // Take the list out of `self` while resolving, so the closure can call `&mut self`
         // methods. Resolution never pushes new unresolved references, so nothing is lost.
         let mut unresolved_references = mem::take(&mut self.unresolved_references);
+        let current_bloom = *self.scoping.scope_table.bloom(current_scope_id);
         unresolved_references.retain_from(unresolved_start, |unresolved| {
+            let lookup_scope_id = unresolved.lookup_scope_id;
+            if lookup_scope_id == current_scope_id
+                && (unresolved.name.len() != 9
+                    || unresolved.name != oxc_str::static_ident!("arguments"))
+            {
+                let bit = crate::scoping::ident_bloom_bit(unresolved.name);
+                if (current_bloom & bit) != 0
+                    && let Some(&symbol_id) = self.scoping.cell.borrow_dependent().bindings
+                        [current_scope_id]
+                        .get(&unresolved.name)
+                {
+                    let symbol_flags = *self.scoping.symbol_table.symbol_flags(symbol_id);
+                    let resolved = self.scoping.cell.with_dependent_mut(|_allocator, cell| {
+                        Self::try_resolve_with_tables(
+                            unresolved.reference_id,
+                            symbol_id,
+                            symbol_flags,
+                            &mut self.scoping.references,
+                            &mut cell.resolved_references,
+                        )
+                    });
+                    if resolved {
+                        return false;
+                    }
+                }
+                unresolved.lookup_scope_id = parent_scope_id;
+                return true;
+            }
             // Parameter decorators are visited in an outer class scope. Leave those references
             // for final resolution because the current function is not on their scope chain.
-            let lookup_scope_id = unresolved.lookup_scope_id;
             if lookup_scope_id != current_scope_id
                 && !self.scoping.scope_is_descendant_of(lookup_scope_id, current_scope_id)
             {
@@ -908,6 +1186,7 @@ impl<'a> SemanticBuilder<'a> {
 
 impl<'a> Visit<'a> for SemanticBuilder<'a> {
     // NB: Not called for `Program`
+    #[inline]
     fn enter_scope(&mut self, flags: ScopeFlags, scope_id: &Cell<Option<ScopeId>>) {
         let parent_scope_id = self.current_scope_id;
         let flags = self.scoping.get_new_scope_flags(flags, parent_scope_id);
@@ -917,6 +1196,7 @@ impl<'a> Visit<'a> for SemanticBuilder<'a> {
     }
 
     // NB: Not called for `Program`
+    #[inline]
     fn leave_scope(&mut self) {
         // `get_parent_id` always returns `Some` because this method is not called for `Program`.
         // So we could `.unwrap()` here. But that seems to produce a small perf impact, probably because
@@ -933,8 +1213,15 @@ impl<'a> Visit<'a> for SemanticBuilder<'a> {
     }
 
     // NB: Not called for `Program`.
+    #[expect(
+        clippy::inline_always,
+        reason = "enables compile-time match elimination in AstKind::set_node_id"
+    )]
+    #[inline(always)]
     fn enter_node(&mut self, kind: AstKind<'a>) {
-        self.create_ast_node(kind);
+        let node_id = self.node_store.alloc_node_id();
+        kind.set_node_id(node_id);
+        self.create_ast_node(node_id, kind);
     }
 
     /// Both this function and `checker::check` must be inlined. Each `visit_*` method calls
@@ -988,7 +1275,7 @@ impl<'a> Visit<'a> for SemanticBuilder<'a> {
                     flags,
                 );
             }
-            AstNodeStoreKind::Ancestry(stack) => stack.push(kind),
+            AstNodeStoreKind::Ancestry(stack) => stack.push(kind, node_id),
         }
 
         let is_ambient = self.source_type.is_typescript_definition();
@@ -1125,6 +1412,7 @@ impl<'a> Visit<'a> for SemanticBuilder<'a> {
                 }
             });
             if let Some(parent_bindings) = parent_bindings {
+                self.scoping.move_scope_bloom(parent_scope_id, self.current_scope_id);
                 for symbol_id in parent_bindings {
                     self.scoping.set_symbol_scope_id(symbol_id, self.current_scope_id);
                 }
@@ -2304,6 +2592,13 @@ impl<'a> Visit<'a> for SemanticBuilder<'a> {
     }
 
     fn visit_formal_parameters(&mut self, it: &FormalParameters<'a>) {
+        if it.items.is_empty() && it.rest.is_none() {
+            let kind = AstKind::FormalParameters(self.alloc(it));
+            self.enter_node(kind);
+            self.visit_span(&it.span);
+            self.leave_node(kind);
+            return;
+        }
         // Checking whether a list is simple scans its parameters. Do this once per
         // list, rather than once per parameter when binding each name.
         let mut excludes = SymbolFlags::FunctionScopedVariableExcludes;
@@ -2902,11 +3197,319 @@ impl<'a> Visit<'a> for SemanticBuilder<'a> {
     }
 
     fn visit_identifier_reference(&mut self, ident: &IdentifierReference<'a>) {
-        let kind = AstKind::IdentifierReference(self.alloc(ident));
-        self.enter_node(kind);
-        self.reference_identifier(ident);
-        self.visit_span(&ident.span);
-        self.leave_node(kind);
+        let node_id = self.node_store.alloc_node_id();
+        ident.node_id.set(node_id);
+        match &mut self.node_store.kind {
+            AstNodeStoreKind::Full(_) => {
+                let kind = AstKind::IdentifierReference(self.alloc(ident));
+                self.create_ast_node(node_id, kind);
+                self.reference_identifier(ident);
+                self.visit_span(&ident.span);
+                self.leave_node(kind);
+            }
+            AstNodeStoreKind::Ancestry(_) => {
+                let prev_node_id = self.node_store.current_node_id;
+                self.node_store.current_node_id = node_id;
+                self.record_ast_node();
+                self.reference_identifier(ident);
+                if self.check_syntax_error {
+                    checker::check_identifier_reference_leaf(ident, self);
+                }
+                self.node_store.current_node_id = prev_node_id;
+            }
+        }
+    }
+
+    fn visit_binding_identifier(&mut self, ident: &BindingIdentifier<'a>) {
+        let node_id = self.node_store.alloc_node_id();
+        ident.node_id.set(node_id);
+        match &mut self.node_store.kind {
+            AstNodeStoreKind::Full(_) => {
+                let kind = AstKind::BindingIdentifier(self.alloc(ident));
+                self.create_ast_node(node_id, kind);
+                self.visit_span(&ident.span);
+                self.leave_node(kind);
+            }
+            AstNodeStoreKind::Ancestry(_) => {
+                let prev_node_id = self.node_store.current_node_id;
+                self.node_store.current_node_id = node_id;
+                self.record_ast_node();
+                if self.check_syntax_error {
+                    checker::check_binding_identifier_leaf(ident, self);
+                }
+                self.node_store.current_node_id = prev_node_id;
+            }
+        }
+    }
+
+    fn visit_identifier_name(&mut self, ident: &IdentifierName<'a>) {
+        let node_id = self.node_store.alloc_node_id();
+        ident.node_id.set(node_id);
+        match &mut self.node_store.kind {
+            AstNodeStoreKind::Full(_) => {
+                let kind = AstKind::IdentifierName(self.alloc(ident));
+                self.create_ast_node(node_id, kind);
+                self.visit_span(&ident.span);
+                self.leave_node(kind);
+            }
+            AstNodeStoreKind::Ancestry(_) => {
+                let prev_node_id = self.node_store.current_node_id;
+                self.node_store.current_node_id = node_id;
+                self.record_ast_node();
+                self.node_store.current_node_id = prev_node_id;
+            }
+        }
+    }
+
+    fn visit_string_literal(&mut self, lit: &StringLiteral<'a>) {
+        let node_id = self.node_store.alloc_node_id();
+        lit.node_id.set(node_id);
+        match &mut self.node_store.kind {
+            AstNodeStoreKind::Full(_) => {
+                let kind = AstKind::StringLiteral(self.alloc(lit));
+                self.create_ast_node(node_id, kind);
+                self.visit_span(&lit.span);
+                self.leave_node(kind);
+            }
+            AstNodeStoreKind::Ancestry(_) => {
+                let prev_node_id = self.node_store.current_node_id;
+                self.node_store.current_node_id = node_id;
+                self.record_ast_node();
+                if self.check_syntax_error {
+                    checker::check_string_literal_leaf(lit, self);
+                }
+                self.node_store.current_node_id = prev_node_id;
+            }
+        }
+    }
+
+    fn visit_numeric_literal(&mut self, lit: &NumericLiteral<'a>) {
+        let node_id = self.node_store.alloc_node_id();
+        lit.node_id.set(node_id);
+        match &mut self.node_store.kind {
+            AstNodeStoreKind::Full(_) => {
+                let kind = AstKind::NumericLiteral(self.alloc(lit));
+                self.create_ast_node(node_id, kind);
+                self.visit_span(&lit.span);
+                self.leave_node(kind);
+            }
+            AstNodeStoreKind::Ancestry(_) => {
+                let prev_node_id = self.node_store.current_node_id;
+                self.node_store.current_node_id = node_id;
+                self.record_ast_node();
+                if self.check_syntax_error {
+                    checker::check_numeric_literal_leaf(lit, self);
+                }
+                self.node_store.current_node_id = prev_node_id;
+            }
+        }
+    }
+
+    fn visit_boolean_literal(&mut self, lit: &BooleanLiteral) {
+        let node_id = self.node_store.alloc_node_id();
+        lit.node_id.set(node_id);
+        match &mut self.node_store.kind {
+            AstNodeStoreKind::Full(_) => {
+                let kind = AstKind::BooleanLiteral(self.alloc(lit));
+                self.create_ast_node(node_id, kind);
+                self.visit_span(&lit.span);
+                self.leave_node(kind);
+            }
+            AstNodeStoreKind::Ancestry(_) => {
+                let prev_node_id = self.node_store.current_node_id;
+                self.node_store.current_node_id = node_id;
+                self.record_ast_node();
+                self.node_store.current_node_id = prev_node_id;
+            }
+        }
+    }
+
+    fn visit_null_literal(&mut self, lit: &NullLiteral) {
+        let node_id = self.node_store.alloc_node_id();
+        lit.node_id.set(node_id);
+        match &mut self.node_store.kind {
+            AstNodeStoreKind::Full(_) => {
+                let kind = AstKind::NullLiteral(self.alloc(lit));
+                self.create_ast_node(node_id, kind);
+                self.visit_span(&lit.span);
+                self.leave_node(kind);
+            }
+            AstNodeStoreKind::Ancestry(_) => {
+                let prev_node_id = self.node_store.current_node_id;
+                self.node_store.current_node_id = node_id;
+                self.record_ast_node();
+                self.node_store.current_node_id = prev_node_id;
+            }
+        }
+    }
+
+    fn visit_ts_type_reference(&mut self, ty: &TSTypeReference<'a>) {
+        match &mut self.node_store.kind {
+            AstNodeStoreKind::Full(_) => {
+                let kind = AstKind::TSTypeReference(self.alloc(ty));
+                self.enter_node(kind);
+                self.current_reference_flags = ReferenceFlags::Type;
+                self.visit_span(&ty.span);
+                self.visit_ts_type_name(&ty.type_name);
+                if let Some(type_arguments) = &ty.type_arguments {
+                    self.visit_ts_type_parameter_instantiation(type_arguments);
+                }
+                self.leave_node(kind);
+            }
+            AstNodeStoreKind::Ancestry(_) => {
+                let node_id = self.node_store.alloc_node_id();
+                ty.node_id.set(node_id);
+                let prev_node_id = self.node_store.current_node_id;
+                self.node_store.current_node_id = node_id;
+                self.record_ast_node();
+                self.current_reference_flags = ReferenceFlags::Type;
+                self.visit_ts_type_name(&ty.type_name);
+                if let Some(type_arguments) = &ty.type_arguments {
+                    self.visit_ts_type_parameter_instantiation(type_arguments);
+                }
+                self.node_store.current_node_id = prev_node_id;
+            }
+        }
+    }
+
+    fn visit_ts_string_keyword(&mut self, it: &TSStringKeyword) {
+        let node_id = self.node_store.alloc_node_id();
+        it.node_id.set(node_id);
+        if let AstNodeStoreKind::Full(_) = &self.node_store.kind {
+            let kind = AstKind::TSStringKeyword(self.alloc(it));
+            self.create_ast_node(node_id, kind);
+            self.visit_span(&it.span);
+            self.leave_node(kind);
+        }
+    }
+
+    fn visit_ts_number_keyword(&mut self, it: &TSNumberKeyword) {
+        let node_id = self.node_store.alloc_node_id();
+        it.node_id.set(node_id);
+        if let AstNodeStoreKind::Full(_) = &self.node_store.kind {
+            let kind = AstKind::TSNumberKeyword(self.alloc(it));
+            self.create_ast_node(node_id, kind);
+            self.visit_span(&it.span);
+            self.leave_node(kind);
+        }
+    }
+
+    fn visit_ts_boolean_keyword(&mut self, it: &TSBooleanKeyword) {
+        let node_id = self.node_store.alloc_node_id();
+        it.node_id.set(node_id);
+        if let AstNodeStoreKind::Full(_) = &self.node_store.kind {
+            let kind = AstKind::TSBooleanKeyword(self.alloc(it));
+            self.create_ast_node(node_id, kind);
+            self.visit_span(&it.span);
+            self.leave_node(kind);
+        }
+    }
+
+    fn visit_ts_any_keyword(&mut self, it: &TSAnyKeyword) {
+        let node_id = self.node_store.alloc_node_id();
+        it.node_id.set(node_id);
+        if let AstNodeStoreKind::Full(_) = &self.node_store.kind {
+            let kind = AstKind::TSAnyKeyword(self.alloc(it));
+            self.create_ast_node(node_id, kind);
+            self.visit_span(&it.span);
+            self.leave_node(kind);
+        }
+    }
+
+    fn visit_ts_void_keyword(&mut self, it: &TSVoidKeyword) {
+        let node_id = self.node_store.alloc_node_id();
+        it.node_id.set(node_id);
+        if let AstNodeStoreKind::Full(_) = &self.node_store.kind {
+            let kind = AstKind::TSVoidKeyword(self.alloc(it));
+            self.create_ast_node(node_id, kind);
+            self.visit_span(&it.span);
+            self.leave_node(kind);
+        }
+    }
+
+    fn visit_ts_undefined_keyword(&mut self, it: &TSUndefinedKeyword) {
+        let node_id = self.node_store.alloc_node_id();
+        it.node_id.set(node_id);
+        if let AstNodeStoreKind::Full(_) = &self.node_store.kind {
+            let kind = AstKind::TSUndefinedKeyword(self.alloc(it));
+            self.create_ast_node(node_id, kind);
+            self.visit_span(&it.span);
+            self.leave_node(kind);
+        }
+    }
+
+    fn visit_ts_null_keyword(&mut self, it: &TSNullKeyword) {
+        let node_id = self.node_store.alloc_node_id();
+        it.node_id.set(node_id);
+        if let AstNodeStoreKind::Full(_) = &self.node_store.kind {
+            let kind = AstKind::TSNullKeyword(self.alloc(it));
+            self.create_ast_node(node_id, kind);
+            self.visit_span(&it.span);
+            self.leave_node(kind);
+        }
+    }
+
+    fn visit_ts_unknown_keyword(&mut self, it: &TSUnknownKeyword) {
+        let node_id = self.node_store.alloc_node_id();
+        it.node_id.set(node_id);
+        if let AstNodeStoreKind::Full(_) = &self.node_store.kind {
+            let kind = AstKind::TSUnknownKeyword(self.alloc(it));
+            self.create_ast_node(node_id, kind);
+            self.visit_span(&it.span);
+            self.leave_node(kind);
+        }
+    }
+
+    fn visit_ts_never_keyword(&mut self, it: &TSNeverKeyword) {
+        let node_id = self.node_store.alloc_node_id();
+        it.node_id.set(node_id);
+        if let AstNodeStoreKind::Full(_) = &self.node_store.kind {
+            let kind = AstKind::TSNeverKeyword(self.alloc(it));
+            self.create_ast_node(node_id, kind);
+            self.visit_span(&it.span);
+            self.leave_node(kind);
+        }
+    }
+
+    fn visit_jsx_text(&mut self, it: &JSXText<'a>) {
+        let node_id = self.node_store.alloc_node_id();
+        it.node_id.set(node_id);
+        if let AstNodeStoreKind::Full(_) = &self.node_store.kind {
+            let kind = AstKind::JSXText(self.alloc(it));
+            self.create_ast_node(node_id, kind);
+            self.visit_span(&it.span);
+            self.leave_node(kind);
+        }
+    }
+
+    fn visit_jsx_identifier(&mut self, it: &JSXIdentifier<'a>) {
+        let node_id = self.node_store.alloc_node_id();
+        it.node_id.set(node_id);
+        if let AstNodeStoreKind::Full(_) = &self.node_store.kind {
+            let kind = AstKind::JSXIdentifier(self.alloc(it));
+            self.create_ast_node(node_id, kind);
+            self.visit_span(&it.span);
+            self.leave_node(kind);
+        }
+    }
+
+    fn visit_this_expression(&mut self, expr: &ThisExpression) {
+        let node_id = self.node_store.alloc_node_id();
+        expr.node_id.set(node_id);
+        match &mut self.node_store.kind {
+            AstNodeStoreKind::Full(_) => {
+                let kind = AstKind::ThisExpression(self.alloc(expr));
+                self.create_ast_node(node_id, kind);
+                self.visit_span(&expr.span);
+                self.leave_node(kind);
+            }
+            AstNodeStoreKind::Ancestry(_) => {
+                let prev_node_id = self.node_store.current_node_id;
+                self.node_store.current_node_id = node_id;
+                self.record_ast_node();
+                self.node_store.current_node_id = prev_node_id;
+            }
+        }
     }
 
     fn visit_call_expression(&mut self, expr: &CallExpression<'a>) {
@@ -2963,19 +3566,6 @@ impl<'a> Visit<'a> for SemanticBuilder<'a> {
         self.visit_expression(&it.expression);
         self.leave_node(kind);
     }
-
-    fn visit_ts_type_reference(&mut self, ty: &TSTypeReference<'a>) {
-        let kind = AstKind::TSTypeReference(self.alloc(ty));
-        self.enter_node(kind);
-        self.current_reference_flags = ReferenceFlags::Type;
-        self.visit_span(&ty.span);
-        self.visit_ts_type_name(&ty.type_name);
-        if let Some(type_arguments) = &ty.type_arguments {
-            self.visit_ts_type_parameter_instantiation(type_arguments);
-        }
-        self.leave_node(kind);
-    }
-
     fn visit_ts_qualified_name(&mut self, name: &TSQualifiedName<'a>) {
         let kind = AstKind::TSQualifiedName(self.alloc(name));
         self.enter_node(kind);
@@ -3011,7 +3601,41 @@ impl<'a> Visit<'a> for SemanticBuilder<'a> {
         self.enter_ambient_context(it.declare);
         control_flow!(self, |cfg| cfg.enter_statement(self.node_store.current_node_id));
         self.visit_span(&it.span);
-        self.visit_variable_declarators(&it.declarations);
+
+        let (mut includes, excludes) = match it.kind {
+            VariableDeclarationKind::Const
+            | VariableDeclarationKind::Using
+            | VariableDeclarationKind::AwaitUsing => (
+                SymbolFlags::BlockScopedVariable | SymbolFlags::ConstVariable,
+                SymbolFlags::BlockScopedVariableExcludes,
+            ),
+            VariableDeclarationKind::Let => {
+                (SymbolFlags::BlockScopedVariable, SymbolFlags::BlockScopedVariableExcludes)
+            }
+            VariableDeclarationKind::Var => {
+                (SymbolFlags::FunctionScopedVariable, SymbolFlags::FunctionScopedVariableExcludes)
+            }
+        };
+        if it.declare {
+            includes |= SymbolFlags::Ambient;
+        }
+        let is_lexical = it.kind.is_lexical();
+
+        for decl in &it.declarations {
+            let decl_kind = AstKind::VariableDeclarator(self.alloc(decl));
+            self.enter_node(decl_kind);
+            self.bind_variable_declarator_with_flags(decl, is_lexical, includes, excludes);
+            self.visit_span(&decl.span);
+            self.visit_binding_pattern(&decl.id);
+            if let Some(type_annotation) = &decl.type_annotation {
+                self.visit_ts_type_annotation(type_annotation);
+            }
+            if let Some(init) = &decl.init {
+                self.visit_expression(init);
+            }
+            self.leave_node(decl_kind);
+        }
+
         self.leave_node(kind);
         self.leave_ambient_context(it.declare);
     }

@@ -137,6 +137,27 @@ impl EnvOptions {
     pub fn from_target_list<S: AsRef<str>>(list: &[S]) -> Result<Self, String> {
         EngineTargets::from_target_list(list).map(Self::from)
     }
+
+    #[inline]
+    pub(crate) const fn has_any_enabled(&self) -> bool {
+        self.es2026.explicit_resource_management
+            || self.es2022.class_static_block
+            || self.es2022.class_properties.is_some()
+            || self.es2022.top_level_await
+            || self.es2021.logical_assignment_operators
+            || self.es2020.export_namespace_from
+            || self.es2020.nullish_coalescing_operator
+            || self.es2020.optional_chaining
+            || self.es2020.big_int
+            || self.es2020.arbitrary_module_namespace_names
+            || self.es2019.optional_catch_binding
+            || self.es2018.object_rest_spread.is_some()
+            || self.es2018.async_generator_functions
+            || self.es2017.async_to_generator
+            || self.es2016.exponentiation_operator
+            || self.es2015.arrow_function.is_some()
+            || self.regexp.has_any_enabled()
+    }
 }
 
 impl From<BabelEnvOptions> for EnvOptions {

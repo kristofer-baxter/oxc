@@ -63,19 +63,22 @@ impl<'a> ModuleRecordBuilder<'a> {
             // Multiple default exports
             // `export default foo`
             // `export { default }`
-            let default_exports = module_record
-                .local_export_entries
-                .iter()
-                .filter_map(|export_entry| export_entry.export_name.default_export_span())
-                .chain(
+            if !module_record.local_export_entries.is_empty()
+                || !module_record.indirect_export_entries.is_empty()
+                || !self.skipped_default_exports.is_empty()
+            {
+                let default_exports =
                     module_record
-                        .indirect_export_entries
+                        .local_export_entries
                         .iter()
-                        .filter_map(|export_entry| export_entry.export_name.default_export_span()),
-                )
-                .chain(self.skipped_default_exports.iter().copied());
-            if default_exports.clone().count() > 1 {
-                errors.push(diagnostics::duplicate_default_export(default_exports.collect()));
+                        .filter_map(|export_entry| export_entry.export_name.default_export_span())
+                        .chain(module_record.indirect_export_entries.iter().filter_map(
+                            |export_entry| export_entry.export_name.default_export_span(),
+                        ))
+                        .chain(self.skipped_default_exports.iter().copied());
+                if default_exports.clone().nth(1).is_some() {
+                    errors.push(diagnostics::duplicate_default_export(default_exports.collect()));
+                }
             }
         }
 
@@ -119,19 +122,42 @@ impl<'a> ModuleRecordBuilder<'a> {
     /// [ParseModule](https://tc39.es/ecma262/#sec-parsemodule)
     /// Step 10.
     fn resolve_export_entries(&mut self) {
-        // let export_entries = self.export_entries.drain(..).collect::<Vec<_>>();
+        if self.export_entries.is_empty() {
+            return;
+        }
         let export_entries =
             std::mem::replace(&mut self.export_entries, ArenaVec::new_in(&self.allocator));
+        let import_len = self.module_record.import_entries.len();
+
+        // Build an arena-backed lookup table when `export_entries * import_entries` would
+        // otherwise be quadratic, avoiding a system-heap allocation per module.
+        let import_map: Option<oxc_allocator::HashMap<'a, &'a str, usize>> =
+            if import_len > 8 && export_entries.len().saturating_mul(import_len) >= 64 {
+                let mut map = oxc_allocator::HashMap::with_capacity_in(import_len, self.allocator);
+                for (idx, entry) in self.module_record.import_entries.iter().enumerate() {
+                    map.entry(entry.local_name.name.as_str()).or_insert(idx);
+                }
+                Some(map)
+            } else {
+                None
+            };
+
         // 10. For each ExportEntry Record ee of exportEntries, do
         for ee in export_entries {
             // a. If ee.[[ModuleRequest]] is null, then
             if ee.module_request.is_none() {
                 let found_import_entry = match &ee.local_name {
-                    ExportLocalName::Name(name) => self
-                        .module_record
-                        .import_entries
-                        .iter()
-                        .find(|entry| entry.local_name.name == name.name),
+                    ExportLocalName::Name(name) if import_len > 0 => {
+                        if let Some(map) = &import_map {
+                            map.get(name.name.as_str())
+                                .map(|&idx| &self.module_record.import_entries[idx])
+                        } else {
+                            self.module_record
+                                .import_entries
+                                .iter()
+                                .find(|entry| entry.local_name.name == name.name)
+                        }
+                    }
                     _ => None,
                 };
                 match found_import_entry {

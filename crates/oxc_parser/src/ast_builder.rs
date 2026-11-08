@@ -22,12 +22,14 @@ impl<'a> ParserAstBuilder<'a> {
 }
 
 impl<'a> AstBuild<'a> for ParserAstBuilder<'a> {
-    #[inline]
+    #[expect(clippy::inline_always)]
+    #[inline(always)]
     fn node_id(&self) -> NodeId {
         let index = self.next_node_id.get();
         assert!(index <= NodeId::MAX_INDEX, "Too many AST nodes");
         self.next_node_id.set(index + 1);
-        NodeId::new(index)
+        // SAFETY: `index <= NodeId::MAX_INDEX` is asserted above.
+        unsafe { NodeId::from_usize_unchecked(index) }
     }
 }
 

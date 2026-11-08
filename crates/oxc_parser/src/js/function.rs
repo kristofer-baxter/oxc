@@ -32,6 +32,15 @@ impl<'a, C: Config> ParserImpl<'a, C> {
         let start = self.cur_start();
         let opening_span = self.cur_token().span();
         self.expect(Kind::LCurly);
+        if self.at(Kind::RCurly) {
+            self.advance(Kind::RCurly);
+            return FunctionBody::boxed(
+                self.end_span(start),
+                ArenaVec::new_in(self),
+                ArenaVec::new_in(self),
+                self,
+            );
+        }
 
         // Add Return context, remove TopLevel context
         let (directives, statements) = self.context(Context::Return, Context::TopLevel, |p| {
@@ -50,6 +59,17 @@ impl<'a, C: Config> ParserImpl<'a, C> {
         let start = self.cur_start();
         let opening_span = self.cur_token().span();
         self.expect(Kind::LParen);
+        if self.at(Kind::RParen) {
+            self.advance(Kind::RParen);
+            let formal_parameters = FormalParameters::boxed(
+                self.end_span(start),
+                params_kind,
+                ArenaVec::new_in(self),
+                None,
+                self,
+            );
+            return (None, formal_parameters);
+        }
         let this_param = if self.is_ts && self.at(Kind::This) {
             let param = self.parse_ts_this_parameter();
             if !self.at(Kind::RParen) {
@@ -103,6 +123,29 @@ impl<'a, C: Config> ParserImpl<'a, C> {
         (list, rest)
     }
 
+    #[inline(never)]
+    fn push_formal_parameter(
+        &self,
+        first_param: &mut Option<FormalParameter<'a>>,
+        list: &mut ArenaVec<'a, FormalParameter<'a>>,
+        param: FormalParameter<'a>,
+    ) {
+        if list.is_empty() {
+            if let Some(first) = first_param.take() {
+                let cap = if self.at(Kind::RParen) { 2 } else { 4 };
+                *list = ArenaVec::with_capacity_in(cap, self);
+                list.push(first);
+                list.push(param);
+            } else if self.at(Kind::RParen) {
+                *list = ArenaVec::from_value_in(param, self);
+            } else {
+                *first_param = Some(param);
+            }
+        } else {
+            list.push(param);
+        }
+    }
+
     #[expect(clippy::inline_always)]
     #[inline(always)]
     fn parse_formal_parameters_list_into(
@@ -112,6 +155,7 @@ impl<'a, C: Config> ParserImpl<'a, C> {
         opening_span: Span,
     ) -> Option<ArenaBox<'a, FormalParameterRest<'a>>> {
         let mut rest: Option<ArenaBox<'a, FormalParameterRest<'a>>> = None;
+        let mut first_param: Option<FormalParameter<'a>> = None;
         let mut first = true;
         let mut has_optional = false;
 
@@ -129,17 +173,16 @@ impl<'a, C: Config> ParserImpl<'a, C> {
             } else {
                 let comma_span = self.cur_token().span();
                 if kind != Kind::Comma {
-                    let error = diagnostics::expect_closing_or_separator(
-                        Kind::RParen.to_str(),
-                        Kind::Comma.to_str(),
-                        kind.to_str(),
+                    self.handle_expect_closing_or_separator_failure(
+                        Kind::RParen,
+                        Kind::Comma,
+                        kind,
                         comma_span,
                         opening_span,
                     );
-                    self.set_fatal_error(error);
                     break;
                 }
-                self.bump_any();
+                self.advance(Kind::Comma);
                 let kind = self.cur_kind();
                 if kind == Kind::RParen {
                     if rest.is_some() && !self.ctx.has_ambient() {
@@ -157,6 +200,74 @@ impl<'a, C: Config> ParserImpl<'a, C> {
                     ),
                 ));
                 break;
+            }
+
+            // Fast path for plain identifier parameters (`function foo(a, b, c)` or `(x: T, y?: U)`)
+            // which cannot have decorators or parameter modifiers.
+            if self.cur_kind() == Kind::Ident {
+                let ident = self.parse_plain_binding_identifier();
+                let ident_span = ident.span;
+                let pattern = BindingPattern::BindingIdentifier(self.alloc(ident));
+                if matches!(self.cur_kind(), Kind::Comma | Kind::RParen) {
+                    if has_optional {
+                        self.error(diagnostics::required_parameter_after_optional_parameter(
+                            ident_span,
+                        ));
+                    }
+                    let param = FormalParameter::new(
+                        ident_span,
+                        ArenaVec::new_in(self),
+                        pattern,
+                        None,
+                        None,
+                        false,
+                        None,
+                        false,
+                        false,
+                        self,
+                    );
+                    self.push_formal_parameter(&mut first_param, list, param);
+                    continue;
+                }
+                let optional = self.is_ts && self.eat(Kind::Question);
+                let type_annotation =
+                    if self.is_ts { self.parse_ts_type_annotation() } else { None };
+                let init = if self.eat(Kind::Eq) {
+                    let init = self.context_add(
+                        Context::In,
+                        ParserImpl::parse_assignment_expression_or_higher,
+                    );
+                    if optional {
+                        self.error(
+                            diagnostics::a_parameter_cannot_have_question_mark_and_initializer(
+                                ident_span,
+                            ),
+                        );
+                    }
+                    Some(ArenaBox::new_in(init, self))
+                } else {
+                    None
+                };
+                let span = self.end_span(ident_span.start);
+                if optional {
+                    has_optional = true;
+                } else if has_optional && init.is_none() {
+                    self.error(diagnostics::required_parameter_after_optional_parameter(span));
+                }
+                let param = FormalParameter::new(
+                    span,
+                    ArenaVec::new_in(self),
+                    pattern,
+                    type_annotation,
+                    init,
+                    optional,
+                    None,
+                    false,
+                    false,
+                    self,
+                );
+                self.push_formal_parameter(&mut first_param, list, param);
+                continue;
             }
 
             let start = self.cur_start();
@@ -193,8 +304,12 @@ impl<'a, C: Config> ParserImpl<'a, C> {
                         param.span,
                     ));
                 }
-                list.push(param);
+                self.push_formal_parameter(&mut first_param, list, param);
             }
+        }
+
+        if let Some(first) = first_param {
+            *list = ArenaVec::from_value_in(first, self);
         }
 
         rest

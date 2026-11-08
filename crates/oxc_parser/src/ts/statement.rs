@@ -6,7 +6,7 @@ use crate::{
     Context, ParserConfig as Config, ParserImpl, StatementContext, diagnostics,
     js::{FunctionKind, VariableDeclarationParent},
     lexer::Kind,
-    modifiers::{ModifierKind, ModifierKinds, Modifiers},
+    modifiers::{Modifier, ModifierKind, ModifierKinds, Modifiers},
 };
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -357,6 +357,12 @@ impl<'a, C: Config> ParserImpl<'a, C> {
         let start = self.cur_start();
         let kind = self.cur_kind();
 
+        if kind == Kind::Ident {
+            let ident = self.parse_known_identifier_name();
+            let key = PropertyKey::StaticIdentifier(self.alloc(ident));
+            return self.parse_property_or_method_signature_after_key(start, key, false, false);
+        }
+
         if matches!(kind, Kind::LParen | Kind::LAngle) {
             return self.parse_signature_member(CallOrConstructorSignature::Call);
         }
@@ -367,10 +373,52 @@ impl<'a, C: Config> ParserImpl<'a, C> {
             return self.parse_signature_member(CallOrConstructorSignature::Constructor);
         }
 
-        let modifiers = self.parse_modifiers(
-            /* permit_const_as_modifier */ true,
-            /* stop_on_start_of_class_static_block */ false,
-        );
+        let modifiers = if kind == Kind::Readonly && !self.cur_token().escaped() {
+            let readonly_token = self.cur_token();
+            self.advance(Kind::Readonly);
+            let next_token = self.cur_token();
+            if next_token.kind() == Kind::Ident && !next_token.is_on_new_line() {
+                let ident = self.parse_known_identifier_name();
+                let key = PropertyKey::StaticIdentifier(self.alloc(ident));
+                let cur = self.cur_kind();
+                if cur == Kind::LParen
+                    || cur == Kind::LAngle
+                    || (cur == Kind::Question && {
+                        let next = self.lexer.peek_token().kind();
+                        next == Kind::LParen || next == Kind::LAngle
+                    })
+                {
+                    self.error(
+                        diagnostics::modifier_only_on_property_declaration_or_index_signature(
+                            Modifier::new(start, ModifierKind::Readonly),
+                            None,
+                        ),
+                    );
+                }
+                return self.parse_property_or_method_signature_after_key(start, key, false, true);
+            }
+            if next_token.is_on_new_line() || !Self::can_follow_modifier(next_token.kind()) {
+                let span = readonly_token.span();
+                let name = if readonly_token.escaped() {
+                    self.lexer.get_escaped_string(readonly_token)
+                } else {
+                    self.token_source(&readonly_token)
+                };
+                let ident = IdentifierName::new(span, self.ident(name), self);
+                let key = PropertyKey::StaticIdentifier(self.alloc(ident));
+                return self.parse_property_or_method_signature_after_key(start, key, false, false);
+            }
+            self.parse_modifiers_from(
+                Modifiers::new_single(ModifierKind::Readonly, start),
+                /* permit_const_as_modifier */ true,
+                /* stop_on_start_of_class_static_block */ false,
+            )
+        } else {
+            self.parse_modifiers(
+                /* permit_const_as_modifier */ true,
+                /* stop_on_start_of_class_static_block */ false,
+            )
+        };
 
         if self.is_index_signature() {
             self.verify_modifiers(

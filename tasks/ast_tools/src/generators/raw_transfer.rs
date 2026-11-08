@@ -212,12 +212,8 @@ fn generate_deserializers(
                 firstNonAsciiPos = sourceStartPos + sourceByteLen;
                 sourceTextLatin = sourceText;
             }} else {{
-                let i = sourceStartPos;
-                const sourceEndPos = sourceStartPos + sourceByteLen;
-                for (; i < sourceEndPos && uint8[i] < 128; i++);
-                firstNonAsciiPos = i;
-
-                sourceTextLatin = latin1Slice.call(uint8, sourceStartPos, sourceEndPos);
+                firstNonAsciiPos = 0;
+                sourceTextLatin = null;
             }}
 
             const data = deserialize(int32[{data_pointer_pos_32}]);
@@ -409,6 +405,86 @@ fn generate_struct(
     }
 
     let fn_name = struct_def.deser_name(schema);
+    if struct_def.name() == "RawTransferData" {
+        #[rustfmt::skip]
+        write_it!(code, "
+            function deserializeComments(raw, src) {{
+                const raw32 = new Int32Array(raw.buffer, raw.byteOffset, raw.byteLength >> 2),
+                    len = raw.byteLength / 24,
+                    arr = new Array(len);
+                for (let i = 0, pos = 0; i < len; i++, pos += 24) {{
+                    const pos32 = pos >> 2,
+                        start = raw32[pos32],
+                        end = raw32[pos32 + 1],
+                        kind = raw[pos + 17];
+                    if (kind === 1 || kind === 2) {{
+                        arr[i] = {{
+                            type: 'Block',
+                            value: src.slice(start + 2, end - 2),
+                            start,
+                            end,
+                            ...(RANGE && {{ range: [start, end] }}),
+                        }};
+                    }} else {{
+                        arr[i] = {{
+                            type: 'Line',
+                            value: src.slice(start + (kind === 0 ? 2 : kind), end),
+                            start,
+                            end,
+                            ...(RANGE && {{ range: [start, end] }}),
+                        }};
+                    }}
+                }}
+                return arr;
+            }}
+
+            function {fn_name}(pos) {{
+                const pos32 = pos >> 2,
+                    commentsLen = int32[pos32 + 38];
+                let comments = null,
+                    rawComments = null,
+                    rawSourceText = null;
+                if (commentsLen === 0) {{
+                    comments = [];
+                }} else {{
+                    const commentsPtr = int32[pos32 + 36];
+                    rawComments = uint8.slice(commentsPtr, commentsPtr + commentsLen * 24);
+                    rawSourceText = sourceText;
+                }}
+                const program = deserializeProgram(pos);
+                const module = (int32[pos32 + 44] | int32[pos32 + 50] | int32[pos32 + 56] | int32[pos32 + 62]) === 0
+                    ? {{
+                        hasModuleSyntax: uint8[pos + 264] === 1,
+                        staticImports: [],
+                        staticExports: [],
+                        dynamicImports: [],
+                        importMetas: [],
+                    }}
+                    : deserializeEcmaScriptModule(pos + 168);
+                const errors = int32[pos32 + 70] === 0 ? [] : deserializeVecError(pos + 272);
+                return {{
+                    get program() {{
+                        return program;
+                    }},
+                    get module() {{
+                        return module;
+                    }},
+                    get comments() {{
+                        if (comments === null) {{
+                            comments = deserializeComments(rawComments, rawSourceText);
+                            rawComments = rawSourceText = null;
+                        }}
+                        return comments;
+                    }},
+                    get errors() {{
+                        return errors;
+                    }},
+                }};
+            }}
+        ");
+        return;
+    }
+
     let mut generator = StructDeserializerGenerator::new(span_type_id, schema);
 
     let body = struct_def.estree.via.as_deref().and_then(|converter_name| {
@@ -445,14 +521,24 @@ fn generate_struct(
         let needs_parent_field =
             generator.fields.contains_key("type") && !struct_def.estree.no_parent;
 
+        let mut no_parent_fields_str = String::new();
         let mut all_fields_inline = true;
         for (field_name, StructFieldValue { value, deser_type, inline }) in generator.fields {
             if let Some(value) = value.strip_prefix("...") {
                 assert!(inline, "Spread fields must be inlined");
                 match deser_type {
-                    DeserializerType::Both => write_it!(fields_str, "...{value},"),
-                    DeserializerType::JsOnly => write_it!(fields_str, "...(!IS_TS && {value}),"),
-                    DeserializerType::TsOnly => write_it!(fields_str, "...(IS_TS && {value}),"),
+                    DeserializerType::Both => {
+                        write_it!(fields_str, "...{value},");
+                        write_it!(no_parent_fields_str, "...{value},");
+                    }
+                    DeserializerType::JsOnly => {
+                        write_it!(fields_str, "...(!IS_TS && {value}),");
+                        write_it!(no_parent_fields_str, "...(!IS_TS && {value}),");
+                    }
+                    DeserializerType::TsOnly => {
+                        write_it!(fields_str, "...(IS_TS && {value}),");
+                        write_it!(no_parent_fields_str, "...(IS_TS && {value}),");
+                    }
                 }
             } else if inline || !needs_parent_field {
                 let value: Cow<str> =
@@ -470,6 +556,7 @@ fn generate_struct(
 
                 if deser_type == DeserializerType::Both {
                     write_it!(fields_str, "{field_name}: {value},");
+                    write_it!(no_parent_fields_str, "{field_name}: {value},");
                 } else {
                     let condition = match deser_type {
                         DeserializerType::JsOnly => "!IS_TS",
@@ -477,6 +564,10 @@ fn generate_struct(
                         DeserializerType::Both => unreachable!(),
                     };
                     write_it!(fields_str, "...({condition} && {{ {field_name}: {value} }}),");
+                    write_it!(
+                        no_parent_fields_str,
+                        "...({condition} && {{ {field_name}: {value} }}),"
+                    );
                 }
             } else {
                 all_fields_inline = false;
@@ -490,6 +581,7 @@ fn generate_struct(
 
                 if deser_type == DeserializerType::Both {
                     write_it!(fields_str, "{field_name}: null,");
+                    write_it!(no_parent_fields_str, "{field_name}: {value},");
                     if value != "null" {
                         write_it!(assignments_str, "node.{field_name} = {value};");
                     }
@@ -500,6 +592,10 @@ fn generate_struct(
                         DeserializerType::Both => unreachable!(),
                     };
                     write_it!(fields_str, "...({condition} && {{ {field_name}: null }}),");
+                    write_it!(
+                        no_parent_fields_str,
+                        "...({condition} && {{ {field_name}: {value} }}),"
+                    );
                     if value != "null" {
                         write_it!(assignments_str, "if ({condition}) node.{field_name} = {value};");
                     }
@@ -515,28 +611,44 @@ fn generate_struct(
             assignments_preamble_str.push_str(preamble_part.trim());
         }
 
-        let mut parent_assignment_str = "";
-        if needs_parent_field {
+        if needs_parent_field && !all_fields_inline {
             fields_str.push_str("...(PARENT && { parent }),\n");
-
-            if !all_fields_inline {
-                inline_preamble_str.push_str("const previousParent = parent;\n");
-                parent_assignment_str = "parent = ";
-                assignments_str.push_str("if (PARENT) parent = previousParent;\n");
-            }
-        }
-
-        format!(
+            format!(
+                "
+                /* IF !PARENT */
+                {inline_preamble_str}
+                {assignments_preamble_str}
+                return {{
+                    {no_parent_fields_str}
+                }};
+                /* END_IF */
+                /* IF PARENT */
+                {inline_preamble_str}
+                const previousParent = parent;
+                const node = parent = {{
+                    {fields_str}
+                }};
+                {assignments_preamble_str}
+                {assignments_str}
+                parent = previousParent;
+                return node;
+                /* END_IF */
             "
-            {inline_preamble_str}
-            const node = {parent_assignment_str} {{
-                {fields_str}
-            }};
-            {assignments_preamble_str}
-            {assignments_str}
-            return node;
-        "
-        )
+            )
+        } else {
+            if needs_parent_field {
+                fields_str.push_str("...(PARENT && { parent }),\n");
+            }
+            format!(
+                "
+                {inline_preamble_str}
+                {assignments_preamble_str}
+                return {{
+                    {fields_str}
+                }};
+            "
+            )
+        }
     });
 
     #[rustfmt::skip]
@@ -698,35 +810,53 @@ impl<'s> StructDeserializerGenerator<'s> {
         let mut inline = false;
         let value = if concat_field_count > 1 {
             // Concatenate fields
-            for (index, &field) in concat_fields[..concat_field_count].iter().enumerate() {
-                let field_pos = pos_offset(struct_offset + field.offset_64());
-                match field.type_def(self.schema) {
-                    TypeDef::Vec(vec_def) => {
-                        let field_fn = vec_def.deser_name(self.schema);
-                        if index == 0 {
-                            self.assignments_preamble
-                                .push(format!("const {field_name} = {field_fn}({field_pos});"));
-                        } else {
-                            self.assignments_preamble
-                                .push(format!("{field_name}.push(...{field_fn}({field_pos}));"));
+            if concat_field_count == 2
+                && let (TypeDef::Vec(vec_def0), TypeDef::Vec(vec_def1)) =
+                    (concat_fields[0].type_def(self.schema), concat_fields[1].type_def(self.schema))
+            {
+                let offset0 = struct_offset + concat_fields[0].offset_64();
+                let offset1 = struct_offset + concat_fields[1].offset_64();
+                let pos0 = pos_offset(offset0);
+                let pos1 = pos_offset(offset1);
+                let len0_pos32 = pos_offset_shift(offset0 + VEC_LEN_FIELD_OFFSET, 2);
+                let fn0 = vec_def0.deser_name(self.schema);
+                let fn1 = vec_def1.deser_name(self.schema);
+                self.assignments_preamble.push(format!(
+                    "let {field_name};\nif (int32[{len0_pos32}] === 0) {{\n    {field_name} = {fn1}({pos1});\n}} else {{\n    {field_name} = {fn0}({pos0});\n    {field_name}.push(...{fn1}({pos1}));\n}}"
+                ));
+            } else {
+                for (index, &field) in concat_fields[..concat_field_count].iter().enumerate() {
+                    let field_pos = pos_offset(struct_offset + field.offset_64());
+                    match field.type_def(self.schema) {
+                        TypeDef::Vec(vec_def) => {
+                            let field_fn = vec_def.deser_name(self.schema);
+                            if index == 0 {
+                                self.assignments_preamble
+                                    .push(format!("const {field_name} = {field_fn}({field_pos});"));
+                            } else {
+                                self.assignments_preamble.push(format!(
+                                    "{field_name}.push(...{field_fn}({field_pos}));"
+                                ));
+                            }
                         }
-                    }
-                    TypeDef::Option(option_def) => {
-                        let option_field_name = get_struct_field_name(field).to_string();
-                        let field_fn = option_def.deser_name(self.schema);
-                        self.assignments_preamble
-                            .push(format!("const {option_field_name} = {field_fn}({field_pos});"));
-                        if index == 0 {
+                        TypeDef::Option(option_def) => {
+                            let option_field_name = get_struct_field_name(field).to_string();
+                            let field_fn = option_def.deser_name(self.schema);
                             self.assignments_preamble.push(format!(
-                                "const {field_name} = {option_field_name} === null ? [] : [{option_field_name}];"
+                                "const {option_field_name} = {field_fn}({field_pos});"
                             ));
-                        } else {
-                            self.assignments_preamble.push(format!(
-                                "if ({option_field_name} !== null) {field_name}.push({option_field_name});"
-                            ));
+                            if index == 0 {
+                                self.assignments_preamble.push(format!(
+                                    "const {field_name} = {option_field_name} === null ? [] : [{option_field_name}];"
+                                ));
+                            } else {
+                                self.assignments_preamble.push(format!(
+                                    "if ({option_field_name} !== null) {field_name}.push({option_field_name});"
+                                ));
+                            }
                         }
+                        _ => panic!("Cannot append: `{}::{}`", struct_def.name(), field.name()),
                     }
-                    _ => panic!("Cannot append: `{}::{}`", struct_def.name(), field.name()),
                 }
             }
 
@@ -787,7 +917,86 @@ impl<'s> StructDeserializerGenerator<'s> {
 
             let value_fn = field_type.deser_name(self.schema);
             let pos = pos_offset(field_offset);
-            format!("{value_fn}({pos})")
+            let struct_name = struct_def.name();
+            if field_name == "name"
+                && matches!(
+                    struct_name,
+                    "IdentifierName"
+                        | "IdentifierReference"
+                        | "BindingIdentifier"
+                        | "LabelIdentifier"
+                        | "JSXIdentifier"
+                )
+            {
+                self.dependent_field_names.insert("start".to_string());
+                self.dependent_field_names.insert("end".to_string());
+                let ptr_pos32 = pos_offset_shift(field_offset, 2);
+                format!(
+                    "int32[{ptr_pos32}] >= sourceStartPos ? sourceText.slice(start, end) : {value_fn}({pos})"
+                )
+            } else if field_name == "name" && struct_name == "PrivateIdentifier" {
+                self.dependent_field_names.insert("start".to_string());
+                self.dependent_field_names.insert("end".to_string());
+                let ptr_pos32 = pos_offset_shift(field_offset, 2);
+                format!(
+                    "int32[{ptr_pos32}] >= sourceStartPos ? sourceText.slice(start + 1, end) : {value_fn}({pos})"
+                )
+            } else if field_name == "value" && struct_name == "StringLiteral" {
+                self.dependent_field_names.insert("start".to_string());
+                self.dependent_field_names.insert("end".to_string());
+                let ptr_pos32 = pos_offset_shift(field_offset, 2);
+                inline = true;
+                format!(
+                    "int32[{ptr_pos32}] >= sourceStartPos ? sourceText.slice(start + 1, end - 1) : {value_fn}({pos})"
+                )
+            } else if field_name == "value" && struct_name == "JSXText" {
+                self.dependent_field_names.insert("start".to_string());
+                self.dependent_field_names.insert("end".to_string());
+                let ptr_pos32 = pos_offset_shift(field_offset, 2);
+                format!(
+                    "int32[{ptr_pos32}] >= sourceStartPos ? sourceText.slice(start, end) : {value_fn}({pos})"
+                )
+            } else if let TypeDef::Primitive(prim) = field_type.innermost_type(self.schema) {
+                match prim.name() {
+                    "i32" => format!("int32[{}]", pos_offset_shift(field_offset, 2)),
+                    "u32" => format!("(int32[{}] >>> 0)", pos_offset_shift(field_offset, 2)),
+                    "u8" => format!("uint8[{pos}]"),
+                    "bool" => format!("uint8[{pos}] === 1"),
+                    "f64" => format!("float64[{}]", pos_offset_shift(field_offset, 3)),
+                    _ => format!("{value_fn}({pos})"),
+                }
+            } else if let TypeDef::Box(box_def) = field_type {
+                let inner_fn_name = box_def.inner_type(self.schema).deser_name(self.schema);
+                let ptr_pos32 = pos_offset_shift(field_offset, 2);
+                format!("{inner_fn_name}(int32[{ptr_pos32}])")
+            } else if let TypeDef::Enum(enum_def) = field_type
+                && enum_def.is_fieldless()
+                && enum_def.estree.via.is_none()
+            {
+                let mut variants = enum_def
+                    .all_variants(self.schema)
+                    .filter(|v| !should_skip_enum_variant(v))
+                    .collect::<Vec<_>>();
+                variants.sort_by_key(|v| v.discriminant);
+                if variants.iter().all(|v| v.estree.via.is_none()) {
+                    if variants.len() == 2
+                        && variants[0].discriminant == 0
+                        && variants[1].discriminant == 1
+                    {
+                        format!(
+                            "uint8[{pos}] === 0 ? '{}' : '{}'",
+                            get_fieldless_variant_value(enum_def, variants[0]),
+                            get_fieldless_variant_value(enum_def, variants[1]),
+                        )
+                    } else {
+                        format!("{}_TABLE[uint8[{pos}]]", enum_def.name())
+                    }
+                } else {
+                    format!("{value_fn}({pos})")
+                }
+            } else {
+                format!("{value_fn}({pos})")
+            }
         };
 
         self.fields.insert(field_name, StructFieldValue { value, deser_type, inline });
@@ -879,9 +1088,15 @@ fn generate_enum(
                 let ret = apply_converter_for_enum(converter_name, payload_offset, schema).unwrap();
                 switch_cases.push_str(&ret);
             } else if let Some(variant_type) = variant.field_type(schema) {
-                let variant_fn_name = variant_type.deser_name(schema);
-                let payload_pos = pos_offset(payload_offset);
-                write_it!(switch_cases, "return {variant_fn_name}({payload_pos});");
+                if let TypeDef::Box(box_def) = variant_type {
+                    let inner_fn_name = box_def.inner_type(schema).deser_name(schema);
+                    let payload_pos32 = pos_offset_shift(payload_offset, 2);
+                    write_it!(switch_cases, "return {inner_fn_name}(int32[{payload_pos32}]);");
+                } else {
+                    let variant_fn_name = variant_type.deser_name(schema);
+                    let payload_pos = pos_offset(payload_offset);
+                    write_it!(switch_cases, "return {variant_fn_name}({payload_pos});");
+                }
             } else {
                 write_it!(
                     switch_cases,
@@ -900,6 +1115,23 @@ fn generate_enum(
             "
         )
     });
+
+    if enum_def.is_fieldless() && enum_def.estree.via.is_none() {
+        let mut variants = enum_def
+            .all_variants(schema)
+            .filter(|variant| !should_skip_enum_variant(variant))
+            .collect::<Vec<_>>();
+        variants.sort_by_key(|variant| variant.discriminant);
+        if variants.iter().all(|v| v.estree.via.is_none()) && variants.len() > 2 {
+            let max_disc = variants.last().unwrap().discriminant as usize;
+            let mut entries = vec!["null".to_string(); max_disc + 1];
+            for variant in &variants {
+                entries[variant.discriminant as usize] =
+                    format!("'{}'", get_fieldless_variant_value(enum_def, variant));
+            }
+            write_it!(code, "const {type_name}_TABLE = [{}];\n", entries.join(", "));
+        }
+    }
 
     #[rustfmt::skip]
     write_it!(code, "
@@ -996,24 +1228,12 @@ static STR_DESERIALIZER_BODY: &str = "
     // Both branches are very predictable, so 2 branches wins.
     const isInSourceRegion = pos >= sourceStartPos;
     if (isInSourceRegion && end <= firstNonAsciiPos) {
-        return sourceTextLatin.substr(pos - sourceStartPos, len);
+        return sourceText.substr(pos - sourceStartPos, len);
     }
 
     // Use `utf8Slice` for strings longer than 64 bytes
     if (len > STRING_DECODE_CROSSOVER) return utf8Slice.call(uint8, pos, end);
 
-    // If string is in source region, use slice of `sourceTextLatin` if all ASCII
-    if (isInSourceRegion) {
-        // Check if all bytes are ASCII, use `utf8Slice` if not
-        for (let i = pos; i < end; i++) {
-            if (uint8[i] >= 128) return utf8Slice.call(uint8, pos, end);
-        }
-
-        // String is all ASCII, so slice from `sourceTextLatin`
-        return sourceTextLatin.substr(pos - sourceStartPos, len);
-    }
-
-    // String is not in source region - use `fromCharCode.apply` with a temp array of correct length.
     // Copy bytes into temp array.
     // If any byte is non-ASCII, use `utf8Slice`.
     const arr = stringDecodeArrays[len];
@@ -1074,10 +1294,22 @@ fn generate_option(
     let (none_condition, payload_offset) =
         get_option_none_condition_and_offset(option_def, inner_type, 0);
 
+    let call_expr = if let TypeDef::Box(box_def) = inner_type {
+        let box_inner_fn = box_def.inner_type(schema).deser_name(schema);
+        let payload_pos32 = if payload_offset == "pos" {
+            Cow::Borrowed("pos >> 2")
+        } else {
+            format_cow!("({payload_offset}) >> 2")
+        };
+        format!("{box_inner_fn}(int32[{payload_pos32}])")
+    } else {
+        format!("{inner_fn_name}({payload_offset})")
+    };
+
     #[rustfmt::skip]
     write_it!(code, "
         function {fn_name}(pos) {{
-            return ({none_condition}) ? null : {inner_fn_name}({payload_offset});
+            return ({none_condition}) ? null : {call_expr};
         }}
     ");
 }
@@ -1149,22 +1381,16 @@ fn generate_vec(vec_def: &VecDef, code: &mut String, estree_derive_id: DeriveId,
     let ptr_pos32 = pos32_offset(VEC_PTR_FIELD_OFFSET);
     let len_pos32 = pos32_offset(VEC_LEN_FIELD_OFFSET);
 
-    // Use shift if possible (stride is a power of 2)
-    let end_pos_offset = if inner_type_size.is_power_of_two() {
-        format!("(int32[{len_pos32}] << {})", inner_type_size.trailing_zeros())
-    } else {
-        format!("int32[{len_pos32}] * {inner_type_size}")
-    };
-
     #[rustfmt::skip]
     write_it!(code, "
         function {fn_name}(pos) {{
-            const arr = [],
-                pos32 = pos >> 2;
+            const pos32 = pos >> 2,
+                len = int32[{len_pos32}];
+            if (len === 0) return [];
             pos = int32[{ptr_pos32}];
-            const endPos = pos + {end_pos_offset};
-            while (pos !== endPos) {{
-                arr.push({inner_fn_name}(pos));
+            const arr = new Array(len);
+            for (let i = 0; i < len; i++) {{
+                arr[i] = {inner_fn_name}(pos);
                 pos += {inner_type_size};
             }}
             return arr;

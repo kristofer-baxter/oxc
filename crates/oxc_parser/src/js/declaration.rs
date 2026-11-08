@@ -69,10 +69,19 @@ impl<'a, C: Config> ParserImpl<'a, C> {
         declare: bool,
     ) -> ArenaBox<'a, VariableDeclaration<'a>> {
         let first = self.parse_variable_declarator(decl_parent, kind);
-        let mut declarations = ArenaVec::from_value_in(first, self);
-        while self.eat(Kind::Comma) {
-            declarations.push(self.parse_variable_declarator(decl_parent, kind));
-        }
+        let declarations = if self.eat(Kind::Comma) {
+            let mut declarations = ArenaVec::with_capacity_in(4, self);
+            declarations.push(first);
+            loop {
+                declarations.push(self.parse_variable_declarator(decl_parent, kind));
+                if !self.eat(Kind::Comma) {
+                    break;
+                }
+            }
+            declarations
+        } else {
+            ArenaVec::from_value_in(first, self)
+        };
 
         if matches!(decl_parent, VariableDeclarationParent::Statement) {
             self.asi();

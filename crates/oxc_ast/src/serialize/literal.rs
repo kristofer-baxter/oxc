@@ -12,7 +12,8 @@ use super::Null;
 #[ast_meta]
 #[estree(
     ts_type = "string | null",
-    raw_deser = "(THIS.start === 0 && THIS.end === 0) ? null : THIS.value + ''"
+    raw_deser = "(THIS.start === 0 && THIS.end === 0) ? null : (THIS.value ? 'true' : 'false')",
+    raw_deser_inline
 )]
 pub struct BooleanLiteralRaw<'b>(pub &'b BooleanLiteral);
 

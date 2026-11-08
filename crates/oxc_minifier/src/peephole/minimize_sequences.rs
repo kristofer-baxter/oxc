@@ -16,16 +16,27 @@ impl<'a> PeepholeOptimizations {
     ) -> Expression<'a> {
         if let Expression::SequenceExpression(mut sequence_expr) = a {
             // `(a, b); c`
-            sequence_expr.expressions.push(b);
+            if let Expression::SequenceExpression(b_seq) = b {
+                sequence_expr.expressions.extend(b_seq.unbox().expressions);
+            } else {
+                sequence_expr.expressions.push(b);
+            }
             sequence_expr.span = span;
             return Expression::SequenceExpression(sequence_expr);
         }
         let exprs = if let Expression::SequenceExpression(sequence_expr) = b {
             // `a; (b, c)`
-            ArenaVec::from_iter_in(std::iter::once(a).chain(sequence_expr.unbox().expressions), ctx)
+            let b_exprs = sequence_expr.unbox().expressions;
+            let mut exprs = ArenaVec::with_capacity_in((b_exprs.len() + 1).max(4), ctx);
+            exprs.push(a);
+            exprs.extend(b_exprs);
+            exprs
         } else {
             // `a; b`
-            ArenaVec::from_array_in([a, b], ctx)
+            let mut exprs = ArenaVec::with_capacity_in(4, ctx);
+            exprs.push(a);
+            exprs.push(b);
+            exprs
         };
         Expression::new_sequence_expression(span, exprs, ctx)
     }

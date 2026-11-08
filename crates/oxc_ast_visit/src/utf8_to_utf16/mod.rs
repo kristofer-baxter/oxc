@@ -113,18 +113,14 @@ impl Utf8ToUtf16 {
 
             converter.reset();
 
-            for comment in &mut program.comments {
-                converter.convert_span(&mut comment.span);
-            }
+            converter.convert_comments(&mut program.comments);
         }
     }
 
     /// Convert all spans in comments to UTF-16.
     pub fn convert_comments(&self, comments: &mut [Comment]) {
         if let Some(mut converter) = self.converter() {
-            for comment in comments {
-                converter.convert_span(&mut comment.span);
-            }
+            converter.convert_comments(comments);
         }
     }
 
@@ -204,6 +200,78 @@ mod test {
         assert_eq!(convert_back(4), 6);
         assert_eq!(convert_back(9), 11);
         assert_eq!(convert_back(11), 15);
+    }
+
+    #[test]
+    fn translate_ast_with_ascii_prefix_comments_and_statements() {
+        let allocator = Allocator::new();
+        let ast = AstBuilder::new(&allocator);
+
+        // "// ok\n; '🤨' // 🤨"
+        //  0..5  6 8..14  15..22
+        let source = "// ok\n; '🤨' // 🤨";
+        let mut program = Program::new(
+            Span::new(0, 22),
+            SourceType::default(),
+            source,
+            [Comment::new(0, 5, CommentKind::Line), Comment::new(15, 22, CommentKind::Line)],
+            None,
+            [],
+            [
+                Statement::new_empty_statement(Span::new(6, 7), &ast),
+                Statement::new_expression_statement(
+                    Span::new(8, 14),
+                    Expression::new_string_literal(Span::new(8, 14), "🤨", None, &ast),
+                    &ast,
+                ),
+            ],
+            &ast,
+        );
+
+        let span_converter = Utf8ToUtf16::new(program.source_text);
+        span_converter.convert_program_and_comments(&mut program);
+
+        assert_eq!(program.span, Span::new(0, 18));
+        assert_eq!(program.body[0].span(), Span::new(6, 7));
+        assert_eq!(program.body[1].span(), Span::new(8, 12));
+        assert_eq!(program.comments[0].span, Span::new(0, 5));
+        assert_eq!(program.comments[1].span, Span::new(13, 18));
+    }
+
+    #[test]
+    fn translate_comments_reverse_order_and_unspanned_statement() {
+        let allocator = Allocator::new();
+        let ast = AstBuilder::new(&allocator);
+
+        // Reversed comments on "// a\n// é" (UTF-8 len 10, UTF-16 len 9)
+        let span_converter = Utf8ToUtf16::new("// a\n// é");
+        let mut comments =
+            [Comment::new(5, 10, CommentKind::Line), Comment::new(0, 4, CommentKind::Line)];
+        span_converter.convert_comments(&mut comments);
+        assert_eq!(comments[0].span, Span::new(5, 9));
+        assert_eq!(comments[1].span, Span::new(0, 4));
+
+        // Modified AST where outer statement is unspanned (0, 0) but inner literal is after non-ASCII
+        let mut program = Program::new(
+            Span::new(0, 6),
+            SourceType::default(),
+            ";'é';",
+            [],
+            None,
+            [],
+            [Statement::new_expression_statement(
+                Span::new(0, 0),
+                Expression::new_string_literal(Span::new(1, 5), "é", None, &ast),
+                &ast,
+            )],
+            &ast,
+        );
+        let span_converter = Utf8ToUtf16::new(program.source_text);
+        span_converter.convert_program(&mut program);
+        let Statement::ExpressionStatement(expr_stmt) = &program.body[0] else { unreachable!() };
+        assert_eq!(expr_stmt.span, Span::new(0, 0));
+        let Expression::StringLiteral(s) = &expr_stmt.expression else { unreachable!() };
+        assert_eq!(s.span, Span::new(1, 4));
     }
 
     #[test]

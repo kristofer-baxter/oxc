@@ -2,9 +2,19 @@ use std::cell::Cell;
 
 use oxc_ast::{
     AstKind,
-    ast::{BindingIdentifier, IdentifierReference, Program, TSEnumMemberName},
+    ast::{
+        BindingIdentifier, BindingPattern, Expression, IdentifierName, IdentifierReference,
+        JSXIdentifier, JSXText, PrivateIdentifier, Program, TSEnumMemberName, TSType,
+        TSTypeAnnotation, TSTypeName,
+    },
 };
-use oxc_ast_visit::{Visit, walk::walk_ts_enum_member_name};
+use oxc_ast_visit::{
+    Visit,
+    walk::{
+        walk_binding_pattern, walk_expression, walk_ts_enum_member_name, walk_ts_type,
+        walk_ts_type_name,
+    },
+};
 use oxc_syntax::scope::{ScopeFlags, ScopeId};
 
 /// Macro to assert that `left >= right`
@@ -160,6 +170,109 @@ impl<'a> Visit<'a> for Counter {
     fn visit_identifier_reference(&mut self, _: &IdentifierReference<'a>) {
         self.stats.nodes += 1;
         self.stats.references += 1;
+    }
+
+    #[inline]
+    fn visit_identifier_name(&mut self, _: &IdentifierName<'a>) {
+        self.stats.nodes += 1;
+    }
+
+    #[inline]
+    fn visit_private_identifier(&mut self, _: &PrivateIdentifier<'a>) {
+        self.stats.nodes += 1;
+    }
+
+    #[inline]
+    fn visit_jsx_identifier(&mut self, _: &JSXIdentifier<'a>) {
+        self.stats.nodes += 1;
+    }
+
+    #[inline]
+    fn visit_jsx_text(&mut self, _: &JSXText<'a>) {
+        self.stats.nodes += 1;
+    }
+
+    #[inline]
+    fn visit_ts_type_annotation(&mut self, it: &TSTypeAnnotation<'a>) {
+        self.stats.nodes += 1;
+        self.visit_ts_type(&it.type_annotation);
+    }
+
+    #[inline]
+    fn visit_binding_pattern(&mut self, it: &BindingPattern<'a>) {
+        if matches!(it, BindingPattern::BindingIdentifier(_)) {
+            self.stats.nodes += 1;
+            self.stats.symbols += 1;
+        } else {
+            walk_binding_pattern(self, it);
+        }
+    }
+
+    #[inline]
+    fn visit_expression(&mut self, it: &Expression<'a>) {
+        match it {
+            Expression::BooleanLiteral(_)
+            | Expression::NullLiteral(_)
+            | Expression::NumericLiteral(_)
+            | Expression::BigIntLiteral(_)
+            | Expression::RegExpLiteral(_)
+            | Expression::StringLiteral(_)
+            | Expression::Super(_)
+            | Expression::ThisExpression(_) => {
+                self.stats.nodes += 1;
+            }
+            Expression::Identifier(_) => {
+                self.stats.nodes += 1;
+                self.stats.references += 1;
+            }
+            Expression::StaticMemberExpression(member) => {
+                // StaticMemberExpression + its IdentifierName property = 2 nodes
+                self.stats.nodes += 2;
+                let mut obj = &member.object;
+                while let Expression::StaticMemberExpression(inner) = obj {
+                    self.stats.nodes += 2;
+                    obj = &inner.object;
+                }
+                self.visit_expression(obj);
+            }
+            _ => walk_expression(self, it),
+        }
+    }
+
+    #[inline]
+    fn visit_ts_type(&mut self, it: &TSType<'a>) {
+        match it {
+            TSType::TSAnyKeyword(_)
+            | TSType::TSBigIntKeyword(_)
+            | TSType::TSBooleanKeyword(_)
+            | TSType::TSIntrinsicKeyword(_)
+            | TSType::TSNeverKeyword(_)
+            | TSType::TSNullKeyword(_)
+            | TSType::TSNumberKeyword(_)
+            | TSType::TSObjectKeyword(_)
+            | TSType::TSStringKeyword(_)
+            | TSType::TSSymbolKeyword(_)
+            | TSType::TSUndefinedKeyword(_)
+            | TSType::TSUnknownKeyword(_)
+            | TSType::TSVoidKeyword(_)
+            | TSType::TSThisType(_)
+            | TSType::JSDocUnknownType(_) => {
+                self.stats.nodes += 1;
+            }
+            TSType::TSTypeReference(type_ref) => {
+                self.stats.nodes += 1;
+                if let TSTypeName::IdentifierReference(_) = &type_ref.type_name {
+                    self.stats.nodes += 1;
+                    self.stats.references += 1;
+                } else {
+                    walk_ts_type_name(self, &type_ref.type_name);
+                }
+                if let Some(type_arguments) = &type_ref.type_arguments {
+                    self.visit_ts_type_parameter_instantiation(type_arguments);
+                }
+            }
+            _ => walk_ts_type(self, it),
+        }
     }
 
     #[inline]

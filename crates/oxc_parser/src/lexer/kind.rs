@@ -442,114 +442,26 @@ impl Kind {
 
     #[cold]
     pub fn match_keyword(s: &str) -> Self {
-        let len = s.len();
-        // SAFETY: Already checked `len <= 1`.
-        if len <= 1 || len >= 12 || !unsafe { s.as_bytes().get_unchecked(0) }.is_ascii_lowercase() {
-            return Ident;
-        }
-        Self::match_keyword_impl(s)
+        Self::match_keyword_bytes(s.as_bytes())
     }
 
-    fn match_keyword_impl(s: &str) -> Self {
-        match s {
-            "as" => As,
-            "do" => Do,
-            "if" => If,
-            "in" => In,
-            "is" => Is,
-            "of" => Of,
-
-            "any" => Any,
-            "for" => For,
-            "get" => Get,
-            "let" => Let,
-            "new" => New,
-            "out" => Out,
-            "set" => Set,
-            "try" => Try,
-            "var" => Var,
-
-            "case" => Case,
-            "else" => Else,
-            "enum" => Enum,
-            "from" => From,
-            "meta" => Meta,
-            "null" => Null,
-            "this" => This,
-            "true" => True,
-            "type" => Type,
-            "void" => Void,
-            "with" => With,
-
-            "async" => Async,
-            "await" => Await,
-            "break" => Break,
-            "catch" => Catch,
-            "class" => Class,
-            "const" => Const,
-            "false" => False,
-            "infer" => Infer,
-            "keyof" => KeyOf,
-            "never" => Never,
-            "super" => Super,
-            "throw" => Throw,
-            "using" => Using,
-            "while" => While,
-            "yield" => Yield,
-            "defer" => Defer,
-
-            "assert" => Assert,
-            "bigint" => BigInt,
-            "delete" => Delete,
-            "export" => Export,
-            "global" => Global,
-            "import" => Import,
-            "module" => Module,
-            "number" => Number,
-            "object" => Object,
-            "public" => Public,
-            "return" => Return,
-            "static" => Static,
-            "string" => String,
-            "switch" => Switch,
-            "symbol" => Symbol,
-            "target" => Target,
-            "typeof" => Typeof,
-            "unique" => Unique,
-            "source" => Source,
-
-            "asserts" => Asserts,
-            "boolean" => Boolean,
-            "declare" => Declare,
-            "default" => Default,
-            "extends" => Extends,
-            "finally" => Finally,
-            "package" => Package,
-            "private" => Private,
-            "require" => Require,
-            "unknown" => Unknown,
-
-            "abstract" => Abstract,
-            "accessor" => Accessor,
-            "continue" => Continue,
-            "debugger" => Debugger,
-            "function" => Function,
-            "override" => Override,
-            "readonly" => Readonly,
-
-            "interface" => Interface,
-            "intrinsic" => Intrinsic,
-            "namespace" => Namespace,
-            "protected" => Protected,
-            "satisfies" => Satisfies,
-            "undefined" => Undefined,
-
-            "implements" => Implements,
-            "instanceof" => Instanceof,
-
-            "constructor" => Constructor,
-            _ => Ident,
+    #[expect(clippy::inline_always)]
+    #[inline(always)]
+    pub fn match_keyword_bytes(lexeme: &[u8]) -> Self {
+        let len = lexeme.len();
+        if !(KEYWORD_LEN_MIN..=KEYWORD_LEN_MAX).contains(&len) {
+            return Ident;
         }
+        let c0 = lexeme[0];
+        if !c0.is_ascii_lowercase() {
+            return Ident;
+        }
+        let h = keyword_hash(c0, lexeme[1], lexeme[len - 1], len);
+        let entry = &KEYWORD_TABLE[h];
+        if entry.len as usize != len {
+            return Ident;
+        }
+        if keyword_eql(&entry.name, lexeme) { entry.kind } else { Ident }
     }
 
     pub fn to_str(self) -> &'static str {
@@ -730,3 +642,161 @@ impl Display for Kind {
         self.to_str().fmt(f)
     }
 }
+
+pub(super) const KEYWORD_LEN_MIN: usize = 2;
+pub(super) const KEYWORD_LEN_MAX: usize = 11;
+
+#[repr(C, align(16))]
+#[derive(Clone, Copy)]
+struct KeywordEntry {
+    name: [u8; 12],
+    len: u8,
+    kind: Kind,
+}
+
+#[expect(clippy::inline_always)]
+#[inline(always)]
+const fn keyword_hash(c0: u8, c1: u8, c_last: u8, len: usize) -> usize {
+    ((c0 as usize) * 3 + (c1 as usize) * 198 + (c_last as usize) * 467 + len) & 511
+}
+
+#[expect(clippy::inline_always)]
+#[inline(always)]
+fn keyword_eql(entry_name: &[u8; 12], lexeme: &[u8]) -> bool {
+    let len = lexeme.len();
+    debug_assert!((KEYWORD_LEN_MIN..=KEYWORD_LEN_MAX).contains(&len));
+    // SAFETY: `len` is in `2..=11`, and `entry_name` has length 12, so all slice ranges below are in bounds.
+    unsafe {
+        if len >= 8 {
+            let head_a = entry_name.as_ptr().cast::<u64>().read_unaligned();
+            let head_b = lexeme.as_ptr().cast::<u64>().read_unaligned();
+            let tail_a = entry_name.as_ptr().add(len - 8).cast::<u64>().read_unaligned();
+            let tail_b = lexeme.as_ptr().add(len - 8).cast::<u64>().read_unaligned();
+            head_a == head_b && tail_a == tail_b
+        } else if len >= 4 {
+            let head_a = entry_name.as_ptr().cast::<u32>().read_unaligned();
+            let head_b = lexeme.as_ptr().cast::<u32>().read_unaligned();
+            let tail_a = entry_name.as_ptr().add(len - 4).cast::<u32>().read_unaligned();
+            let tail_b = lexeme.as_ptr().add(len - 4).cast::<u32>().read_unaligned();
+            head_a == head_b && tail_a == tail_b
+        } else {
+            let head_a = entry_name.as_ptr().cast::<u16>().read_unaligned();
+            let head_b = lexeme.as_ptr().cast::<u16>().read_unaligned();
+            let tail_a = entry_name.as_ptr().add(len - 2).cast::<u16>().read_unaligned();
+            let tail_b = lexeme.as_ptr().add(len - 2).cast::<u16>().read_unaligned();
+            head_a == head_b && tail_a == tail_b
+        }
+    }
+}
+
+const KEYWORDS: &[(&[u8], Kind)] = &[
+    (b"as", As),
+    (b"do", Do),
+    (b"if", If),
+    (b"in", In),
+    (b"is", Is),
+    (b"of", Of),
+    (b"any", Any),
+    (b"for", For),
+    (b"get", Get),
+    (b"let", Let),
+    (b"new", New),
+    (b"out", Out),
+    (b"set", Set),
+    (b"try", Try),
+    (b"var", Var),
+    (b"case", Case),
+    (b"else", Else),
+    (b"enum", Enum),
+    (b"from", From),
+    (b"meta", Meta),
+    (b"null", Null),
+    (b"this", This),
+    (b"true", True),
+    (b"type", Type),
+    (b"void", Void),
+    (b"with", With),
+    (b"async", Async),
+    (b"await", Await),
+    (b"break", Break),
+    (b"catch", Catch),
+    (b"class", Class),
+    (b"const", Const),
+    (b"false", False),
+    (b"infer", Infer),
+    (b"keyof", KeyOf),
+    (b"never", Never),
+    (b"super", Super),
+    (b"throw", Throw),
+    (b"using", Using),
+    (b"while", While),
+    (b"yield", Yield),
+    (b"defer", Defer),
+    (b"assert", Assert),
+    (b"bigint", BigInt),
+    (b"delete", Delete),
+    (b"export", Export),
+    (b"global", Global),
+    (b"import", Import),
+    (b"module", Module),
+    (b"number", Number),
+    (b"object", Object),
+    (b"public", Public),
+    (b"return", Return),
+    (b"static", Static),
+    (b"string", String),
+    (b"switch", Switch),
+    (b"symbol", Symbol),
+    (b"target", Target),
+    (b"typeof", Typeof),
+    (b"unique", Unique),
+    (b"source", Source),
+    (b"asserts", Asserts),
+    (b"boolean", Boolean),
+    (b"declare", Declare),
+    (b"default", Default),
+    (b"extends", Extends),
+    (b"finally", Finally),
+    (b"package", Package),
+    (b"private", Private),
+    (b"require", Require),
+    (b"unknown", Unknown),
+    (b"abstract", Abstract),
+    (b"accessor", Accessor),
+    (b"continue", Continue),
+    (b"debugger", Debugger),
+    (b"function", Function),
+    (b"override", Override),
+    (b"readonly", Readonly),
+    (b"interface", Interface),
+    (b"intrinsic", Intrinsic),
+    (b"namespace", Namespace),
+    (b"protected", Protected),
+    (b"satisfies", Satisfies),
+    (b"undefined", Undefined),
+    (b"implements", Implements),
+    (b"instanceof", Instanceof),
+    (b"constructor", Constructor),
+];
+
+static KEYWORD_TABLE: [KeywordEntry; 512] = {
+    let mut table = [KeywordEntry { name: [0; 12], len: 0, kind: Ident }; 512];
+    let mut i = 0;
+    while i < KEYWORDS.len() {
+        let (bytes, kind) = KEYWORDS[i];
+        assert!(bytes.len() >= KEYWORD_LEN_MIN && bytes.len() <= KEYWORD_LEN_MAX);
+        let h = keyword_hash(bytes[0], bytes[1], bytes[bytes.len() - 1], bytes.len());
+        assert!(table[h].len == 0, "keyword perfect hash collision");
+        let mut name = [0u8; 12];
+        let mut j = 0;
+        while j < bytes.len() {
+            name[j] = bytes[j];
+            j += 1;
+        }
+        #[expect(clippy::cast_possible_truncation)]
+        let len = bytes.len() as u8;
+        table[h] = KeywordEntry { name, len, kind };
+        i += 1;
+    }
+    table
+};

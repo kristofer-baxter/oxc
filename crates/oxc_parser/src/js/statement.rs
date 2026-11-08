@@ -49,7 +49,7 @@ impl<'a, C: Config> ParserImpl<'a, C> {
         // syntax commits to the Module goal.
         let track_await_reparse = is_top_level && self.source_type.is_unambiguous();
 
-        let mut expecting_directives = true;
+        let mut expecting_directives = self.at(Kind::Str);
         while !self.has_fatal_error() {
             if !is_top_level && self.at(Kind::RCurly) {
                 break;
@@ -121,6 +121,17 @@ impl<'a, C: Config> ParserImpl<'a, C> {
             {
                 self.error(diagnostics::statement_in_ambient_context(stmt.span()));
                 reported_ambient_statement = true;
+            }
+            if statements.is_empty() {
+                let end = if is_top_level { Kind::Eof } else { Kind::RCurly };
+                let cap = if self.at(end) {
+                    1
+                } else if is_top_level {
+                    8
+                } else {
+                    4
+                };
+                statements = ArenaVec::with_capacity_in(cap, self);
             }
             statements.push(stmt);
         }
@@ -266,14 +277,15 @@ impl<'a, C: Config> ParserImpl<'a, C> {
     pub(super) fn parse_expression_or_labeled_statement(&mut self) -> Statement<'a> {
         let start = self.cur_start();
         let expr = self.parse_expr();
-        if let Expression::Identifier(ident) = &expr {
-            // Section 14.13 Labelled Statement
-            // Avoids lookahead for a labeled statement, which is on a hot path
-            if self.eat(Kind::Colon) {
-                let label = LabelIdentifier::new(ident.span, ident.name, self);
-                let body = self.parse_statement_list_item(StatementContext::Label);
-                return Statement::new_labeled_statement(self.end_span(start), label, body, self);
-            }
+        // Section 14.13 Labelled Statement
+        // Avoids lookahead for a labeled statement, which is on a hot path
+        if self.at(Kind::Colon)
+            && let Expression::Identifier(ident) = &expr
+        {
+            self.bump_any(); // bump `:`
+            let label = LabelIdentifier::new(ident.span, ident.name, self);
+            let body = self.parse_statement_list_item(StatementContext::Label);
+            return Statement::new_labeled_statement(self.end_span(start), label, body, self);
         }
         self.parse_expression_statement(start, expr)
     }
@@ -281,9 +293,24 @@ impl<'a, C: Config> ParserImpl<'a, C> {
     /// Section 14.2 Block Statement
     pub(crate) fn parse_block(&mut self) -> ArenaBox<'a, BlockStatement<'a>> {
         let start = self.cur_start();
-        let body = self.parse_normal_list(Kind::LCurly, Kind::RCurly, |p| {
-            p.parse_statement_list_item(StatementContext::StatementList)
-        });
+        let opening_span = self.cur_token().span();
+        self.expect(Kind::LCurly);
+        let body = if self.at(Kind::RCurly) || self.has_fatal_error() {
+            ArenaVec::new_in(self)
+        } else {
+            let first = self.parse_statement_list_item(StatementContext::StatementList);
+            if self.at(Kind::RCurly) || self.has_fatal_error() {
+                ArenaVec::from_value_in(first, self)
+            } else {
+                let mut list = ArenaVec::with_capacity_in(4, self);
+                list.push(first);
+                self.parse_normal_list_into(&mut list, Kind::RCurly, |p| {
+                    p.parse_statement_list_item(StatementContext::StatementList)
+                });
+                list
+            }
+        };
+        self.expect_closing(Kind::RCurly, opening_span);
         BlockStatement::boxed(self.end_span(start), body, self)
     }
 
@@ -817,6 +844,13 @@ impl<'a, C: Config> ParserImpl<'a, C> {
                 } else {
                     diagnostics::using_declaration_not_allowed_in_switch_bare_case(stmt.span())
                 });
+            }
+            if consequent.is_empty() {
+                let is_end = matches!(
+                    self.cur_kind(),
+                    Kind::Case | Kind::Default | Kind::RCurly | Kind::Eof | Kind::Undetermined
+                );
+                consequent = ArenaVec::with_capacity_in(if is_end { 1 } else { 2 }, self);
             }
             consequent.push(stmt);
         }

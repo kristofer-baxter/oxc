@@ -119,7 +119,7 @@ impl Lexer {
             "lexer: src must have >= {PAD} bytes of padding past len {n} (got {})",
             src.len()
         );
-        self.ensure(n, cpu);
+        self.ensure_output(n, cpu);
         let kinds = self.sig_kinds.as_mut_ptr();
         let spans = self.spans.as_mut_ptr();
         unsafe {
@@ -246,6 +246,12 @@ impl Lexer {
         if self.kwpos.is_empty() {
             self.kwpos.resize(KWB * 64 + 8, 0);
         }
+    }
+
+    #[cpu_multiversion]
+    #[inline(never)]
+    fn ensure_output(&mut self, n: usize, cpu: impl Cpu) {
+        self.ensure(n, cpu);
         let need = n + PAD;
         if self.out_cap < need {
             self.spans.resize(need + SPAN_SENTINELS, Span::new(0, 0));
@@ -259,9 +265,10 @@ impl Lexer {
     #[cpu_version(Generic)]
     #[must_use]
     pub fn kinds(&self) -> &[TokenKind] {
-        let bytes = &self.sig_kinds[..self.sig_len + SPAN_SENTINELS];
+        let end = self.sig_len + SPAN_SENTINELS;
+        let bytes = self.sig_kinds.get(..end).unwrap_or(&[]);
         debug_assert_kind_bytes(bytes);
-        // SAFETY: `lex_raw` wrote `sig_len` kinds plus the sentinels, all of
+        // SAFETY: `lex` wrote `sig_len` kinds plus the sentinels, all of
         // them declared discriminants.
         unsafe { kinds_from_bytes(bytes) }
     }

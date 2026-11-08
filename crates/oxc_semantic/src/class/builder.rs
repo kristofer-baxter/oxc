@@ -35,8 +35,25 @@ impl<'a> ClassTableBuilder<'a> {
         if !self.enabled {
             return;
         }
-        self.current_class_id =
-            Some(self.classes.declare_class(self.current_class_id, parent_node_id));
+        let elements_capacity = class
+            .body
+            .iter()
+            .filter(|element| match element {
+                ClassElement::PropertyDefinition(def) => def.key.name().is_some(),
+                ClassElement::MethodDefinition(def) => {
+                    !def.kind.is_constructor()
+                        && !def.value.is_typescript_syntax()
+                        && def.key.name().is_some()
+                }
+                ClassElement::AccessorProperty(def) => def.key.name().is_some(),
+                _ => false,
+            })
+            .count();
+        self.current_class_id = Some(self.classes.declare_class(
+            self.current_class_id,
+            parent_node_id,
+            elements_capacity,
+        ));
 
         for element in &class.body {
             match element {
@@ -157,6 +174,6 @@ impl<'a> ClassTableBuilder<'a> {
         }
         self.current_class_id = self
             .current_class_id
-            .and_then(|current_class_id| self.classes.parent_ids.get(&current_class_id).copied());
+            .and_then(|current_class_id| self.classes.parent_ids[current_class_id]);
     }
 }

@@ -3,11 +3,15 @@ use oxc_simd::{Cpu, DynCpu, cpu_multiversion, to_dyn};
 mod avx2;
 mod common;
 mod generic;
+#[cfg(target_arch = "aarch64")]
+mod neon;
 
 pub(super) use common::{scan_ident_esc, scan_number, scan_quoted, scan_regex, scan_tmpl_text};
 
 use avx2::{scan_block_comment_avx2, scan_line_comment_avx2};
 use generic::{scan_block_comment_generic, scan_line_comment_generic};
+#[cfg(target_arch = "aarch64")]
+use neon::{scan_block_comment_neon, scan_line_comment_neon};
 
 #[cpu_multiversion]
 #[inline(always)]
@@ -19,6 +23,8 @@ pub(super) unsafe fn scan_block_comment(
 ) -> (usize, bool, i64) {
     match to_dyn(cpu) {
         DynCpu::Avx2(cpu) => scan_block_comment_avx2(src, n, i, cpu),
+        #[cfg(target_arch = "aarch64")]
+        DynCpu::Neon(cpu) => scan_block_comment_neon(src, n, i, cpu),
         _ => scan_block_comment_generic(src, n, i),
     }
 }
@@ -35,6 +41,8 @@ pub(super) unsafe fn scan_line_comment(
 ) -> (usize, i64) {
     match to_dyn(cpu) {
         DynCpu::Avx2(cpu) => scan_line_comment_avx2(src, n, i, cpu),
+        #[cfg(target_arch = "aarch64")]
+        DynCpu::Neon(cpu) => scan_line_comment_neon(src, n, i, cpu),
         _ => scan_line_comment_generic(src, n, i),
     }
 }

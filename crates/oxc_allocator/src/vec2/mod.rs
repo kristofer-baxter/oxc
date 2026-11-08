@@ -2744,6 +2744,14 @@ pub struct Drain<'a, 's, T: 'a + 's, A: Alloc> {
     vec: NonNull<Vec<'a, T, A>>,
 }
 
+impl<'a, 's, T: 'a + 's, A: Alloc> Drain<'a, 's, T, A> {
+    /// Returns the remaining items of this iterator as a slice.
+    #[inline]
+    pub fn as_slice(&self) -> &[T] {
+        self.iter.as_slice()
+    }
+}
+
 impl<'a, 's, T: 'a + 's + fmt::Debug, A: Alloc> fmt::Debug for Drain<'a, 's, T, A> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_tuple("Drain").field(&self.iter.as_slice()).finish()

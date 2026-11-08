@@ -32,3 +32,17 @@ pub struct RegExpOptions {
     /// ES2024 <https://babel.dev/docs/babel-plugin-transform-unicode-sets-regex>
     pub set_notation: bool,
 }
+
+impl RegExpOptions {
+    #[inline]
+    pub(crate) const fn has_any_enabled(self) -> bool {
+        self.sticky_flag
+            || self.unicode_flag
+            || self.unicode_property_escapes
+            || self.dot_all_flag
+            || self.named_capture_groups
+            || self.look_behind_assertions
+            || self.match_indices
+            || self.set_notation
+    }
+}

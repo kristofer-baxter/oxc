@@ -202,6 +202,16 @@ pub struct StaticExport<'a> {
 
 impl<'a> FromIn<'a, ModuleRecord<'a>> for EcmaScriptModule<'a> {
     fn from_in(record: ModuleRecord<'a>, allocator: &'a Allocator) -> Self {
+        if !record.has_module_syntax {
+            return Self {
+                has_module_syntax: false,
+                static_imports: ArenaVec::new_in(&allocator),
+                static_exports: ArenaVec::new_in(&allocator),
+                dynamic_imports: record.dynamic_imports,
+                import_metas: ArenaVec::new_in(&allocator),
+            };
+        }
+
         let static_imports =
             record.requested_modules.iter().flat_map(|(name, requested_modules)| {
                 requested_modules.iter().filter(|m| m.is_import).map(|m| {

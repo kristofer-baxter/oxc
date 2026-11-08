@@ -24,7 +24,8 @@ use crate::context::TraverseCtx;
 
 /// Store for `VariableDeclarator`s to be added to enclosing statement block.
 pub struct VarDeclarationsStore<'a> {
-    stack: SparseStack<Declarators<'a>>,
+    stack: Option<SparseStack<Declarators<'a>>>,
+    empty_depth: usize,
 }
 
 /// Declarators to be inserted in a statement block.
@@ -43,7 +44,7 @@ impl<'a> Declarators<'a> {
 impl<'a> VarDeclarationsStore<'a> {
     /// Create new `VarDeclarationsStore`.
     pub fn new() -> Self {
-        Self { stack: SparseStack::new() }
+        Self { stack: None, empty_depth: 0 }
     }
 
     /// Add a `var` declaration to be inserted at top of current enclosing statement block,
@@ -162,13 +163,22 @@ impl<'a> VarDeclarationsStore<'a> {
         self.insert_let_declarator(declarator, ast);
     }
 
+    fn get_or_init_current_declarators(&mut self, ast: &AstBuilder<'a>) -> &mut Declarators<'a> {
+        let stack = self.stack.get_or_insert_with(SparseStack::new);
+        while self.empty_depth > 0 {
+            stack.push(None);
+            self.empty_depth -= 1;
+        }
+        stack.last_mut_or_init(|| Declarators::new(ast))
+    }
+
     /// Add a `var` declaration to be inserted at top of current enclosing statement block.
     pub fn insert_var_declarator(
         &mut self,
         declarator: VariableDeclarator<'a>,
         ast: &AstBuilder<'a>,
     ) {
-        let declarators = self.stack.last_mut_or_init(|| Declarators::new(ast));
+        let declarators = self.get_or_init_current_declarators(ast);
         declarators.var_declarators.push(declarator);
     }
 
@@ -178,17 +188,19 @@ impl<'a> VarDeclarationsStore<'a> {
         declarator: VariableDeclarator<'a>,
         ast: &AstBuilder<'a>,
     ) {
-        let declarators = self.stack.last_mut_or_init(|| Declarators::new(ast));
+        let declarators = self.get_or_init_current_declarators(ast);
         declarators.let_declarators.push(declarator);
     }
 }
 
 // Internal methods - called by `Common` transform
 impl<'a> VarDeclarationsStore<'a> {
+    #[inline]
     pub(crate) fn record_entering_statements(&mut self) {
-        self.stack.push(None);
+        self.empty_depth += 1;
     }
 
+    #[inline]
     pub(crate) fn insert_into_statements(
         &mut self,
         stmts: &mut ArenaVec<'a, Statement<'a>>,
@@ -197,6 +209,10 @@ impl<'a> VarDeclarationsStore<'a> {
     ) {
         if is_program_body {
             // Handle in `insert_into_program` instead
+            return;
+        }
+        if self.empty_depth > 0 {
+            self.empty_depth -= 1;
             return;
         }
 
@@ -223,7 +239,11 @@ impl<'a> VarDeclarationsStore<'a> {
         &mut self,
         ast: &AstBuilder<'a>,
     ) -> Option<(Option<Statement<'a>>, Option<Statement<'a>>)> {
-        let Declarators { var_declarators, let_declarators } = self.stack.pop()?;
+        if self.empty_depth > 0 {
+            self.empty_depth -= 1;
+            return None;
+        }
+        let Declarators { var_declarators, let_declarators } = self.stack.as_mut()?.pop()?;
 
         let var_statement = (!var_declarators.is_empty())
             .then(|| Self::create_declaration(VariableDeclarationKind::Var, var_declarators, ast));
@@ -238,8 +258,11 @@ impl<'a> VarDeclarationsStore<'a> {
     #[expect(clippy::inline_always)]
     #[inline(always)]
     pub(crate) fn assert_stack_exhausted(&self) {
-        debug_assert!(self.stack.is_exhausted());
-        debug_assert!(self.stack.last().is_none());
+        debug_assert_eq!(self.empty_depth, 0);
+        if let Some(stack) = &self.stack {
+            debug_assert!(stack.is_exhausted());
+            debug_assert!(stack.last().is_none());
+        }
     }
 
     fn create_declaration(

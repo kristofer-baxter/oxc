@@ -9,6 +9,31 @@ use typescript as ts;
 
 pub use javascript::is_function_decl_part_of_if_statement;
 
+#[inline]
+pub fn check_identifier_reference_leaf<'a>(
+    ident: &IdentifierReference<'a>,
+    ctx: &SemanticBuilder<'a>,
+) {
+    js::check_identifier_leaf(&ident.name, ident.span, ctx);
+    js::check_identifier_reference_leaf(ident, ctx);
+}
+
+#[inline]
+pub fn check_binding_identifier_leaf<'a>(ident: &BindingIdentifier<'a>, ctx: &SemanticBuilder<'a>) {
+    js::check_identifier_leaf(&ident.name, ident.span, ctx);
+    js::check_binding_identifier_leaf(ident, ctx);
+}
+
+#[inline]
+pub fn check_string_literal_leaf<'a>(lit: &StringLiteral<'a>, ctx: &SemanticBuilder<'a>) {
+    js::check_string_literal_leaf(lit, ctx);
+}
+
+#[inline]
+pub fn check_numeric_literal_leaf<'a>(lit: &NumericLiteral<'a>, ctx: &SemanticBuilder<'a>) {
+    js::check_number_literal(lit, ctx);
+}
+
 /// Perform syntax error checking for the given AST node.
 ///
 /// Must be inlined along with `SemanticBuilder::leave_node` so the compiler can see the
