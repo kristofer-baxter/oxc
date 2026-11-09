@@ -1,4 +1,4 @@
-use oxc_simd::{Cpu, DynCpu, cpu_multiversion, to_dyn};
+use oxc_simd::{Cpu, DynCpu, cpu_multiversion};
 
 mod avx2;
 mod common;
@@ -21,7 +21,7 @@ pub(super) unsafe fn scan_block_comment(
     i: usize,
     cpu: impl Cpu,
 ) -> (usize, bool, i64) {
-    match to_dyn(cpu) {
+    match DynCpu::from(cpu) {
         DynCpu::Avx2(cpu) => scan_block_comment_avx2(src, n, i, cpu),
         #[cfg(target_arch = "aarch64")]
         DynCpu::Neon(cpu) => scan_block_comment_neon(src, n, i, cpu),
@@ -39,7 +39,7 @@ pub(super) unsafe fn scan_line_comment(
     i: usize,
     cpu: impl Cpu,
 ) -> (usize, i64) {
-    match to_dyn(cpu) {
+    match DynCpu::from(cpu) {
         DynCpu::Avx2(cpu) => scan_line_comment_avx2(src, n, i, cpu),
         #[cfg(target_arch = "aarch64")]
         DynCpu::Neon(cpu) => scan_line_comment_neon(src, n, i, cpu),
