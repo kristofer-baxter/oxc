@@ -163,36 +163,41 @@ fn annex_b_block_function_and_hoisted_binding_share_a_mangled_name() {
 
 #[test]
 fn annex_b_aliases_keep_resolved_reference_membership_consistent() {
-    let source = "function outer() { var value = 1; { function value() { return value; } use(value); } return value; } use(outer());";
-    for keep_names in [false, true] {
-        let allocator = Allocator::default();
-        let parsed = Parser::new(&allocator, source, SourceType::script()).parse();
-        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
-        let mut program = parsed.program;
-        let result = Minifier::new(MinifierOptions {
-            compress: None,
-            mangle: Some(MangleOptions {
-                top_level: Some(true),
-                keep_names: MangleOptionsKeepNames { function: keep_names, class: false },
-                ..MangleOptions::default()
-            }),
-            ..MinifierOptions::default()
-        })
-        .minify(&allocator, &mut program);
-        let scoping = result.scoping.expect("mangling must return its scoping");
-        let mut references = 0;
-        for symbol_id in scoping.symbol_ids() {
-            for &reference_id in scoping.get_resolved_reference_ids(symbol_id) {
-                assert_eq!(
-                    scoping.get_reference(reference_id).symbol_id(),
-                    Some(symbol_id),
-                    "reference {reference_id:?} belongs to {symbol_id:?}, keep_names={keep_names}"
-                );
-                references += 1;
+    for reads in [1, 1024] {
+        let uses = "use(value);".repeat(reads);
+        let source = format!(
+            "function outer() {{ var value = 1; {{ function value() {{ return value; }} {uses} }} return value; }} use(outer());"
+        );
+        for keep_names in [false, true] {
+            let allocator = Allocator::default();
+            let parsed = Parser::new(&allocator, &source, SourceType::script()).parse();
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let mut program = parsed.program;
+            let result = Minifier::new(MinifierOptions {
+                compress: None,
+                mangle: Some(MangleOptions {
+                    top_level: Some(true),
+                    keep_names: MangleOptionsKeepNames { function: keep_names, class: false },
+                    ..MangleOptions::default()
+                }),
+                ..MinifierOptions::default()
+            })
+            .minify(&allocator, &mut program);
+            let scoping = result.scoping.expect("mangling must return its scoping");
+            let mut references = 0;
+            for symbol_id in scoping.symbol_ids() {
+                for &reference_id in scoping.get_resolved_reference_ids(symbol_id) {
+                    assert_eq!(
+                        scoping.get_reference(reference_id).symbol_id(),
+                        Some(symbol_id),
+                        "reference {reference_id:?} belongs to {symbol_id:?}, keep_names={keep_names}"
+                    );
+                    references += 1;
+                }
             }
-        }
 
-        assert_eq!(references, 4, "every resolved reference must occur once");
+            assert_eq!(references, reads + 3, "every resolved reference must occur once");
+        }
     }
 }
 
@@ -218,6 +223,75 @@ fn substituted_iife_arguments_preserve_tdz_exceptions() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             assert!(!output.status.success(), "TDZ read must throw:\n{source}\noutput:\n{code}");
             assert!(stderr.contains("ReferenceError:"), "{code}\n{stderr}");
+        }
+    }
+}
+
+#[test]
+fn property_extraction_preserves_tdz_exceptions() {
+    for source in [
+        "globalThis.result = (({p: void later}).p === void 0); let later = 1;",
+        "globalThis.result = (({p: void later})['p'] === void 0); let later = 1;",
+    ] {
+        let minified = minify_with_compression(
+            source,
+            SourceType::mjs(),
+            false,
+            Some(CompressOptions::smallest()),
+        );
+        for code in [source, &minified] {
+            let output = Command::new("node")
+                .args(["--input-type=module", "--eval", code])
+                .output()
+                .expect("Node.js is required to verify property extraction exceptions");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(!output.status.success(), "TDZ read must throw:\n{source}\noutput:\n{code}");
+            assert!(stderr.contains("ReferenceError:"), "{code}\n{stderr}");
+        }
+    }
+}
+
+#[test]
+fn property_extraction_preserves_inferred_stack_names() {
+    for source in [
+        "console.log(({ descriptive: function () { return new Error().stack; } }).descriptive());",
+        "console.log(({ descriptive: () => new Error().stack })['descriptive']());",
+    ] {
+        for keep_names in [true, false] {
+            let mut compress = CompressOptions::smallest();
+            compress.keep_names.function = keep_names;
+            let minified =
+                minify_with_compression(source, SourceType::mjs(), keep_names, Some(compress));
+            let reference_name = stack_function_name(source, SourceType::mjs());
+            let minified_name = stack_function_name(&minified, SourceType::mjs());
+            if keep_names {
+                assert_eq!(minified_name, reference_name, "{minified}");
+            } else {
+                assert_ne!(minified_name, reference_name, "{minified}");
+            }
+        }
+    }
+}
+
+#[test]
+fn named_iifes_preserve_stack_names() {
+    for source in [
+        "(function descriptive() { console.log(new Error().stack); })();",
+        "(function descriptive(value) { console.log(new Error().stack); return value; })(1);",
+        "(function descriptive() { console.log(new Error().stack); console.log('tail'); return 0; })();",
+    ] {
+        assert_eq!(stack_function_name(source, SourceType::mjs()), "descriptive", "{source}");
+        for keep_names in [true, false] {
+            let mut compress = CompressOptions::smallest();
+            compress.keep_names.function = keep_names;
+            let minified =
+                minify_with_compression(source, SourceType::mjs(), keep_names, Some(compress));
+            let name = stack_function_name(&minified, SourceType::mjs());
+            if keep_names {
+                assert_eq!(name, "descriptive", "{minified}");
+            } else {
+                assert_ne!(name, "descriptive", "{minified}");
+            }
         }
     }
 }

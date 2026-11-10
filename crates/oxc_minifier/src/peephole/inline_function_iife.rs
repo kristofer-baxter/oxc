@@ -41,9 +41,10 @@ impl<'a> PeepholeOptimizations {
             Expression::FunctionExpression(f) => {
                 if f.r#async
                     || f.generator
-                    || f.id
-                        .as_ref()
-                        .is_some_and(|id| !ctx.scoping().symbol_is_unused(id.symbol_id()))
+                    || f.id.as_ref().is_some_and(|id| {
+                        ctx.options().keep_names.function
+                            || !ctx.scoping().symbol_is_unused(id.symbol_id())
+                    })
                 {
                     return;
                 }
@@ -232,9 +233,10 @@ impl<'a> PeepholeOptimizations {
                 if f.r#async
                     || f.generator
                     || f.params.has_parameter()
-                    || f.id
-                        .as_ref()
-                        .is_some_and(|id| !ctx.scoping().symbol_is_unused(id.symbol_id()))
+                    || f.id.as_ref().is_some_and(|id| {
+                        ctx.options().keep_names.function
+                            || !ctx.scoping().symbol_is_unused(id.symbol_id())
+                    })
                 {
                     return None;
                 }

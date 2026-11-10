@@ -180,6 +180,7 @@ impl<'a> PeepholeOptimizations {
             if p.kind != PropertyKind::Init
                 || Self::expression_has_setter_or_getter(&p.value)
                 || p.value.may_have_side_effects(ctx)
+                || Self::discards_observable_read(&p.value, span.start, ctx)
             {
                 return None;
             }
@@ -192,18 +193,13 @@ impl<'a> PeepholeOptimizations {
             }
         }
         let matched_idx = matched_idx?;
-        for (idx, prop) in obj.properties.iter().enumerate() {
-            if idx != matched_idx
-                && let ObjectPropertyKind::ObjectProperty(p) = prop
-                && Self::discards_observable_read(&p.value, span.start, ctx)
-            {
-                return None;
-            }
-        }
         let ObjectPropertyKind::ObjectProperty(matched_prop) = &obj.properties[matched_idx] else {
             return None;
         };
-        if matched_prop.method {
+        if matched_prop.method
+            || (ctx.options().keep_names.function
+                && Self::may_yield_anonymous_function(&matched_prop.value))
+        {
             return None;
         }
         if is_callee {
