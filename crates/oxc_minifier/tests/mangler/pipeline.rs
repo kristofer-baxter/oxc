@@ -1,18 +1,29 @@
+use std::process::Command;
+
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{BindingPattern, Statement};
 use oxc_codegen::Codegen;
 use oxc_mangler::{MangleOptions, MangleOptionsKeepNames};
-use oxc_minifier::{Minifier, MinifierOptions};
+use oxc_minifier::{CompressOptions, Minifier, MinifierOptions};
 use oxc_parser::Parser;
 use oxc_span::SourceType;
 
 fn minify(source: &str, source_type: SourceType, keep_names: bool) -> String {
+    minify_with_compression(source, source_type, keep_names, None)
+}
+
+fn minify_with_compression(
+    source: &str,
+    source_type: SourceType,
+    keep_names: bool,
+    compress: Option<CompressOptions>,
+) -> String {
     let allocator = Allocator::default();
     let parsed = Parser::new(&allocator, source, source_type).parse();
     assert!(parsed.diagnostics.is_empty());
     let mut program = parsed.program;
     let result = Minifier::new(MinifierOptions {
-        compress: None,
+        compress,
         mangle: Some(MangleOptions {
             top_level: Some(true),
             keep_names: MangleOptionsKeepNames { function: keep_names, class: false },
@@ -24,8 +35,28 @@ fn minify(source: &str, source_type: SourceType, keep_names: bool) -> String {
     Codegen::new().with_scoping(result.scoping).build(&program).code
 }
 
+fn stack_function_name(source: &str, source_type: SourceType) -> String {
+    let output = Command::new("node")
+        .args([
+            "--input-type",
+            if source_type.is_module() { "module" } else { "commonjs" },
+            "--eval",
+            source,
+        ])
+        .output()
+        .expect("Node.js is required to verify function names in stack traces");
+    assert!(output.status.success(), "Node.js failed: {}", String::from_utf8_lossy(&output.stderr));
+    let stack = String::from_utf8(output.stdout).expect("Node.js stack output must be UTF-8");
+    stack
+        .lines()
+        .nth(1)
+        .and_then(|line| line.split_whitespace().nth(1))
+        .expect("Error stack must contain a named first frame")
+        .to_owned()
+}
+
 #[test]
-fn observable_function_names_are_reserved_but_call_only_names_can_shorten() {
+fn function_names_are_kept_even_when_only_called_directly() {
     let output = minify(
         "function visible() {} use(visible.name); function callOnly() {} callOnly(); const inferred = () => {}; use(inferred.name);",
         SourceType::mjs(),
@@ -33,7 +64,61 @@ fn observable_function_names_are_reserved_but_call_only_names_can_shorten() {
     );
     assert!(output.contains("function visible("), "{output}");
     assert!(output.contains("const inferred ="), "{output}");
-    assert!(!output.contains("callOnly"), "{output}");
+    assert!(output.contains("function callOnly("), "{output}");
+}
+
+#[test]
+fn stack_function_names_are_kept_in_modules_and_nested_strict_scripts() {
+    for (source, source_type) in [
+        (
+            "function descriptive() { return new Error().stack; } console.log(descriptive());",
+            SourceType::mjs(),
+        ),
+        (
+            "function outer() { 'use strict'; function descriptive() { return new Error().stack; } console.log(descriptive()); } outer();",
+            SourceType::script(),
+        ),
+    ] {
+        let original_name = stack_function_name(source, source_type);
+        assert_eq!(original_name, "descriptive", "{source}");
+        for compress in [None, Some(CompressOptions::safest())] {
+            let output = minify_with_compression(source, source_type, true, compress);
+            assert!(output.contains("function descriptive("), "{output}");
+            assert_eq!(stack_function_name(&output, source_type), original_name, "{output}");
+        }
+        let output = minify(source, source_type, false);
+        assert!(!output.contains("descriptive"), "{output}");
+        assert_ne!(stack_function_name(&output, source_type), original_name, "{output}");
+    }
+}
+
+#[test]
+fn inferred_call_only_function_names_are_kept() {
+    for (source, name) in [
+        ("const inferred = () => new Error().stack; console.log(inferred());", "inferred"),
+        (
+            "function outer(fallback = () => new Error().stack) { return fallback(); } console.log(outer());",
+            "fallback",
+        ),
+    ] {
+        let output = minify(source, SourceType::mjs(), true);
+        assert!(output.contains(&format!("{name} =")), "{output}");
+        assert!(output.contains(&format!("{name}()")), "{output}");
+        let output = minify(source, SourceType::mjs(), false);
+        assert!(!output.contains(name), "{output}");
+    }
+}
+
+#[test]
+fn annex_b_aliased_function_names_are_kept() {
+    let output = minify(
+        "function outer() { var value = 1; { function value() {} } return value; } use(outer());",
+        SourceType::script(),
+        true,
+    );
+    assert!(output.contains("var value = 1"), "{output}");
+    assert!(output.contains("function value("), "{output}");
+    assert!(output.contains("return value;"), "{output}");
 }
 
 #[test]
