@@ -1,6 +1,6 @@
 use std::{collections::hash_map::Entry, fmt, mem};
 
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use self_cell::self_cell;
 
 use oxc_allocator::{Allocator, ArenaVec, BitSet, CloneIn, CloneInSemanticIds};
@@ -275,6 +275,11 @@ mod scoping_cell {
             // So there's no way for simultaneous usage of `borrow_dependent` on another thread to break
             // the guarantee that no mutation of the `Allocator` can occur during this method.
             self.0.borrow_owner().used_bytes()
+        }
+
+        #[inline(always)]
+        pub fn allocator_capacity_bytes(&self) -> usize {
+            self.0.borrow_owner().capacity()
         }
 
         /// Consume [`ScopingCell`] and return the [`Allocator`] it contains.
@@ -1184,38 +1189,100 @@ impl Scoping {
 }
 
 impl Scoping {
-    /// Clone all semantic data. Used in `Rolldown`.
+    /// Returns the total byte capacity of the internal bump arena.
+    #[inline]
+    #[must_use]
+    pub fn allocator_capacity_bytes(&self) -> usize {
+        self.cell.allocator_capacity_bytes()
+    }
+
+    /// Returns the used byte count of the internal bump arena.
+    #[inline]
+    #[must_use]
+    pub fn allocator_used_bytes(&self) -> usize {
+        self.cell.allocator_used_bytes()
+    }
+
+    /// Clone all semantic data into a right-sized bump arena. Used in `Rolldown`.
     #[must_use]
     pub fn clone_in_with_semantic_ids_with_another_arena(&self) -> Self {
-        let used_bytes = self.cell.allocator_used_bytes();
+        const SCRATCH_CAPACITY_LIMIT: usize = 256 * 1024;
+        thread_local! {
+            static SCRATCH: std::cell::RefCell<Allocator> =
+                std::cell::RefCell::new(Allocator::default());
+        }
+
         let cell = self.cell.borrow_dependent();
+        let measured_bytes = SCRATCH.with_borrow_mut(|scratch| {
+            let symbol_names = cell.symbol_names.clone_in_with_semantic_ids(scratch);
+            let _ = cell.resolved_references.clone_in_with_semantic_ids(scratch);
+            for v in cell.symbol_redeclarations.values() {
+                let _ = v.clone_in_with_semantic_ids(scratch);
+            }
+            for map in &cell.bindings {
+                let mut cloned = Bindings::with_capacity_in(map.len(), scratch);
+                for (k, &v) in map {
+                    let key = match symbol_names.get(v.index()) {
+                        Some(&sym_name) if sym_name == *k => sym_name,
+                        _ => k.clone_in_with_semantic_ids(scratch),
+                    };
+                    cloned.insert(key, v);
+                }
+            }
+            let _ = cell.root_unresolved_references.clone_in_with_semantic_ids(scratch);
+            let used = scratch.used_bytes();
+            if scratch.capacity() > SCRATCH_CAPACITY_LIMIT {
+                *scratch = Allocator::default();
+            } else {
+                scratch.reset();
+            }
+            used
+        });
+
+        let mut no_side_effects =
+            FxHashSet::with_capacity_and_hasher(self.no_side_effects.len(), FxBuildHasher);
+        no_side_effects.extend(self.no_side_effects.iter().copied());
 
         Self {
             symbol_table: self.symbol_table.clone(),
             references: self.references.clone(),
-            no_side_effects: self.no_side_effects.clone(),
+            no_side_effects,
             enum_data: self.enum_data.clone(),
             scope_table: self.scope_table.clone(),
             cell: {
-                let allocator = Allocator::with_capacity(used_bytes);
-                ScopingCell::new(allocator, |allocator| ScopingInner {
-                    symbol_names: cell.symbol_names.clone_in_with_semantic_ids(allocator),
-                    resolved_references: cell
-                        .resolved_references
-                        .clone_in_with_semantic_ids(allocator),
-                    symbol_redeclarations: cell
-                        .symbol_redeclarations
-                        .iter()
-                        .map(|(k, v)| (*k, v.clone_in_with_semantic_ids(allocator)))
-                        .collect(),
-                    bindings: cell
-                        .bindings
-                        .iter()
-                        .map(|map| map.clone_in_with_semantic_ids(allocator))
-                        .collect(),
-                    root_unresolved_references: cell
-                        .root_unresolved_references
-                        .clone_in_with_semantic_ids(allocator),
+                let allocator = Allocator::with_capacity(measured_bytes);
+                ScopingCell::new(allocator, |allocator| {
+                    let symbol_names = cell.symbol_names.clone_in_with_semantic_ids(allocator);
+                    let resolved_references =
+                        cell.resolved_references.clone_in_with_semantic_ids(allocator);
+                    let mut symbol_redeclarations = FxHashMap::with_capacity_and_hasher(
+                        cell.symbol_redeclarations.len(),
+                        FxBuildHasher,
+                    );
+                    for (&k, v) in &cell.symbol_redeclarations {
+                        symbol_redeclarations.insert(k, v.clone_in_with_semantic_ids(allocator));
+                    }
+                    let mut bindings = IndexVec::with_capacity(cell.bindings.len());
+                    for map in &cell.bindings {
+                        let mut cloned = Bindings::with_capacity_in(map.len(), allocator);
+                        for (k, &v) in map {
+                            let key = match symbol_names.get(v.index()) {
+                                Some(&sym_name) if sym_name == *k => sym_name,
+                                _ => k.clone_in_with_semantic_ids(allocator),
+                            };
+                            cloned.insert(key, v);
+                        }
+                        bindings.push(cloned);
+                    }
+                    let root_unresolved_references =
+                        cell.root_unresolved_references.clone_in_with_semantic_ids(allocator);
+                    ScopingInner {
+                        symbol_names,
+                        resolved_references,
+                        symbol_redeclarations,
+                        bindings,
+                        root_unresolved_references,
+                    }
                 })
             },
         }
@@ -1228,6 +1295,59 @@ mod tests {
     use oxc_syntax::{node::NodeId, scope::ScopeFlags, symbol::SymbolFlags};
 
     use super::{Ident, Scoping};
+
+    #[test]
+    fn right_sized_clone_owns_names_bindings_and_references() {
+        use oxc_allocator::Allocator;
+        use oxc_parser::Parser;
+        use oxc_span::SourceType;
+
+        let cloned = {
+            let allocator = Allocator::default();
+            let source = String::from(
+                "var outer = 1; var outer; function nested(arg) { return outer + arg + missing; }",
+            );
+            let parsed = Parser::new(&allocator, &source, SourceType::mjs()).parse();
+            assert!(parsed.diagnostics.is_empty());
+            let original =
+                crate::SemanticBuilder::new().with_build_nodes(true).build(&parsed.program);
+            assert!(original.diagnostics.is_empty());
+            let original = original.semantic.scoping();
+            let cloned = original.clone_in_with_semantic_ids_with_another_arena();
+            assert_eq!(cloned.symbols_len(), original.symbols_len());
+            assert_eq!(cloned.scopes_len(), original.scopes_len());
+            assert_eq!(cloned.references_len(), original.references_len());
+            for symbol in original.symbol_ids() {
+                assert_eq!(cloned.symbol_name(symbol), original.symbol_name(symbol));
+                assert_eq!(cloned.symbol_flags(symbol), original.symbol_flags(symbol));
+                assert_eq!(cloned.symbol_scope_id(symbol), original.symbol_scope_id(symbol));
+                assert_eq!(
+                    cloned.get_resolved_reference_ids(symbol),
+                    original.get_resolved_reference_ids(symbol),
+                );
+                assert_eq!(
+                    cloned.symbol_redeclarations(symbol).len(),
+                    original.symbol_redeclarations(symbol).len(),
+                );
+            }
+            assert_eq!(
+                cloned.root_unresolved_references().len(),
+                original.root_unresolved_references().len(),
+            );
+            cloned
+        };
+        for _ in 0..3 {
+            let mut independent = cloned.clone_in_with_semantic_ids_with_another_arena();
+            let root = independent.root_scope_id();
+            let outer = independent.get_binding(root, Ident::from("outer")).unwrap();
+            independent.rename_symbol(outer, root, Ident::from("renamed"));
+            assert_eq!(independent.symbol_name(outer), "renamed");
+            assert_eq!(cloned.symbol_name(outer), "outer");
+            assert_eq!(independent.get_binding(root, Ident::from("renamed")), Some(outer));
+            assert!(independent.allocator_used_bytes() > 0);
+            assert!(independent.allocator_capacity_bytes() >= independent.allocator_used_bytes());
+        }
+    }
 
     #[test]
     fn bloom_filter_tracks_rename_and_move_binding() {

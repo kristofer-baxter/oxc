@@ -39,11 +39,11 @@ const fn mix(a: u32, b: u32) -> u32 {
 ///   across identifiers of varying lengths (`4..=8`, `9..=16`, `17+`)
 /// - **wyhash-style mixing** — 64-bit multiply + XOR-fold provides non-linear
 ///   combination where every input bit affects many output bits
-/// - **Asymmetric seeds** — XOR with different constants before mixing, so even
-///   when read windows overlap (e.g. 4-byte strings where head == tail), the two
-///   mixer inputs are always different
+/// - **Complete input coverage** — mix every four-byte chunk and any trailing
+///   window, so generated identifiers differing only in middle bytes do not systematically collide
 /// - **`const fn`** — enables compile-time hashing for `ident!("await")` macros
 #[inline]
+#[expect(clippy::cast_possible_truncation)]
 pub const fn ident_hash(s: &[u8]) -> u32 {
     // Seeds from murmur3 / splitmix
     const SEED1: u32 = 0x9E37_79B9;
@@ -51,12 +51,18 @@ pub const fn ident_hash(s: &[u8]) -> u32 {
 
     let len = s.len();
     if len >= 4 {
-        let rem = len - 4;
-        let q = rem >> 2;
-        // SAFETY: `len >= 4`, so `0 <= q <= rem = len - 4` and `0 <= rem - q <= rem = len - 4`.
-        let (head, mid1, mid2, tail) =
-            unsafe { (read_u32(s, 0), read_u32(s, q), read_u32(s, rem - q), read_u32(s, rem)) };
-        mix(head.wrapping_add(mid1 << 1) ^ SEED1, tail.wrapping_add(mid2 << 1) ^ SEED2)
+        let mut h = (len as u32) ^ SEED1;
+        let mut i = 0;
+        while i + 4 <= len {
+            // SAFETY: `i + 4 <= len`.
+            h = mix(h ^ unsafe { read_u32(s, i) }, SEED2.wrapping_add(i as u32));
+            i += 4;
+        }
+        if i < len {
+            // SAFETY: `len >= 4`, so `len - 4` is in bounds for a four-byte read.
+            h = mix(h ^ unsafe { read_u32(s, len - 4) }, 0xC2B2_AE35);
+        }
+        h
     } else if len > 0 {
         // 1-3 bytes: wyhash trick — read first, middle, last byte.
         // Captures all bytes regardless of length (middle overlaps for len=1,2).
@@ -274,6 +280,23 @@ mod test {
         let manual_hash = hasher2.finish();
 
         assert_eq!(std_hash, manual_hash);
+    }
+
+    #[test]
+    fn generated_identifiers_mix_every_byte() {
+        assert_ne!(
+            ident_hash(b"dynamic_402_jsx__exports"),
+            ident_hash(b"dynamic_483_jsx__exports"),
+        );
+        for len in 4..100 {
+            let original = vec![b'a'; len];
+            let original_hash = ident_hash(&original);
+            for position in 0..len {
+                let mut changed = original.clone();
+                changed[position] = b'b';
+                assert_ne!(original_hash, ident_hash(&changed), "len={len}, position={position}");
+            }
+        }
     }
 
     /// Verify str and Ident hash paths agree across all length buckets.

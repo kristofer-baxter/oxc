@@ -633,7 +633,7 @@ fn test_fold_logical_op() {
 fn test_fold_logical_op2() {
     fold("x = function(){} && x", "x=x");
     fold("x = true && function(){}", "x=function(){}");
-    fold("x = [(function(){alert(x)})()] && x", "x=((function(){alert(x)})(),x)");
+    fold("x = [(function(){alert(x)})()] && x", "x=(alert(x),x)");
 }
 
 // `cjs-module-lexer` scans `module.exports = { ... }` syntactically. esbuild

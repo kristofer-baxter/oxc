@@ -19,7 +19,7 @@ fn inline_constant_iife_arguments() {
 
     // Parameter facts also reach nested closures, respecting shadowing.
     test_smallest("use((x => () => x + 1)(1));", "use((x => () => 2)(1));");
-    test_smallest("use((x => x + (x => x + 1)(2))(1));", "use((x => x + (x => 3)(2))(1));");
+    test_smallest("use((x => x + (x => x + 1)(2))(1));", "use(4);");
     // Recording the argument must not duplicate it at a bare parameter read.
     test_smallest(
         "(x => effect(x))('a long string with many characters');",
@@ -67,7 +67,7 @@ fn inline_constant_function_iife_arguments() {
     test_smallest("(function (x) { return x + 1 })(1);", "");
     test_smallest("const f = function (x) { return x + 1 }; f(1);", "");
     test_smallest("(function unused(x, y) { return x + y })(1, 2);", "");
-    test_smallest("(function (x) { effect(x + 1) })(1);", "(function (x) { effect(2) })(1);");
+    test_smallest("(function (x) { effect(x + 1) })(1);", "effect(2);");
     test_smallest(
         "(function (x) { effect(x + 1) })((sideEffect(), 1));",
         "(function (x) { effect(2) })((sideEffect(), 1));",
@@ -78,7 +78,7 @@ fn inline_constant_function_iife_arguments() {
     );
     test_smallest(
         "(function (x) { effect(x) })('a long string with many characters');",
-        "(function (x) { effect(x) })('a long string with many characters');",
+        "effect('a long string with many characters');",
     );
 
     // Explicit strict mode also makes regular script IIFEs eligible.
@@ -365,15 +365,12 @@ fn readonly_var() {
     // statement before the `var` can run code that reads it.
     test_smallest(
         "var used = false; function test() { if (used) return 123; return 321; } log(test());",
-        "function test() { return 321; } log(test());",
+        "log(321);",
     );
 
     // Multiple readonly vars in a row — every preceding statement is itself a
     // safe `var = literal` so each one is inlineable in turn.
-    test_smallest(
-        "var a = 1; var b = 2; function f() { return a + b; } log(f());",
-        "function f() { return 3; } log(f());",
-    );
+    test_smallest("var a = 1; var b = 2; function f() { return a + b; } log(f());", "log(3);");
 }
 
 #[test]
@@ -486,21 +483,21 @@ fn readonly_var_through_declarative_exports() {
     // and a later var stays inlineable.
     test_smallest(
         "export function helper() {} export var A = 1; var b = 2; function f() { return b; } log(f());",
-        "export function helper() {} export var A = 1; function f() { return 2; } log(f());",
+        "export function helper() {} export var A = 1; log(2);",
     );
     test_smallest(
         "export default function helper() {} var b = 2; function f() { return b; } log(f());",
-        "export default function helper() {} function f() { return 2; } log(f());",
+        "export default function helper() {} log(2);",
     );
 }
 
 #[test]
-fn readonly_var_export_default_expression_breaks_prelude() {
+fn readonly_var_unexposed_function_after_default_export_expression() {
     // `export default <expr>` evaluates the expression at module init, which
-    // can call user code. A later var must not inline.
+    // can call user code, but cannot reach a local function that has not escaped.
     test_smallest(
         "export default sideEffect(); var b = 2; function f() { return b; } log(f());",
-        "export default sideEffect(); var b = 2; function f() { return b; } log(f());",
+        "export default sideEffect(); log(2);",
     );
 }
 
@@ -522,18 +519,16 @@ fn readonly_var_in_function_body() {
     // which substitute_single_use_symbol can't reach.
     test_smallest(
         "function outer() { var flag = false; function inner() { return flag ? 1 : 2; } return inner(); } log(outer());",
-        "function outer() { function inner() { return 2; } return inner(); } log(outer());",
+        "log(2);",
     );
 }
 
 #[test]
-fn readonly_var_in_function_body_unsafe_preceding_call() {
-    // Same hoisting hazard as top-level: an observable call before the var
-    // inside the function body could invoke a hoisted inner function that
-    // reads `flag` as `undefined`. Skip.
+fn readonly_var_unexposed_nested_function_after_call() {
+    // The global call cannot reach this local inner function before initialization.
     test_smallest(
         "function outer() { sideEffect(); var flag = true; function inner() { return flag; } return inner(); } log(outer());",
-        "function outer() { sideEffect(); var flag = !0; function inner() { return flag; } return inner(); } log(outer());",
+        "function outer() { return sideEffect(), !0; } log(outer());",
     );
 }
 
@@ -557,7 +552,7 @@ fn readonly_var_after_type_declaration() {
     // stays inlineable.
     test_options_source_type(
         "type T = number; interface I {} var b = 2; function f() { return b; } log(f());",
-        "type T = number; interface I {} function f() { return 2; } log(f());",
+        "type T = number; interface I {} log(2);",
         SourceType::ts().with_module(true),
         &CompressOptions::smallest(),
     );
@@ -572,14 +567,13 @@ fn readonly_var_after_type_declaration() {
 fn fold_writeonce_falsy_var_in_boolean_context() {
     // Multiple same-frame boolean reads.
     test_smallest("var h = false; if (h) a(); if (h) b()", "");
-    // Read inside a function, past a side-effectful prelude (`g()` runs first):
-    // the hoisting gate withholds value-context folding; boolean context is sound.
+    // A global call cannot reach an unexposed local function.
     test_smallest("g(); var h = false; function f() { if (h) a() } f()", "g();");
 
-    // Value context must NOT fold (a pre-init read would observe `undefined`).
+    // Value context also folds when closure exposure rules out a pre-init read.
     test_smallest(
         "g(); var h = false; function f() { sink(h) } f()",
-        "g(); var h = !1; function f() { sink(h); } f();",
+        "g(); function f() { sink(!1); } f();",
     );
     // Reassigned => not write-once => not folded.
     test_smallest("var h = false; h = 1; if (h) a()", "var h = !1; h = 1, h && a();");
@@ -591,6 +585,54 @@ fn fold_writeonce_falsy_var_in_boolean_context() {
         "var h = !1; function f() { h && a(); } f();",
         SourceType::cjs().with_script(true),
         &CompressOptions::smallest(),
+    );
+}
+
+#[test]
+fn closure_exposure_blocks_preinitialization_constant_reads() {
+    test_smallest(
+        "expose(f); var value = 1; function f() { return value; } use(f());",
+        "expose(f); var value = 1; function f() { return value; } use(f());",
+    );
+    test_smallest(
+        "export function f() { return value; } unknown(); var value = 1; use(f());",
+        "export function f() { return value; } unknown(); var value = 1; use(f());",
+    );
+    test_smallest(
+        "function f() { let value = 1; eval('value = 2'); return value; } use(f());",
+        "function f() { let value = 1; return eval('value = 2'), value; } use(f());",
+    );
+}
+
+#[test]
+fn commonjs_wrapper_arguments_preserve_hidden_writes() {
+    test_options_source_type(
+        "var module = 1; arguments[2] = 2; use(module);",
+        "var module = 1; arguments[2] = 2, use(module);",
+        SourceType::cjs(),
+        &CompressOptions::smallest(),
+    );
+    test_options_source_type(
+        "var exports = {}; arguments[0] = other; use(exports);",
+        "var exports = {}; arguments[0] = other, use(exports);",
+        SourceType::cjs(),
+        &CompressOptions::smallest(),
+    );
+}
+
+#[test]
+fn child_simplification_reschedules_ancestor_candidate_scans() {
+    test_smallest(
+        "function outer() { function inner() { let p = 'metric'; [...[p, , , p]]; return 1; } return inner(); } use(outer());",
+        "use(1);",
+    );
+}
+
+#[test]
+fn regular_iife_preserves_effectful_argument_order() {
+    test_smallest(
+        "(function(a, b) { sink(a, b); })(first(), second());",
+        "(function(a, b) { sink(a, b); })(first(), second());",
     );
 }
 

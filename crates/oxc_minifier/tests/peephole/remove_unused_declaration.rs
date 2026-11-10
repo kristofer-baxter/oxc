@@ -423,10 +423,7 @@ fn remove_recursive_unused_nested_in_live_function() {
     // Dead recursion inside a used function: statement-level tree shaking
     // (rolldown's linker) cannot see inside bodies, so this must be handled
     // here.
-    test_smallest(
-        "function live() { function inner() { inner() } return 1; } g(live());",
-        "function live() { return 1; } g(live());",
-    );
+    test_smallest("function live() { function inner() { inner() } return 1; } g(live());", "g(1);");
 }
 
 // ---- Site-local self-recursive declarators ----
@@ -460,7 +457,7 @@ fn keep_reachable_self_recursive_function_valued_declarators() {
 // same local self-reference check without becoming a graph candidate.
 #[test]
 fn remove_self_recursive_for_init_declarator() {
-    test_smallest("for (let f = () => f();;) break;", "for (;;) break;");
+    test_smallest("for (let f = () => f();;) break;", "");
 }
 
 // ---- Non-candidates: declarator and class cycles ----
@@ -866,7 +863,7 @@ fn keep_script_root_var_in_nested_statement_after_cycle_removed() {
     let source = "function outer() { function d1() { return x + d2() } function d2() { return d1() } return 1 } outer(); switch (1) { case 1: var x = 42; }";
     // Script globals can be rebound through global-object properties without a
     // resolved write reference, so the call cannot reuse a pure summary.
-    let expected = "function outer() { return 1 } if (outer(), 1) var x = 42;";
+    let expected = "function outer() { return 1 } outer(); var x = 42;";
     test_options_source_type(source, expected, SourceType::script(), &options);
 
     // CommonJS top-level vars are wrapper-local, so ordinary counts may remove them.

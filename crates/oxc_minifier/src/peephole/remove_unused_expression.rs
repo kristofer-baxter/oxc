@@ -11,7 +11,10 @@ use oxc_ecmascript::{
     side_effects::{MayHaveSideEffects, MayHaveSideEffectsContext},
 };
 use oxc_span::GetSpan;
-use oxc_syntax::{scope::ScopeId, symbol::SymbolId};
+use oxc_syntax::{
+    scope::{ScopeFlags, ScopeId},
+    symbol::SymbolId,
+};
 
 use super::PeepholeOptimizations;
 use super::fold_constants::is_cjs_module_exports_hint;
@@ -24,7 +27,14 @@ impl<'a> PeepholeOptimizations {
         if Self::expr_has_specialized_unused_handler(e) {
             match e {
                 Expression::ArrayExpression(_) => Self::remove_unused_array_expr(e, ctx),
-                Expression::AssignmentExpression(_) => Self::remove_unused_assignment_expr(e, ctx),
+                Expression::AssignmentExpression(_) => {
+                    let removed = Self::remove_unused_assignment_expr(e, ctx);
+                    if !removed && matches!(e, Expression::SequenceExpression(_)) {
+                        Self::remove_unused_sequence_expr(e, ctx)
+                    } else {
+                        removed
+                    }
+                }
                 Expression::BinaryExpression(_) => Self::remove_unused_binary_expr(e, ctx),
                 Expression::CallExpression(_) => Self::remove_unused_call_expr(e, ctx),
                 Expression::ClassExpression(_) => Self::remove_unused_class_expr(e, ctx),
@@ -57,7 +67,9 @@ impl<'a> PeepholeOptimizations {
     pub(crate) fn derived_constructor_this_scope(ctx: &TraverseCtx<'a>) -> Option<ScopeId> {
         for scope_id in ctx.ancestor_scopes() {
             let flags = ctx.scoping().scope_flags(scope_id);
-            if flags.is_block() || flags.is_arrow() {
+            // Only a `var` scope other than an arrow function binds its own `this`;
+            // block, `catch`, and arrow scopes use the enclosing one.
+            if flags.is_arrow() || !flags.intersects(ScopeFlags::Var) {
                 continue;
             }
             if !flags.is_constructor() {
@@ -672,6 +684,44 @@ impl<'a> PeepholeOptimizations {
     fn remove_unused_call_expr(e: &mut Expression<'a>, ctx: &mut TraverseCtx<'a>) -> bool {
         let Expression::CallExpression(call_expr) = e else { return false };
 
+        if !ctx.is_tree_shake_only()
+            && !ctx.state.symbols.enum_iife_symbols.is_empty()
+            && call_expr.arguments.len() == 1
+            && let Some(arg_expr) = call_expr.arguments[0].as_expression()
+        {
+            let enum_sym_and_refs = match arg_expr.without_parentheses() {
+                Expression::AssignmentExpression(assign)
+                    if assign.operator == AssignmentOperator::LogicalOr =>
+                {
+                    if let AssignmentTarget::AssignmentTargetIdentifier(id) = &assign.left {
+                        ctx.scoping()
+                            .get_reference(id.reference_id())
+                            .symbol_id()
+                            .map(|sym| (sym, 1usize))
+                    } else {
+                        None
+                    }
+                }
+                Expression::LogicalExpression(logic) if logic.operator == LogicalOperator::Or => {
+                    if let Expression::Identifier(id) = logic.left.without_parentheses() {
+                        ctx.scoping()
+                            .get_reference(id.reference_id())
+                            .symbol_id()
+                            .map(|sym| (sym, 2usize))
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+            if let Some((sym, max_self_refs)) = enum_sym_and_refs
+                && ctx.state.symbols.enum_iife_symbols.contains(&sym)
+                && ctx.scoping().get_resolved_reference_ids(sym).len() <= max_self_refs
+            {
+                return true;
+            }
+        }
+
         let is_pure = {
             (call_expr.pure && ctx.annotations())
                 || ctx.manual_pure_functions(&call_expr.callee)
@@ -700,6 +750,9 @@ impl<'a> PeepholeOptimizations {
             return false;
         }
 
+        if let Some(removable) = Self::expand_unused_function_iife(e, ctx) {
+            return removable;
+        }
         !Self::has_side_effects_or_preserved_iife(e, ctx)
     }
 
@@ -825,7 +878,7 @@ impl<'a> PeepholeOptimizations {
         let Expression::AssignmentExpression(assign_expr) = &*e else { unreachable!() };
 
         let Some(symbol_id) = Self::resolve_member_assign_object_symbol(assign_expr, ctx) else {
-            return false;
+            return Self::remove_unused_inline_fresh_member_assignment(e, ctx);
         };
 
         if !e.may_have_side_effects(ctx) {
@@ -882,6 +935,116 @@ impl<'a> PeepholeOptimizations {
         let new_expr = Self::preserve_indirect_access_if_needed(span, new_expr, ctx);
         ctx.replace_expression(e, new_expr);
         false
+    }
+
+    fn remove_unused_inline_fresh_member_assignment(
+        e: &mut Expression<'a>,
+        ctx: &mut TraverseCtx<'a>,
+    ) -> bool {
+        if ctx.is_tree_shake_only() || ctx.current_scope_flags().contains_direct_eval() {
+            return false;
+        }
+        let Expression::AssignmentExpression(assign_expr) = &*e else { return false };
+        if assign_expr.operator != AssignmentOperator::Assign {
+            return false;
+        }
+        let obj = match &assign_expr.left {
+            AssignmentTarget::StaticMemberExpression(m)
+                if !m.optional && m.property.name != "__proto__" =>
+            {
+                &m.object
+            }
+            AssignmentTarget::ComputedMemberExpression(m)
+                if !m.optional && Self::member_key_is_safe(&m.expression) =>
+            {
+                &m.object
+            }
+            _ => return false,
+        };
+        let is_safe_inline_fresh = match obj.without_parentheses() {
+            Expression::ObjectExpression(obj_expr) => {
+                Self::fresh_value_kind(obj.without_parentheses()) == FreshValueKind::Object
+                    && Self::object_literal_has_own_data_prop_or_null_proto(
+                        obj_expr,
+                        &assign_expr.left,
+                    )
+            }
+            _ => false,
+        };
+        if !is_safe_inline_fresh {
+            return false;
+        }
+        let obj_has_effects = obj.may_have_side_effects(ctx)
+            || Self::discards_observable_read(obj, assign_expr.span.start, ctx);
+        let rhs_has_effects = assign_expr.right.may_have_side_effects(ctx)
+            || Self::discards_observable_read(&assign_expr.right, assign_expr.span.start, ctx);
+        if !obj_has_effects {
+            if !rhs_has_effects {
+                return true;
+            }
+            let Expression::AssignmentExpression(assign_expr) = e else { unreachable!() };
+            let span = assign_expr.span;
+            let new_expr = assign_expr.right.take_in(ctx);
+            let new_expr = Self::preserve_indirect_access_if_needed(span, new_expr, ctx);
+            ctx.replace_expression(e, new_expr);
+            return false;
+        }
+        let Expression::AssignmentExpression(assign_expr) = e else { unreachable!() };
+        let span = assign_expr.span;
+        let mut obj_expr = match &mut assign_expr.left {
+            AssignmentTarget::StaticMemberExpression(m) => m.object.take_in(ctx),
+            AssignmentTarget::ComputedMemberExpression(m) => m.object.take_in(ctx),
+            _ => unreachable!(),
+        };
+        let rhs_expr = assign_expr.right.take_in(ctx);
+        let rhs_expr = Self::preserve_indirect_access_if_needed(span, rhs_expr, ctx);
+        if Self::remove_unused_expression(&mut obj_expr, ctx) {
+            ctx.drop_expression(&obj_expr);
+            ctx.replace_expression(e, rhs_expr);
+            return !rhs_has_effects;
+        }
+        let seq = Self::join_sequence(span, obj_expr, rhs_expr, ctx);
+        ctx.replace_expression(e, seq);
+        false
+    }
+
+    fn object_literal_has_own_data_prop_or_null_proto(
+        obj_expr: &ObjectExpression<'a>,
+        target: &AssignmentTarget<'a>,
+    ) -> bool {
+        let target_key = match target {
+            AssignmentTarget::StaticMemberExpression(m) => Some(m.property.name.as_str()),
+            AssignmentTarget::ComputedMemberExpression(m) => {
+                match m.expression.without_parentheses() {
+                    Expression::StringLiteral(s) => s.value.as_str(),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        let mut has_own_data = false;
+        let mut has_null_proto = false;
+        for prop in &obj_expr.properties {
+            let ObjectPropertyKind::ObjectProperty(p) = prop else {
+                return false;
+            };
+            if p.computed || p.method || p.kind != PropertyKind::Init {
+                return false;
+            }
+            let key_name = match &p.key {
+                PropertyKey::StaticIdentifier(id) => Some(id.name.as_str()),
+                PropertyKey::StringLiteral(s) => s.value.as_str(),
+                _ => None,
+            };
+            if key_name == Some("__proto__")
+                && matches!(p.value.without_parentheses(), Expression::NullLiteral(_))
+            {
+                has_null_proto = true;
+            } else if target_key.is_some() && key_name == target_key {
+                has_own_data = true;
+            }
+        }
+        has_own_data || has_null_proto
     }
 
     /// Whether a member assignment target is a single-level member write

@@ -53,6 +53,80 @@ fn rewrites_runtime_property_positions() {
 }
 
 #[test]
+fn exact_allowlist_intersects_regex_and_all_reservations() {
+    let mut opts = ManglePropertiesOptions::from_names([
+        "_a",
+        "plain",
+        "_skip",
+        "_dynamic",
+        "_reserved",
+        "_cached",
+        "constructor",
+        "1",
+    ]);
+    opts.include = lazy_regex::Regex::new("^_[a-z]+$").unwrap();
+    opts.exclude = Some(lazy_regex::Regex::new("^_s(?:kip|pare)$").unwrap());
+    opts.exclude_prefix("");
+    opts.exclude_prefix("_dyn");
+    opts.reserve_name("_reserved");
+    opts.cache.insert_str("_cached", None).unwrap();
+    opts.cache.insert_str("_reserved", Some("pinned")).unwrap();
+    opts.cache.insert_str("_skip", Some("pinned")).unwrap();
+    opts.cache.insert_str("_dynamic", Some("pinned")).unwrap();
+    opts.mangle_quoted = true;
+    test(
+        "obj._a; obj.plain; obj._skip; obj._dynamic; obj._reserved; obj._cached; obj._outside; obj.constructor; obj[1];",
+        "obj.e; obj.plain; obj._skip; obj._dynamic; obj._reserved; obj._cached; obj._outside; obj.constructor; obj[1];",
+        opts,
+    );
+    test("obj._a;", "obj._a;", ManglePropertiesOptions::from_names([] as [&str; 0]));
+    let mut opts = ManglePropertiesOptions::from_names(["constructor", "1", "_field"]);
+    opts.mangle_quoted = true;
+    opts.cache.insert_str("constructor", Some("pinned")).unwrap();
+    opts.cache.insert_str("1", Some("pinned")).unwrap();
+    test("obj.constructor; obj[1]; obj._field;", "obj.constructor; obj[1]; obj.e;", opts);
+}
+
+#[test]
+fn string_words_reserve_sources_and_generated_targets_including_directives() {
+    let opts = ManglePropertiesOptions::from_names(["_picked", "_blocked", "_template"]);
+    test(
+        "'directive r'; use('words _blocked e'); use(`t ${x} _template`); obj._picked; obj._blocked; obj._template;",
+        "'directive r'; use('words _blocked e'); use(`t ${x} _template`); obj.n; obj._blocked; obj._template;",
+        opts,
+    );
+    let mut opts = ManglePropertiesOptions::from_names(["_blocked"]);
+    opts.reserve_string_words = false;
+    test("use('word _blocked'); obj._blocked;", "use('word _blocked'); obj.e;", opts);
+}
+
+#[test]
+fn annotated_keys_do_not_reserve_their_own_words() {
+    test(
+        "obj._field; use(/* @__KEY__ */ '_field'); use(/* @__KEY__ */ `_field`);",
+        "obj.e; use(/* @__KEY__ */ 'e'); use(/* @__KEY__ */ `e`);",
+        ManglePropertiesOptions::from_names(["_field"]),
+    );
+    let mut opts = ManglePropertiesOptions::from_names(["_field"]);
+    opts.cache.insert_str("_field", Some("stable")).unwrap();
+    test("use('word _field'); obj._field;", "use('word _field'); obj._field;", opts);
+}
+
+#[test]
+fn string_word_reservations_are_shared_across_programs() {
+    let allocator = Allocator::default();
+    let mut first = Parser::new(&allocator, "obj._field;", SourceType::mjs()).parse().program;
+    let second = Parser::new(&allocator, "use('word _field');", SourceType::mjs()).parse().program;
+    let mut mangler =
+        PropertyMangler::new_in(ManglePropertiesOptions::from_names(["_field"]), &allocator);
+    mangler.collect(&first);
+    mangler.collect(&second);
+    mangler.assign();
+    mangler.rewrite(&mut first);
+    assert_eq!(Codegen::new().build(&first).code, codegen("obj._field;", SourceType::mjs()));
+}
+
+#[test]
 fn quoted_behavior_is_per_occurrence() {
     test(
         "obj._foo; obj['_foo']; ({ _foo: 1, '_foo': 2 });",

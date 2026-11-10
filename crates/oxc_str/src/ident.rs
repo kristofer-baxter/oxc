@@ -755,6 +755,19 @@ mod test {
     }
 
     #[test]
+    fn generated_identifiers_support_borrowed_and_prehashed_lookups() {
+        let names = ["dynamic_402_jsx__exports", "dynamic_483_jsx__exports"];
+        let mut map = IdentHashMap::default();
+        for (index, name) in names.into_iter().enumerate() {
+            map.insert(Ident::from(name), index);
+        }
+        for (index, name) in names.into_iter().enumerate() {
+            assert_eq!(map.get(name), Some(&index));
+            assert_eq!(map.get(&Ident::from(name)), Some(&index));
+        }
+    }
+
+    #[test]
     fn ident_clone_in() {
         let allocator = Allocator::new();
         let original = Ident::from("test");

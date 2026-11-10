@@ -1,19 +1,32 @@
 //! Minifier-owned symbol data, grouped by storage lifetime and density.
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
+
+use std::cell::Cell;
 
 use oxc_allocator::Allocator;
+use oxc_ecmascript::constant_evaluation::ConstantValue;
 use oxc_index::IndexVec;
 use oxc_semantic::Scoping;
 use oxc_span::SourceType;
+use oxc_str::CompactStr;
 use oxc_syntax::symbol::SymbolId;
 
 use crate::{
     CompressOptions,
     symbol_liveness::SymbolLiveness,
     symbol_metadata::{FunctionSummary, MemberWriteEffect, PersistentSymbolMetadata},
-    symbol_value::SymbolValue,
+    symbol_value::{ReferenceCounts, SymbolValue, SymbolValueDigest},
 };
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum TrivialFunction<'a> {
+    ZeroParamConstant(ConstantValue<'a>),
+    OneParamConstant(ConstantValue<'a>),
+    Identity1Param,
+}
+
+type MemberConstants<'a> = (u32, Option<u32>, FxHashMap<CompactStr, ConstantValue<'a>>);
 
 /// Symbol-indexed data owned by the minifier.
 ///
@@ -23,13 +36,20 @@ use crate::{
 /// - `persistent` is sparse metadata retained across passes;
 /// - `liveness` is stable observability metadata plus optional graph results.
 pub struct SymbolState<'a> {
-    /// Per-pass scratch indexed directly by dense semantic symbol IDs.
-    ///
-    /// Sized once from `Scoping::symbols_len()`; no minifier pass mints new
-    /// symbols, so indexed writes intentionally panic if that contract changes.
     values: IndexVec<SymbolId, Option<SymbolValue<'a>>>,
+    populated_symbols: Vec<SymbolId>,
+    cached_ref_counts: IndexVec<SymbolId, Cell<Option<ReferenceCounts>>>,
+    prev_digests: IndexVec<SymbolId, Option<SymbolValueDigest>>,
     persistent: FxHashMap<SymbolId, PersistentSymbolMetadata>,
     liveness: Option<SymbolLiveness<'a>>,
+    pub(crate) member_constants: FxHashMap<SymbolId, MemberConstants<'a>>,
+    pub(crate) enum_iife_symbols: FxHashSet<SymbolId>,
+    pub(crate) verified_enum_iifes: FxHashMap<
+        SymbolId,
+        (Option<oxc_syntax::reference::ReferenceId>, Option<oxc_syntax::reference::ReferenceId>),
+    >,
+    pub(crate) trivial_functions: FxHashMap<SymbolId, (u32, Option<u32>, TrivialFunction<'a>)>,
+    pub(crate) cached_allow_enum_iife: Option<bool>,
 }
 
 impl<'a> SymbolState<'a> {
@@ -39,20 +59,33 @@ impl<'a> SymbolState<'a> {
         scoping: &Scoping,
         allocator: &'a Allocator,
     ) -> Self {
-        let mut values = IndexVec::with_capacity(scoping.symbols_len());
-        values.resize_with(scoping.symbols_len(), || None);
+        let len = scoping.symbols_len();
+        let mut values = IndexVec::with_capacity(len);
+        values.resize_with(len, || None);
+        let mut cached_ref_counts = IndexVec::with_capacity(len);
+        cached_ref_counts.resize_with(len, || Cell::new(None));
+        let mut prev_digests = IndexVec::with_capacity(len);
+        prev_digests.resize_with(len, || None);
         Self {
             values,
+            populated_symbols: Vec::with_capacity(len / 2),
+            cached_ref_counts,
+            prev_digests,
             persistent: FxHashMap::default(),
             liveness: SymbolLiveness::new_if_enabled(source_type, options, scoping, allocator),
+            member_constants: FxHashMap::default(),
+            enum_iife_symbols: FxHashSet::default(),
+            verified_enum_iifes: FxHashMap::default(),
+            trivial_functions: FxHashMap::default(),
+            cached_allow_enum_iife: None,
         }
     }
 
     /// Clear values without releasing the buffer so the next pass stays on
     /// the indexed-write fast path.
     pub fn reset_values(&mut self) {
-        for value in &mut self.values {
-            *value = None;
+        for symbol_id in self.populated_symbols.drain(..) {
+            self.values[symbol_id] = None;
         }
     }
 
@@ -62,7 +95,11 @@ impl<'a> SymbolState<'a> {
         symbol_id: SymbolId,
         value: SymbolValue<'a>,
     ) -> &mut SymbolValue<'a> {
-        self.values[symbol_id].insert(value)
+        let slot = &mut self.values[symbol_id];
+        if slot.is_none() {
+            self.populated_symbols.push(symbol_id);
+        }
+        slot.insert(value)
     }
 
     #[inline]
@@ -70,16 +107,63 @@ impl<'a> SymbolState<'a> {
         self.values.get(symbol_id)?.as_ref()
     }
 
-    pub fn set_function_summary(&mut self, symbol_id: SymbolId, summary: FunctionSummary) {
-        self.persistent.entry(symbol_id).or_default().set_function_summary(summary);
+    #[inline]
+    pub fn has_cached_ref_counts(&self, symbol_id: SymbolId) -> bool {
+        self.cached_ref_counts[symbol_id].get().is_some()
     }
 
-    pub fn clear_function_summary(&mut self, symbol_id: SymbolId) {
-        if let Some(metadata) = self.persistent.get_mut(&symbol_id) {
-            // Clear in place: removing this shared entry would also erase its
-            // monotone member-write effect.
-            metadata.set_function_summary(FunctionSummary::Unknown);
+    #[inline]
+    pub fn reference_counts(&self, symbol_id: SymbolId, scoping: &Scoping) -> ReferenceCounts {
+        if let Some(counts) = self.cached_ref_counts[symbol_id].get() {
+            return counts;
         }
+        let mut counts = ReferenceCounts::default();
+        for reference in scoping.get_resolved_references(symbol_id) {
+            counts.record(reference.flags());
+        }
+        self.cached_ref_counts[symbol_id].set(Some(counts));
+        counts
+    }
+
+    #[inline]
+    pub fn symbol_is_mutated(&self, symbol_id: SymbolId, scoping: &Scoping) -> bool {
+        if scoping.symbol_flags(symbol_id).is_const_variable() {
+            return false;
+        }
+        if let Some(sv) = self.value(symbol_id) {
+            return sv.references.has_writes();
+        }
+        self.reference_counts(symbol_id, scoping).has_writes()
+    }
+
+    #[inline]
+    pub fn invalidate_symbol(&self, symbol_id: SymbolId) {
+        self.cached_ref_counts[symbol_id].set(None);
+    }
+
+    #[inline]
+    pub fn update_digest(&mut self, symbol_id: SymbolId, digest: SymbolValueDigest) -> bool {
+        let prev = self.prev_digests[symbol_id].replace(digest);
+        prev != Some(digest)
+    }
+
+    pub fn set_function_summary(&mut self, symbol_id: SymbolId, summary: FunctionSummary) -> bool {
+        let entry = self.persistent.entry(symbol_id).or_default();
+        if entry.function_summary() == summary {
+            return false;
+        }
+        entry.set_function_summary(summary);
+        true
+    }
+
+    pub fn clear_function_summary(&mut self, symbol_id: SymbolId) -> bool {
+        if let Some(metadata) = self.persistent.get_mut(&symbol_id)
+            && metadata.function_summary() != FunctionSummary::Unknown
+        {
+            metadata.set_function_summary(FunctionSummary::Unknown);
+            return true;
+        }
+        false
     }
 
     pub fn function_summary(&self, symbol_id: SymbolId) -> FunctionSummary {

@@ -208,11 +208,11 @@ fn test_inline_single_use_variable() {
 
     test(
         "function wrapper() { var x = 1; for (var i = x; i < 10; i++) console.log(i) }",
-        "function wrapper() { for (var i = 1; i < 10; i++) console.log(i) }",
+        "function wrapper() { for (var x = 1, i = 1; i < 10; i++) console.log(i) }",
     );
     test(
         "function wrapper() { var x = 1; for (let i = x; i < 10; i++) console.log(i) }",
-        "function wrapper() { for (let i = 1; i < 10; i++) console.log(i) }",
+        "function wrapper() { var x = 1; for (let i = 1; i < 10; i++) console.log(i) }",
     );
     test(
         "function wrapper() { var x = function () { return console.log(i), 1 }; for (let i = x(); i < 10; i++) console.log(i) }",
@@ -225,7 +225,7 @@ fn test_inline_single_use_variable() {
     );
     test(
         "function wrapper() { var i, x = 1; for (i = x; i < 10; i++) console.log(i) }",
-        "function wrapper() { for (var i = 1; i < 10; i++) console.log(i) }",
+        "function wrapper() { var i, x = 1; for (i = 1; i < 10; i++) console.log(i) }",
     );
     test(
         "function wrapper() { var x = i; for (var i = x; i < 10; i++) console.log(i) }",
@@ -276,7 +276,7 @@ fn test_inline_single_use_variable() {
     // cannot be compressed to `function wrapper() { var foo; globalThis[console.log(foo)] = (() => { foo = 1 })() }`
     test(
         "function wrapper() { var foo; var bar = (() => { foo = 1 })(); globalThis[console.log(foo)] = bar }",
-        "function wrapper() { var foo = 1, bar = void 0; globalThis[console.log(foo)] = bar }",
+        "function wrapper() { var foo = 1, bar = void 0; globalThis[console.log(1)] = void 0 }",
     );
     // cannot be compressed to `function wrapper() { let foo; return foo.bar = (() => { foo = {} })(), foo }`
     test(
@@ -501,7 +501,7 @@ fn keep_exposed_variables() {
     test_script("{ let x = foo; x() }", "foo()");
     test(
         "var b = 'b', l = { '-a': 'a', b }; export { l }",
-        "var l = { '-a': 'a', b: 'b' }; export { l }",
+        "var b = 'b', l = { '-a': 'a', b: 'b' }; export { l }",
     );
 }
 

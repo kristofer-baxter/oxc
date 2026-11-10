@@ -1125,7 +1125,11 @@ fn compile_outlined_functions<'a, 'b, 'p, 's, const EMIT: bool>(
     output_mode: CompilerOutputMode,
     env_config: &EnvironmentConfig,
     context: &mut ProgramContext<'a>,
-) -> Result<(), CompileResult<'a>> {
+) -> Result<(), CompileResult<'a>>
+where
+    'p: 'b,
+    'b: 's,
+{
     let mut nodes = Vec::new();
     let mut roots = vec![Vec::new(); compiled_fns.len()];
     let mut queue = Vec::new();

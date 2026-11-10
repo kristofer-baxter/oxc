@@ -47,9 +47,8 @@ fn test_undefined() {
     test("for (undefined in {}) {}", "for(undefined in {});");
     test("undefined++;", "undefined++");
     test("undefined += undefined;", "undefined+=void 0");
-    // shadowed: a parameter named `undefined` must not be substituted with
-    // `void 0`. `foo()` keeps the IIFE from being dropped as dead code.
-    test_same("(function(undefined) { foo(typeof undefined); })()");
+    // The omitted argument is undefined even when its parameter shadows the global.
+    test("(function(undefined) { foo(typeof undefined); })()", "foo('undefined');");
     // destructuring throw error side effect
     test_same("var {} = void 0");
     test_same("var [] = void 0");
@@ -900,7 +899,7 @@ fn optional_catch_binding() {
         "try { foo } catch { function f() { var e = 2 } }",
     );
 
-    test_same(
+    test(
         r#"var a = "PASS";
     try {
     throw "FAIL1";
@@ -908,6 +907,7 @@ fn optional_catch_binding() {
     var a = "FAIL2";
     }
     console.log(a);"#,
+        "var a = 'PASS'; try { throw 'FAIL1'; } catch (a) { var a = 'FAIL2'; } console.log('PASS');",
     );
 
     // Regression tests for https://github.com/oxc-project/oxc/issues/17307

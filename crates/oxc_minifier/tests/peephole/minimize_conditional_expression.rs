@@ -91,7 +91,7 @@ fn minimize_conditional_exprs() {
     test("v = a != null ? a.b.c[d](e) : undefined", "v = a == null ? void 0 : a.b.c[d](e)"); // accessing global `a` may have a getter with side effects
     test(
         "v = function(a) { var undefined = 1; return a != null ? a.b.c[d](e) : undefined }",
-        "v = function(a) { return a == null ? 1 : a.b.c[d](e) }",
+        "v = function(a) { var undefined = 1; return a == null ? 1 : a.b.c[d](e) }",
     );
     test_target(
         "v = function(a) { return a != null ? a.b.c[d](e) : undefined }",

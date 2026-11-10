@@ -1,6 +1,8 @@
+mod closure_exposure;
 mod convert_to_dotted_properties;
 mod fold_constants;
 mod inline;
+mod inline_function_iife;
 mod minimize_binary_expression;
 mod minimize_conditional_expression;
 mod minimize_conditions;
@@ -69,7 +71,39 @@ impl<'a> PeepholeOptimizations {
     /// cycle — handled at program scope by starting the root prelude unsafe when
     /// the module has loaders (see `enter_program`).
     /// Type-only declarations (`type`, `interface`) are erased and never run.
-    fn is_declarative_body_statement(stmt: &Statement<'a>) -> bool {
+    /// Whether a body-level function declaration shares a parameter's name. In
+    /// a sloppy function the declaration is then stored in the mapped
+    /// `arguments` object, which a callee reaches without naming it (through
+    /// `f.arguments` or `g.caller.arguments`), so no prelude is declarative.
+    pub(super) fn declares_parameter_named_function(
+        params: &FormalParameters<'a>,
+        body: &FunctionBody<'a>,
+    ) -> bool {
+        Self::declares_function_named(&body.statements, |name| {
+            params
+                .items
+                .iter()
+                .any(|param| param.pattern.get_binding_identifier().is_some_and(|b| b.name == name))
+        })
+    }
+
+    /// Whether a body-level function declaration has a name that `is_parameter`
+    /// accepts.
+    fn declares_function_named(
+        statements: &[Statement<'a>],
+        is_parameter: impl Fn(&str) -> bool,
+    ) -> bool {
+        statements.iter().any(|mut stmt| {
+            // A sloppy `L: function f() {}` is a hoisted declaration too.
+            while let Statement::LabeledStatement(labeled) = stmt {
+                stmt = &labeled.body;
+            }
+            let Statement::FunctionDeclaration(function) = stmt else { return false };
+            function.id.as_ref().is_some_and(|id| is_parameter(id.name.as_str()))
+        })
+    }
+
+    pub(super) fn is_declarative_body_statement(stmt: &Statement<'a>) -> bool {
         match stmt {
             Statement::EmptyStatement(_)
             | Statement::ImportDeclaration(_)
@@ -119,9 +153,68 @@ impl<'a> PeepholeOptimizations {
     /// Note: only AST `Literal`s qualify. Constant-but-non-literal initializers
     /// (`-1`, `void 0`, `1 + 2`) run no user code either, but conservatively end
     /// the prelude here — a missed optimization, never a correctness risk.
-    fn is_declarative_variable_declarator(decl: &VariableDeclarator<'a>) -> bool {
+    pub(super) fn is_declarative_variable_declarator(decl: &VariableDeclarator<'a>) -> bool {
         matches!(decl.id, BindingPattern::BindingIdentifier(_))
             && decl.init.as_ref().is_none_or(Expression::is_literal)
+    }
+
+    /// Whether a declarator initializes a property of the global object. An
+    /// earlier script may have defined that property as an accessor, so the
+    /// write can run a setter that calls this script's function declarations.
+    fn assigns_script_global(
+        decl: &VariableDeclarator<'a>,
+        kind: VariableDeclarationKind,
+        ctx: &TraverseCtx<'a>,
+    ) -> bool {
+        kind.is_var() && decl.init.is_some() && Self::is_script_root_scope(ctx)
+    }
+
+    pub(crate) fn is_body_variable_declaration(stmt: &Statement<'a>) -> bool {
+        match stmt {
+            Statement::VariableDeclaration(_) => true,
+            Statement::ExportDeclaration(export) => {
+                matches!(export.declaration, Declaration::VariableDeclaration(_))
+            }
+            _ => false,
+        }
+    }
+
+    fn body_variable_declaration_count(statements: &[Statement<'a>]) -> u32 {
+        u32::try_from(
+            statements.iter().filter(|stmt| Self::is_body_variable_declaration(stmt)).count(),
+        )
+        .expect("declaration count is bounded by the source length")
+    }
+
+    pub(crate) fn update_body_prelude_after_statement(
+        stmt: &Statement<'a>,
+        was_body_var_decl: bool,
+        ctx: &mut TraverseCtx<'a>,
+    ) {
+        if was_body_var_decl {
+            if matches!(
+                ctx.parent(),
+                Ancestor::ProgramBody(_) | Ancestor::FunctionBodyStatements(_)
+            ) {
+                let frame = ctx.state.body_frames.last_mut();
+                frame.last_var_decl_end = frame.last_var_decl_end.saturating_sub(1);
+            }
+        } else if (!Self::is_declarative_body_statement(stmt)
+            || matches!(stmt, Statement::VariableDeclaration(d)
+                if d.declarations.iter().any(|decl| Self::assigns_script_global(decl, d.kind, ctx))))
+            && Self::prelude_is_open(ctx)
+            && (Self::is_script_root_scope(ctx)
+                || closure_exposure::statement_may_expose_closure(stmt, ctx.scoping()))
+        {
+            Self::mark_current_body_unsafe(ctx);
+        }
+    }
+
+    fn prelude_is_open(ctx: &TraverseCtx<'a>) -> bool {
+        let frame = ctx.state.body_frames.last();
+        !frame.hoisted_var_inlining_unsafe
+            && frame.last_var_decl_end > 0
+            && frame.scope_id == ctx.current_scope_id()
     }
 
     /// Mark the current function/program body as no longer in its declarative
@@ -192,7 +285,8 @@ impl<'a> PeepholeOptimizations {
     }
 
     /// Whether reading a resolved symbol again could produce a different value.
-    /// Imported bindings and Script-root globals can change externally.
+    /// Imported bindings, Script-root globals, and bindings with writes that
+    /// semantic analysis does not record can change externally.
     ///
     /// Uses the O(1) cached reference counts from `SymbolValue` when available,
     /// falling back to the O(num_refs) scan in `Scoping::symbol_is_mutated` for
@@ -206,6 +300,7 @@ impl<'a> PeepholeOptimizations {
         if scoping.symbol_flags(symbol_id).is_import()
             || (ctx.source_type().is_script()
                 && scoping.symbol_scope_id(symbol_id) == scoping.root_scope_id())
+            || ctx.state.hidden_writes.contains(&symbol_id)
         {
             return true;
         }
@@ -213,7 +308,7 @@ impl<'a> PeepholeOptimizations {
         if let Some(sv) = ctx.state.symbols.value(symbol_id) {
             sv.references.has_writes()
         } else {
-            scoping.symbol_is_mutated(symbol_id)
+            ctx.state.symbols.symbol_is_mutated(symbol_id, scoping)
         }
     }
 
@@ -292,7 +387,7 @@ impl<'a> PeepholeOptimizations {
     /// True if the scope chain from `read_scope` up to (excluding) `stop_scope`
     /// crosses a function boundary — i.e. the read is in a closure relative to
     /// `stop_scope`. Async/generator/arrow scopes are all `Function`.
-    fn read_crosses_function_boundary(
+    pub(super) fn read_crosses_function_boundary(
         read_scope: ScopeId,
         stop_scope: ScopeId,
         ctx: &TraverseCtx<'a>,
@@ -320,11 +415,23 @@ impl<'a> Traverse<'a> for PeepholeOptimizations {
         // `enter`/`exit_function_body` are balanced, so the stack is back to its
         // single program-root entry by the next pass; reset it in place rather
         // than reallocating (matching the `reset`/`clear` above).
+        // A CommonJS body runs inside a sloppy wrapper function whose parameters
+        // are `exports, require, module, __filename, __dirname`, so a root
+        // function declaration of one of those names lands in its mapped
+        // `arguments`, as in `declares_parameter_named_function`.
+        let last_var_decl_end = Self::body_variable_declaration_count(&program.body);
+        let declares_wrapper_parameter_function = last_var_decl_end > 0
+            && ctx.source_type().is_commonjs()
+            && Self::declares_function_named(&program.body, |name| {
+                crate::state::COMMONJS_WRAPPER_PARAMETERS.contains(&name)
+            });
         *ctx.state.body_frames.last_mut() = BodyFrame {
             scope_id: ctx.scoping().root_scope_id(),
-            hoisted_var_inlining_unsafe: module_has_loaders,
+            hoisted_var_inlining_unsafe: module_has_loaders || declares_wrapper_parameter_function,
+            last_var_decl_end,
             this_initialized_at: None,
         };
+        Self::collect_program_inlining_facts(program, ctx);
         // `PassChanges` is managed by pass completion, not reset per
         // traversal.
     }
@@ -333,7 +440,9 @@ impl<'a> Traverse<'a> for PeepholeOptimizations {
         if matches!(ctx.parent(), Ancestor::ArrowFunctionExpressionBody(_)) {
             return;
         }
-        let initialized_at = if Self::derived_constructor_this_scope(ctx).is_some() {
+        let initialized_at = if ctx.current_scope_flags().is_constructor()
+            && Self::derived_constructor_this_scope(ctx).is_some()
+        {
             body.statements.iter().find_map(|stmt| match stmt {
                 Statement::ExpressionStatement(stmt) => {
                     Self::unconditional_super_call_end(&stmt.expression)
@@ -343,9 +452,19 @@ impl<'a> Traverse<'a> for PeepholeOptimizations {
         } else {
             None
         };
+        let last_var_decl_end = Self::body_variable_declaration_count(&body.statements);
+        let declares_parameter_named_function = last_var_decl_end > 0
+            && match ctx.parent() {
+                Ancestor::FunctionBody(function) => {
+                    function.params().has_parameter()
+                        && Self::declares_parameter_named_function(function.params(), body)
+                }
+                _ => false,
+            };
         ctx.state.body_frames.push(BodyFrame {
             scope_id: ctx.current_scope_id(),
-            hoisted_var_inlining_unsafe: false,
+            hoisted_var_inlining_unsafe: declares_parameter_named_function,
+            last_var_decl_end,
             this_initialized_at: initialized_at,
         });
     }
@@ -375,9 +494,13 @@ impl<'a> Traverse<'a> for PeepholeOptimizations {
         } else {
             None
         };
+        let last_var_decl_end = body
+            .as_function_body()
+            .map_or(0, |body| Self::body_variable_declaration_count(&body.statements));
         ctx.state.body_frames.push(BodyFrame {
             scope_id: ctx.current_scope_id(),
             hoisted_var_inlining_unsafe: false,
+            last_var_decl_end,
             this_initialized_at: initialized_at,
         });
     }
@@ -405,7 +528,9 @@ impl<'a> Traverse<'a> for PeepholeOptimizations {
         stmts: &mut ArenaVec<'a, Statement<'a>>,
         ctx: &mut TraverseCtx<'a>,
     ) {
-        Self::minimize_statements(stmts, ctx);
+        if ctx.state.is_current_body_own_dirty() {
+            Self::minimize_statements(stmts, ctx);
+        }
     }
 
     fn enter_statement(&mut self, stmt: &mut Statement<'a>, ctx: &mut TraverseCtx<'a>) {
@@ -413,6 +538,7 @@ impl<'a> Traverse<'a> for PeepholeOptimizations {
     }
 
     fn exit_statement(&mut self, stmt: &mut Statement<'a>, ctx: &mut TraverseCtx<'a>) {
+        let was_body_var_decl = Self::is_body_variable_declaration(stmt);
         if ctx.is_tree_shake_only() {
             match stmt {
                 Statement::BlockStatement(_) => Self::try_optimize_block(stmt, ctx),
@@ -454,6 +580,7 @@ impl<'a> Traverse<'a> for PeepholeOptimizations {
                         Self::minimize_expression_in_boolean_context(test, ctx);
                     }
                     Self::try_fold_for(stmt, ctx);
+                    Self::try_fold_for_with_immediate_break(stmt, ctx);
                 }
                 Statement::DoWhileStatement(s) => {
                     Self::minimize_expression_in_boolean_context(&mut s.test, ctx);
@@ -479,10 +606,9 @@ impl<'a> Traverse<'a> for PeepholeOptimizations {
         }
 
         // Maintain the per-body declarative-prelude flag used by
-        // `is_hoisted_var_inlineable`.
-        if !Self::is_declarative_body_statement(stmt) {
-            Self::mark_current_body_unsafe(ctx);
-        }
+        // `is_hoisted_var_inlineable`. Variable declarations are already
+        // checked per declarator in `exit_variable_declarator`.
+        Self::update_body_prelude_after_statement(stmt, was_body_var_decl, ctx);
     }
 
     fn exit_for_statement(&mut self, stmt: &mut ForStatement<'a>, ctx: &mut TraverseCtx<'a>) {
@@ -516,15 +642,30 @@ impl<'a> Traverse<'a> for PeepholeOptimizations {
         decl: &mut VariableDeclarator<'a>,
         ctx: &mut TraverseCtx<'a>,
     ) {
-        Self::init_symbol_value(decl, ctx);
         // Per-declarator update of the body-unsafe flag. Catches multi-declarator
         // statements (`var [x=call()] = '', flag = true;`, possibly produced by
         // join-vars) where an earlier declarator runs user code via a
         // destructuring default or non-literal init — the per-statement check
         // would fire too late for subsequent declarators' `init_symbol_value`.
-        if !Self::is_declarative_variable_declarator(decl) {
-            Self::mark_current_body_unsafe(ctx);
+        // It runs before this declarator's own `init_symbol_value`: its
+        // initializer can call a closure that reads the binding before it is set
+        // (`var x = [read()].length; function read() { return x }`).
+        let in_body_statement_list = Self::is_declaration_in_body_statement_list(ctx);
+        if Self::prelude_is_open(ctx) {
+            let assigns_script_global = match ctx.parent() {
+                Ancestor::VariableDeclarationDeclarations(d) => {
+                    Self::assigns_script_global(decl, *d.kind(), ctx)
+                }
+                _ => false,
+            };
+            if (!Self::is_declarative_variable_declarator(decl) || assigns_script_global)
+                && (Self::is_script_root_scope(ctx)
+                    || closure_exposure::declarator_may_expose_closure(decl, ctx.scoping()))
+            {
+                Self::mark_current_body_unsafe(ctx);
+            }
         }
+        Self::init_symbol_value(decl, in_body_statement_list, ctx);
     }
 
     fn exit_expression(&mut self, expr: &mut Expression<'a>, ctx: &mut TraverseCtx<'a>) {
@@ -623,6 +764,7 @@ impl<'a> Traverse<'a> for PeepholeOptimizations {
                 Expression::CallExpression(_) => {
                     Self::fold_call_expression(expr, ctx);
                     Self::substitute_iife_call(expr, ctx);
+                    Self::inline_function_iife(expr, ctx);
                     Self::remove_dead_code_call_expression(expr, ctx);
                     Self::replace_concat_chain(expr, ctx);
                     Self::replace_known_global_methods(expr, ctx);

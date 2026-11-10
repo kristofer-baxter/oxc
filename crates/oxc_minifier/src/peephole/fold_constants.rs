@@ -8,7 +8,6 @@ use oxc_ecmascript::{
     side_effects::MayHaveSideEffects,
     with_number_literal,
 };
-use oxc_semantic::IsGlobalReference;
 use oxc_span::{GetSpan, SPAN};
 use oxc_str::JSStr;
 use oxc_syntax::operator::{BinaryOperator, LogicalOperator};
@@ -36,7 +35,7 @@ impl<'a> PeepholeOptimizations {
                 let new_value = match &e.argument {
                     Expression::Identifier(ident)
                         if matches!(ident.name.as_str(), "undefined" | "Infinity" | "NaN")
-                            && ident.is_global_reference(ctx.scoping()) =>
+                            && ctx.is_global_reference(ident) =>
                     {
                         false
                     }
@@ -83,7 +82,16 @@ impl<'a> PeepholeOptimizations {
         if Self::is_delete_argument(ctx) {
             return;
         }
-        // TODO: tryFoldObjectPropAccess(n, left, name)
+        if !ctx.is_tree_shake_only() && !e.optional {
+            let key = oxc_str::CompactStr::from(e.property.name.as_str());
+            let span = e.span;
+            if let Some(changed) = Self::try_fold_object_prop_access(span, &mut e.object, &key, ctx)
+            {
+                ctx.replace_expression(expr, changed);
+                return;
+            }
+        }
+        let Expression::StaticMemberExpression(e) = expr else { return };
         // `evaluate_value` only folds a narrow set of member accesses (currently
         // `.length` on constant strings/arrays) and bails cheaply otherwise.
         // Evaluate it first so the overwhelmingly common non-foldable access
@@ -102,7 +110,18 @@ impl<'a> PeepholeOptimizations {
         if Self::is_delete_argument(ctx) {
             return;
         }
-        // TODO: tryFoldObjectPropAccess(n, left, name)
+        if !ctx.is_tree_shake_only()
+            && !e.optional
+            && let Some(key) = Self::extract_computed_member_key(&e.expression)
+        {
+            let span = e.span;
+            if let Some(changed) = Self::try_fold_object_prop_access(span, &mut e.object, &key, ctx)
+            {
+                ctx.replace_expression(expr, changed);
+                return;
+            }
+        }
+        let Expression::ComputedMemberExpression(e) = expr else { return };
         // See `fold_static_member_expr`: bail via the cheap `evaluate_value`
         // check before walking the object and key for side effects.
         let Some(value) = e.evaluate_value(ctx) else { return };
@@ -111,6 +130,153 @@ impl<'a> PeepholeOptimizations {
         }
         let changed = ctx.value_to_expr(e.span, value);
         ctx.replace_expression(expr, changed);
+    }
+
+    fn try_fold_object_prop_access(
+        span: Span,
+        object: &mut Expression<'a>,
+        key: &str,
+        ctx: &TraverseCtx<'a>,
+    ) -> Option<Expression<'a>> {
+        let is_callee = matches!(
+            ctx.parent(),
+            Ancestor::CallExpressionCallee(_) | Ancestor::TaggedTemplateExpressionTag(_)
+        );
+        if !is_callee
+            && !ctx.state.symbols.member_constants.is_empty()
+            && let Expression::Identifier(ident) = object.without_parentheses()
+        {
+            let ref_id = ident.reference_id();
+            let reference = ctx.scoping().get_reference(ref_id);
+            if let Some(symbol_id) = reference.symbol_id()
+                && let Some((decl_end, tdz_end, props)) =
+                    ctx.state.symbols.member_constants.get(&symbol_id)
+                && let Some(val) = props.get(key).cloned()
+            {
+                let decl_end = *decl_end;
+                let tdz_end = *tdz_end;
+                if ctx.inlining_visible_to_reference(
+                    decl_end,
+                    tdz_end,
+                    symbol_id,
+                    ref_id,
+                    ident.span.start,
+                ) {
+                    return Some(ctx.value_to_expr(span, val));
+                }
+            }
+        }
+
+        let Expression::ObjectExpression(obj) = object else { return None };
+        if obj.properties.len() != 1 {
+            return None;
+        }
+        let mut matched_idx = None;
+        for (idx, prop) in obj.properties.iter().enumerate() {
+            let ObjectPropertyKind::ObjectProperty(p) = prop else {
+                return None;
+            };
+            if p.kind != PropertyKind::Init
+                || Self::expression_has_setter_or_getter(&p.value)
+                || p.value.may_have_side_effects(ctx)
+            {
+                return None;
+            }
+            let prop_key = Self::extract_static_member_key(&p.key)?;
+            if matches!(prop_key.as_str(), "__proto__" | "constructor" | "prototype") {
+                return None;
+            }
+            if prop_key.as_str() == key {
+                matched_idx = Some(idx);
+            }
+        }
+        let matched_idx = matched_idx?;
+        for (idx, prop) in obj.properties.iter().enumerate() {
+            if idx != matched_idx
+                && let ObjectPropertyKind::ObjectProperty(p) = prop
+                && Self::discards_observable_read(&p.value, span.start, ctx)
+            {
+                return None;
+            }
+        }
+        let ObjectPropertyKind::ObjectProperty(matched_prop) = &obj.properties[matched_idx] else {
+            return None;
+        };
+        if matched_prop.method {
+            return None;
+        }
+        if is_callee {
+            let params_have_no_initializers = |params: &FormalParameters<'a>| {
+                params
+                    .items
+                    .iter()
+                    .all(|p| p.initializer.is_none() && p.pattern.is_binding_identifier())
+                    && params.rest.as_ref().is_none_or(|r| r.rest.argument.is_binding_identifier())
+            };
+            let ok_callee = match matched_prop.value.without_parentheses() {
+                Expression::ArrowFunctionExpression(a) => {
+                    ctx.scoping().scope_flags(a.scope_id()).is_strict_mode()
+                        || (params_have_no_initializers(&a.params)
+                            && a.get_expression().is_some_and(Expression::is_literal))
+                }
+                Expression::FunctionExpression(f) => {
+                    !f.r#async
+                        && !f.generator
+                        && !Self::function_uses_this_or_arguments(f)
+                        && (f.id.is_some()
+                            || ctx.scoping().scope_flags(f.scope_id()).is_strict_mode()
+                            || (params_have_no_initializers(&f.params)
+                                && f.body.as_ref().is_some_and(|b| {
+                                    b.statements.len() == 1
+                                        && matches!(
+                                            &b.statements[0],
+                                            Statement::ReturnStatement(r)
+                                                if r.argument.as_ref().is_some_and(Expression::is_literal)
+                                        )
+                                })))
+                }
+                _ => false,
+            };
+            if !ok_callee {
+                return None;
+            }
+        } else if Self::may_yield_anonymous_function(&matched_prop.value) {
+            return None;
+        }
+        let ObjectPropertyKind::ObjectProperty(matched_prop) = &mut obj.properties[matched_idx]
+        else {
+            unreachable!()
+        };
+        Some(matched_prop.value.take_in(ctx))
+    }
+
+    fn function_uses_this_or_arguments(f: &Function<'a>) -> bool {
+        struct ThisChecker {
+            found: bool,
+        }
+        impl<'a> oxc_ast_visit::Visit<'a> for ThisChecker {
+            fn visit_this_expression(&mut self, _: &ThisExpression) {
+                self.found = true;
+            }
+            fn visit_super(&mut self, _: &Super) {
+                self.found = true;
+            }
+            fn visit_new_target(&mut self, _: &NewTarget) {
+                self.found = true;
+            }
+            fn visit_identifier_reference(&mut self, it: &IdentifierReference<'a>) {
+                if matches!(it.name.as_str(), "arguments" | "eval") {
+                    self.found = true;
+                }
+            }
+            fn visit_function(&mut self, _: &Function<'a>, _: oxc_syntax::scope::ScopeFlags) {}
+        }
+        let mut checker = ThisChecker { found: false };
+        oxc_ast_visit::Visit::visit_formal_parameters(&mut checker, &f.params);
+        if let Some(body) = &f.body {
+            oxc_ast_visit::Visit::visit_function_body(&mut checker, body);
+        }
+        checker.found
     }
 
     pub fn fold_logical_expr(expr: &mut Expression<'a>, ctx: &mut TraverseCtx<'a>) {
@@ -533,8 +699,9 @@ impl<'a> PeepholeOptimizations {
             Expression::NumericLiteral(lit) => (Self::number_literal_source_len(lit.value)?, false),
             Expression::BooleanLiteral(_) => (2, false),
             Expression::NullLiteral(_) => (4, false),
+            // Mangling usually shortens a kept identifier to one or two bytes.
             Expression::Identifier(ident) => (
-                ident.name.len(),
+                ident.name.len().min(2),
                 ident
                     .reference_id
                     .get()
@@ -555,6 +722,48 @@ impl<'a> PeepholeOptimizations {
             _ => return None,
         };
         Some(result)
+    }
+
+    /// The side-effect-free string value of `expr`, unless producing it would copy
+    /// a constant that `inline_identifier_reference` keeps behind its binding
+    /// (a long string read more than once). Like Terser's `best_of`, merging
+    /// such a constant into a neighbouring literal duplicates it at every read.
+    fn side_free_string_value_without_duplication(
+        expr: &Expression<'a>,
+        ctx: &TraverseCtx<'a>,
+    ) -> Option<JSStr<'a>> {
+        if Self::reads_non_inlineable_constant(expr, ctx) {
+            return None;
+        }
+        expr.get_side_free_string_value(ctx)
+    }
+
+    pub(super) fn reads_non_inlineable_constant(
+        expr: &Expression<'a>,
+        ctx: &TraverseCtx<'a>,
+    ) -> bool {
+        match expr {
+            Expression::Identifier(ident) => ident
+                .reference_id
+                .get()
+                .and_then(|reference_id| ctx.scoping().get_reference(reference_id).symbol_id())
+                .and_then(|symbol_id| ctx.state.symbols.value(symbol_id))
+                .is_some_and(|value| {
+                    value.initialized_constant.is_some() && !value.can_inline_initialized_constant()
+                }),
+            Expression::BinaryExpression(e) => {
+                Self::reads_non_inlineable_constant(&e.left, ctx)
+                    || Self::reads_non_inlineable_constant(&e.right, ctx)
+            }
+            Expression::UnaryExpression(e) => Self::reads_non_inlineable_constant(&e.argument, ctx),
+            Expression::ParenthesizedExpression(e) => {
+                Self::reads_non_inlineable_constant(&e.expression, ctx)
+            }
+            Expression::TemplateLiteral(t) => {
+                t.expressions.iter().any(|e| Self::reads_non_inlineable_constant(e, ctx))
+            }
+            _ => false,
+        }
     }
 
     // Simplified version of `tryFoldAdd` from closure compiler.
@@ -594,8 +803,8 @@ impl<'a> PeepholeOptimizations {
             && left_binary_expr.right.value_type(ctx).is_string()
         {
             if let (Some(left_str), Some(right_str)) = (
-                left_binary_expr.right.get_side_free_string_value(ctx),
-                e.right.get_side_free_string_value(ctx),
+                Self::side_free_string_value_without_duplication(&left_binary_expr.right, ctx),
+                Self::side_free_string_value_without_duplication(&e.right, ctx),
             ) {
                 let span = left_binary_expr
                     .right
@@ -660,7 +869,9 @@ impl<'a> PeepholeOptimizations {
             }
 
             // "`${x}y` + 'z'" => "`${x}yz`"
-            if let Some(right_str) = right_expr.get_side_free_string_value(ctx) {
+            if let Some(right_str) =
+                Self::side_free_string_value_without_duplication(right_expr, ctx)
+            {
                 left.span = left.span.merge_within(right_expr.span(), parent_span).unwrap_or(SPAN);
                 let last_quasi =
                     left.quasis.last_mut().expect("template literal must have at least one quasi");
@@ -680,7 +891,8 @@ impl<'a> PeepholeOptimizations {
             }
         } else if let Expression::TemplateLiteral(right) = right_expr {
             // "'x' + `y${z}`" => "`xy${z}`"
-            if let Some(left_str) = left_expr.get_side_free_string_value(ctx) {
+            if let Some(left_str) = Self::side_free_string_value_without_duplication(left_expr, ctx)
+            {
                 right.span = right.span.merge_within(left_expr.span(), parent_span).unwrap_or(SPAN);
                 let first_quasi = right
                     .quasis
@@ -1006,7 +1218,7 @@ impl<'a> PeepholeOptimizations {
         let mut first_inline: Option<(usize, JSStr<'a>)> = None;
         let mut more_inline: Vec<(usize, JSStr<'a>)> = Vec::new();
         for (idx, expr) in t.expressions.iter().enumerate() {
-            if expr.may_have_side_effects(ctx) {
+            if expr.may_have_side_effects(ctx) || Self::reads_non_inlineable_constant(expr, ctx) {
                 continue;
             }
             let Some(value) = evaluate_to_js_string(expr, ctx) else {
