@@ -56,6 +56,38 @@ fn stack_function_name(source: &str, source_type: SourceType) -> String {
 }
 
 #[test]
+fn mangler_scratch_does_not_remain_in_the_ast_arena() {
+    let allocator = Allocator::default();
+    let parsed = Parser::new(
+        &allocator,
+        "function computeLongValue(input) { let intermediate = input * 2; return intermediate + 1; } console.log(computeLongValue(3));",
+        SourceType::mjs(),
+    )
+    .parse();
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let mut program = parsed.program;
+    let ast_bytes = allocator.used_bytes();
+    let result = Minifier::new(MinifierOptions {
+        compress: None,
+        mangle: Some(MangleOptions { top_level: Some(true), ..MangleOptions::default() }),
+        ..MinifierOptions::default()
+    })
+    .minify(&allocator, &mut program);
+    assert_eq!(
+        allocator.used_bytes(),
+        ast_bytes,
+        "mangling scratch must not extend the AST arena's lifetime"
+    );
+    let code = Codegen::new().with_scoping(result.scoping).build(&program).code;
+    let output = Command::new("node")
+        .args(["--input-type=module", "--eval", &code])
+        .output()
+        .expect("Node.js is required to verify generated code after mangling scratch is freed");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(output.stdout, b"7\n", "{code}");
+}
+
+#[test]
 fn function_names_are_kept_even_when_only_called_directly() {
     let output = minify(
         "function visible() {} use(visible.name); function callOnly() {} callOnly(); const inferred = () => {}; use(inferred.name);",

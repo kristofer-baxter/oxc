@@ -213,7 +213,7 @@ impl<'a> Minifier {
                             .map(CompactStr::from),
                     );
                 }
-                let class_private_mappings = Mangler::new_with_temp_allocator(allocator)
+                let class_private_mappings = Mangler::default()
                     .with_options(options)
                     .build_with_semantic(&mut semantic, program);
                 (semantic.into_scoping(), class_private_mappings)
