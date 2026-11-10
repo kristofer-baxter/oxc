@@ -460,9 +460,19 @@ impl<'a> PeepholeOptimizations {
         anchor: u32,
         ctx: &TraverseCtx<'a>,
     ) -> bool {
+        Self::discards_observable_read_with_initialized_binding(e, anchor, None, ctx)
+    }
+
+    pub(super) fn discards_observable_read_with_initialized_binding(
+        e: &Expression<'a>,
+        anchor: u32,
+        initialized_binding: Option<SymbolId>,
+        ctx: &TraverseCtx<'a>,
+    ) -> bool {
         let mut finder = ObservableReadFinder {
             found: false,
             anchor,
+            initialized_binding,
             ctx,
             this_may_be_uninitialized: Self::derived_constructor_this_scope(ctx).is_some(),
             in_own_this: false,
@@ -693,6 +703,7 @@ impl AwaitOrYieldNameFinder {
 struct ObservableReadFinder<'b, 'a> {
     found: bool,
     anchor: u32,
+    initialized_binding: Option<SymbolId>,
     ctx: &'b TraverseCtx<'a>,
     /// The visit starts in a derived constructor, where `this` throws before `super()`.
     this_may_be_uninitialized: bool,
@@ -728,6 +739,9 @@ impl<'a> Visit<'a> for ObservableReadFinder<'_, 'a> {
             }
             return;
         };
+        if Some(symbol_id) == self.initialized_binding {
+            return;
+        }
         let flags = scoping.symbol_flags(symbol_id);
         if (self.ctx.source_type().is_script()
             && scoping.symbol_scope_id(symbol_id) == scoping.root_scope_id())

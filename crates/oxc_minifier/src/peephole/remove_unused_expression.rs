@@ -1199,7 +1199,7 @@ impl<'a> PeepholeOptimizations {
         match Self::classify_class_removability(c, &*ctx) {
             ClassRemovability::Keep => return None,
             // Nothing to extract by construction: `RemovesClean` means pure
-            // heritage, no present static values, pure computed keys — so
+            // heritage, unobservable static values, pure computed keys — so
             // the extraction walk (which would re-run the classifier's
             // purity checks to extract nothing) is skipped.
             ClassRemovability::RemovesClean => {}
@@ -1210,7 +1210,6 @@ impl<'a> PeepholeOptimizations {
                 // so it reports no extraction plan. Cold path — it only runs
                 // when an `Extracts` class is actually removed.
                 let mut exprs = ArenaVec::new_in(ctx);
-                let class_symbol_id = c.id.as_ref().and_then(|id| id.symbol_id.get());
 
                 if c.heritage_expression()
                     .is_some_and(|expression| expression.may_have_side_effects(ctx))
@@ -1234,29 +1233,6 @@ impl<'a> PeepholeOptimizations {
                     {
                         exprs.push(expr.take_in(ctx));
                     }
-                    // Save static initializer.
-                    if e.r#static()
-                        && let Some(init) = match e {
-                            ClassElement::TSIndexSignature(_)
-                            | ClassElement::StaticBlock(_)
-                            | ClassElement::MethodDefinition(_) => None,
-                            ClassElement::PropertyDefinition(def) => def.value.take(),
-                            ClassElement::AccessorProperty(def) => def.value.take(),
-                        }
-                    {
-                        if class_symbol_id.is_some()
-                            && let Expression::Identifier(id) = init.without_parentheses()
-                            && ctx.scoping().get_reference(id.reference_id()).symbol_id()
-                                == class_symbol_id
-                        {
-                            // The class binding is initialized for static values, but does not
-                            // remain available after its class expression is discarded.
-                            ctx.drop_expression(&init);
-                        } else {
-                            // Already checked side effects above.
-                            exprs.push(init);
-                        }
-                    }
                 }
 
                 ctx.notice_change();
@@ -1273,7 +1249,7 @@ impl<'a> PeepholeOptimizations {
     /// `remove_unused_class` keys off it.
     pub(crate) fn classify_class_removability(
         c: &Class<'a>,
-        ctx: &impl MayHaveSideEffectsContext<'a>,
+        ctx: &TraverseCtx<'a>,
     ) -> ClassRemovability {
         // Don't remove classes with decorators - they may have side effects.
         if !c.decorators.is_empty() {
@@ -1313,11 +1289,19 @@ impl<'a> PeepholeOptimizations {
                     _ => None,
                 };
                 if let Some(value) = value {
-                    if value.may_have_side_effects(ctx) {
+                    // Static values run after the class binding is initialized. Keep any
+                    // other observable read inside the class rather than hoisting self-reads
+                    // beyond a named class expression's scope.
+                    if value.may_have_side_effects(ctx)
+                        || Self::discards_observable_read_with_initialized_binding(
+                            value,
+                            value.span().start,
+                            c.id.as_ref().and_then(|id| id.symbol_id.get()),
+                            ctx,
+                        )
+                    {
                         return ClassRemovability::Keep;
                     }
-                    // Every PRESENT static value is extracted, pure or not.
-                    extracts = true;
                 }
             }
             if e.computed()
@@ -1368,9 +1352,8 @@ impl<'a> PeepholeOptimizations {
 pub enum ClassRemovability {
     /// Removal must bail (`remove_unused_class` returns `None`).
     Keep,
-    /// Removable, but evaluation-time expressions (side-effectful heritage
-    /// or computed keys, any present static value) are extracted into the
-    /// surrounding code.
+    /// Removable, but side-effectful heritage or computed keys are extracted
+    /// into the surrounding code.
     Extracts,
     /// Removable with nothing extracted.
     RemovesClean,
