@@ -191,6 +191,33 @@ fn annex_b_aliases_keep_resolved_reference_membership_consistent() {
                 references += 1;
             }
         }
+
         assert_eq!(references, 4, "every resolved reference must occur once");
+    }
+}
+
+#[test]
+fn substituted_iife_arguments_preserve_tdz_exceptions() {
+    for source in [
+        "function use(value) {} use((x => x)(void later)); let later = 1;",
+        "function use(value) {} use((function (x) { return x; })(void later)); let later = 1;",
+        "globalThis.probe = function (first = (x => x)(void later), later = 1) { return first; }; globalThis.probe();",
+        "class Child extends Object { constructor() { console.log((x => x)(void this)); super(); } } new Child();",
+    ] {
+        let minified = minify_with_compression(
+            source,
+            SourceType::mjs(),
+            false,
+            Some(CompressOptions::smallest()),
+        );
+        for code in [source, &minified] {
+            let output = Command::new("node")
+                .args(["--input-type=module", "--eval", code])
+                .output()
+                .expect("Node.js is required to verify TDZ exceptions");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(!output.status.success(), "TDZ read must throw:\n{source}\noutput:\n{code}");
+            assert!(stderr.contains("ReferenceError:"), "{code}\n{stderr}");
+        }
     }
 }

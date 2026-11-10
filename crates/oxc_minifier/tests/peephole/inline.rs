@@ -63,6 +63,16 @@ fn inline_iife_arguments_preserves_side_effects() {
 }
 
 #[test]
+fn inline_iife_arguments_preserves_substituted_tdz_reads() {
+    test_same_options("use((x => x)(void later)); let later = 1;", &CompressOptions::smallest());
+    test_smallest(
+        "use((function (x) { return x; })(void later)); let later = 1;",
+        "use((later, void 0)); let later = 1;",
+    );
+    test_smallest("use((x => x)(void 0));", "use(void 0);");
+}
+
+#[test]
 fn inline_constant_function_iife_arguments() {
     test_smallest("(function (x) { return x + 1 })(1);", "");
     test_smallest("const f = function (x) { return x + 1 }; f(1);", "");

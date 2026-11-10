@@ -353,7 +353,9 @@ impl<'a> Normalize {
     fn fold_void_ident(e: &mut UnaryExpression<'a>, ctx: &mut TraverseCtx<'a>) {
         debug_assert!(e.operator.is_void());
         let Expression::Identifier(ident) = &e.argument else { return };
-        if ident.is_global_reference(ctx.scoping()) {
+        if ident.is_global_reference(ctx.scoping())
+            || PeepholeOptimizations::discards_observable_read(&e.argument, e.span.start, ctx)
+        {
             return;
         }
         // `replace_expression` walks the dropped ident into `PassChanges`, so

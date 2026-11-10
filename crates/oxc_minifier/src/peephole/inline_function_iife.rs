@@ -162,9 +162,8 @@ impl<'a> PeepholeOptimizations {
         {
             return;
         }
-        if call.arguments.iter().enumerate().any(|(index, argument)| {
-            !substituted_indexes.contains(&index)
-                && Self::discards_observable_read(argument.to_expression(), call.span.start, ctx)
+        if call.arguments.iter().any(|argument| {
+            Self::discards_observable_read(argument.to_expression(), call.span.start, ctx)
         }) {
             return;
         }

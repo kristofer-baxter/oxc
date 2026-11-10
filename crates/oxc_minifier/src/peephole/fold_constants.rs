@@ -61,7 +61,8 @@ impl<'a> PeepholeOptimizations {
                     });
                 }
             }
-            _ if e.may_have_side_effects(ctx) => {}
+            _ if e.may_have_side_effects(ctx)
+                || Self::discards_observable_read(&e.argument, e.span.start, ctx) => {}
             _ => {
                 if let Some(changed) = e.evaluate_value(ctx).map(|v| ctx.value_to_expr(e.span, v)) {
                     ctx.replace_expression(expr, changed);

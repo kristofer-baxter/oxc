@@ -58,7 +58,9 @@ impl<'a> PeepholeOptimizations {
                 ),
             }
         } else {
-            !e.may_have_side_effects(ctx)
+            !(e.may_have_side_effects(ctx)
+                || (e.is_identifier_reference()
+                    && Self::discards_observable_read(e, e.span().start, ctx)))
         }
     }
 
@@ -774,7 +776,7 @@ impl<'a> PeepholeOptimizations {
         {
             return true;
         }
-        e.may_have_side_effects(ctx)
+        e.may_have_side_effects(ctx) || Self::discards_observable_read(e, e.span().start, ctx)
     }
 
     pub fn fold_arguments_into_needed_expressions(
