@@ -1,3 +1,4 @@
+use cow_utils::CowUtils;
 use oxc_allocator::Allocator;
 use oxc_ast_visit::VisitMut;
 use oxc_codegen::{Codegen, CodegenOptions, CommentOptions};
@@ -98,6 +99,32 @@ fn string_words_reserve_sources_and_generated_targets_including_directives() {
     let mut opts = ManglePropertiesOptions::from_names(["_blocked"]);
     opts.reserve_string_words = false;
     test("use('word _blocked'); obj._blocked;", "use('word _blocked'); obj.e;", opts);
+}
+
+#[test]
+fn string_words_include_decoded_ascii_around_lone_surrogates() {
+    for source in [
+        r"use('\u005ffield\uD800'); obj._field;",
+        r"use('\uD800_field\uDC00'); obj._field;",
+        r"'\u005ffield\uD800'; obj._field;",
+        r"use(`\u005ffield\uD800`); obj._field;",
+        r"use(`\u005ffield\uD800${x}`); obj._field;",
+    ] {
+        test(source, source, ManglePropertiesOptions::from_names(["_field"]));
+        let mut opts = ManglePropertiesOptions::from_names(["_field"]);
+        opts.reserve_string_words = false;
+        test(source, &source.cow_replace("obj._field", "obj.e"), opts);
+    }
+    test(
+        r"use('e\uD800'); obj._field;",
+        r"use('e\uD800'); obj.t;",
+        ManglePropertiesOptions::from_names(["_field"]),
+    );
+    test(
+        r"use(/* @__KEY__ */ '\u005ffield\uD800'); obj._field;",
+        r"use(/* @__KEY__ */ '\u005ffield\uD800'); obj.e;",
+        ManglePropertiesOptions::from_names(["_field"]),
+    );
 }
 
 #[test]

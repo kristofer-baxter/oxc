@@ -310,11 +310,10 @@ impl<'o, 'a> PropertyCollector<'o, 'a> {
         self.state.occupied.insert(name);
     }
 
-    fn occupy_string_words(&mut self, text: &'a str) {
+    fn occupy_string_words(&mut self, bytes: &'a [u8]) {
         if !self.options.reserve_string_words {
             return;
         }
-        let bytes = text.as_bytes();
         let mut i = 0;
         while i < bytes.len() {
             let b = bytes[i];
@@ -326,7 +325,9 @@ impl<'o, 'a> PropertyCollector<'o, 'a> {
                 {
                     i += 1;
                 }
-                self.occupy(Ident::from(&text[start..i]));
+                let word = std::str::from_utf8(&bytes[start..i])
+                    .expect("identifier words contain only ASCII");
+                self.occupy(Ident::from(word));
             } else {
                 i += 1;
             }
@@ -337,15 +338,21 @@ impl<'o, 'a> PropertyCollector<'o, 'a> {
         self.key_annotated.contains(&span.start)
     }
 
-    fn observe_literal(&mut self, span: Span, name: Ident<'a>) {
-        if self.special_literal(span) {
-            self.candidate(name);
-        } else {
-            // Compression can propagate or fold an arbitrary string into a property key after
-            // property names have already been assigned. Keep every literal spelling out of the
-            // generated namespace so that later materialization cannot merge distinct keys.
-            self.occupy(name);
-            self.occupy_string_words(name.as_str());
+    fn observe_literal(&mut self, span: Span, value: JSStr<'a>) {
+        let annotated = self.special_literal(span);
+        if let Some(name) = value.as_str() {
+            let name = Ident::from(name);
+            if annotated {
+                self.candidate(name);
+            } else {
+                // Compression can propagate or fold an arbitrary string into a property key
+                // after names have been assigned. Keep its spelling out of the generated
+                // namespace so that later materialization cannot merge distinct keys.
+                self.occupy(name);
+            }
+        }
+        if !annotated {
+            self.occupy_string_words(value.as_bytes());
         }
     }
 
@@ -405,8 +412,8 @@ impl<'a> Visit<'a> for PropertyCollector<'_, 'a> {
         // Directives are not property-name positions.
         if let Some(name) = directive.expression.value.as_str() {
             self.occupy(Ident::from(name));
-            self.occupy_string_words(name);
         }
+        self.occupy_string_words(directive.expression.value.as_bytes());
     }
 
     fn visit_ts_type(&mut self, _ty: &TSType<'a>) {}
@@ -464,24 +471,22 @@ impl<'a> Visit<'a> for PropertyCollector<'_, 'a> {
     }
 
     fn visit_string_literal(&mut self, literal: &StringLiteral<'a>) {
-        if let Some(name) = literal.value.as_str() {
-            self.observe_literal(literal.span, Ident::from(name));
-        }
+        self.observe_literal(literal.span, literal.value);
     }
 
     fn visit_template_literal(&mut self, template: &TemplateLiteral<'a>) {
         if template.expressions.is_empty()
             && let [quasi] = template.quasis.as_slice()
-            && let Some(cooked) = quasi.value.cooked.and_then(JSStr::as_str)
+            && let Some(cooked) = quasi.value.cooked
         {
-            self.observe_literal(template.span, Ident::from(cooked));
+            self.observe_literal(template.span, cooked);
         } else if self.options.reserve_string_words {
             for quasi in &template.quasis {
-                if let Some(cooked) = quasi.value.cooked.and_then(JSStr::as_str) {
-                    self.occupy_string_words(cooked);
-                } else {
-                    self.occupy_string_words(quasi.value.raw.as_str());
-                }
+                let bytes = match quasi.value.cooked {
+                    Some(cooked) => cooked.as_bytes(),
+                    None => quasi.value.raw.as_str().as_bytes(),
+                };
+                self.occupy_string_words(bytes);
             }
         }
         walk::walk_template_literal(self, template);

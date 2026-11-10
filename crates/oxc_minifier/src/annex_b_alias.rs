@@ -128,6 +128,7 @@ fn alias<'a>(
         scoping.add_symbol_redeclaration(binding, flags, declaration, id.span);
     }
     for reference_id in scoping.get_resolved_reference_ids(block_function).to_vec() {
+        scoping.delete_resolved_reference(block_function, reference_id);
         scoping.get_reference_mut(reference_id).set_symbol_id(binding);
         scoping.add_resolved_reference(binding, reference_id);
     }

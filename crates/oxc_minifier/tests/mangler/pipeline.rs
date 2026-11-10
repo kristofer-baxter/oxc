@@ -160,3 +160,37 @@ fn annex_b_block_function_and_hoisted_binding_share_a_mangled_name() {
     let Statement::FunctionDeclaration(inner) = &block.body[0] else { panic!("{output}") };
     assert_eq!(binding.name, inner.id.as_ref().unwrap().name, "{output}");
 }
+
+#[test]
+fn annex_b_aliases_keep_resolved_reference_membership_consistent() {
+    let source = "function outer() { var value = 1; { function value() { return value; } use(value); } return value; } use(outer());";
+    for keep_names in [false, true] {
+        let allocator = Allocator::default();
+        let parsed = Parser::new(&allocator, source, SourceType::script()).parse();
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let mut program = parsed.program;
+        let result = Minifier::new(MinifierOptions {
+            compress: None,
+            mangle: Some(MangleOptions {
+                top_level: Some(true),
+                keep_names: MangleOptionsKeepNames { function: keep_names, class: false },
+                ..MangleOptions::default()
+            }),
+            ..MinifierOptions::default()
+        })
+        .minify(&allocator, &mut program);
+        let scoping = result.scoping.expect("mangling must return its scoping");
+        let mut references = 0;
+        for symbol_id in scoping.symbol_ids() {
+            for &reference_id in scoping.get_resolved_reference_ids(symbol_id) {
+                assert_eq!(
+                    scoping.get_reference(reference_id).symbol_id(),
+                    Some(symbol_id),
+                    "reference {reference_id:?} belongs to {symbol_id:?}, keep_names={keep_names}"
+                );
+                references += 1;
+            }
+        }
+        assert_eq!(references, 4, "every resolved reference must occur once");
+    }
+}
