@@ -20,7 +20,9 @@ use super::{
     },
 };
 use crate::{
-    Context, ParserConfig as Config, ParserImpl, diagnostics,
+    Context, ParserConfig as Config, ParserImpl,
+    buffered_vec::BufferedVec,
+    diagnostics,
     lexer::{Kind, parse_big_int, parse_float, parse_int},
     modifiers::Modifiers,
 };
@@ -373,15 +375,11 @@ impl<'a, C: Config> ParserImpl<'a, C> {
             if p.at(Kind::RParen) || p.has_fatal_error() {
                 return (Some(first), None);
             }
-            let mut expressions = ArenaVec::with_capacity_in(2, p);
-            expressions.push(first);
-            let comma_start = p.parse_delimited_list_rest(
-                &mut expressions,
-                Kind::RParen,
-                Kind::Comma,
-                opening_span,
-                Self::parse_assignment_expression_or_higher,
-            );
+            let mut first = Some(first);
+            let (mut expressions, comma_start) =
+                p.parse_delimited_list(Kind::RParen, Kind::Comma, opening_span, |p| {
+                    first.take().unwrap_or_else(|| p.parse_assignment_expression_or_higher())
+                });
             let expression = if expressions.len() == 1 {
                 expressions.remove(0)
             } else {
@@ -668,37 +666,42 @@ impl<'a, C: Config> ParserImpl<'a, C> {
                 (quasis, ArenaVec::new_in(self))
             }
             Kind::TemplateHead => {
-                let first_quasi = self.parse_template_element(tagged);
+                let mut expressions = BufferedVec::new_in(self);
+                let mut first = Some(self.parse_template_element(tagged));
                 // TemplateHead Expression[+In, ?Yield, ?Await]
-                let first_expr = self.context_add(Context::In, Self::parse_expr);
+                let expr = self.context_add(Context::In, Self::parse_expr);
+                expressions.push(expr);
                 self.re_lex_template_substitution_tail();
-                let is_single = self.at(Kind::TemplateTail);
-                let mut expressions =
-                    ArenaVec::with_capacity_in(if is_single { 1 } else { 3 }, self);
-                let mut quasis = ArenaVec::with_capacity_in(if is_single { 2 } else { 4 }, self);
-                quasis.push(first_quasi);
-                expressions.push(first_expr);
-                while self.fatal_error.is_none() {
-                    match self.cur_kind() {
+                let mut finished = false;
+                let quasis = self.collect_list(|p| {
+                    if let Some(first) = first.take() {
+                        return Some(first);
+                    }
+                    if finished || p.fatal_error.is_some() {
+                        return None;
+                    }
+                    match p.cur_kind() {
                         Kind::TemplateTail => {
-                            quasis.push(self.parse_template_element(tagged));
-                            break;
+                            let quasi = p.parse_template_element(tagged);
+                            finished = true;
+                            Some(quasi)
                         }
                         Kind::TemplateMiddle => {
-                            quasis.push(self.parse_template_element(tagged));
+                            let quasi = p.parse_template_element(tagged);
                             // TemplateMiddle Expression[+In, ?Yield, ?Await]
-                            let expr = self.context_add(Context::In, Self::parse_expr);
+                            let expr = p.context_add(Context::In, Self::parse_expr);
                             expressions.push(expr);
-                            self.re_lex_template_substitution_tail();
+                            p.re_lex_template_substitution_tail();
+                            Some(quasi)
                         }
                         _ => {
-                            self.expect(Kind::TemplateTail);
-                            break;
+                            p.expect(Kind::TemplateTail);
+                            None
                         }
                     }
-                }
+                });
 
-                (quasis, expressions)
+                (quasis, expressions.into_vec())
             }
             _ => unreachable!("parse_template_literal"),
         };
@@ -865,7 +868,9 @@ impl<'a, C: Config> ParserImpl<'a, C> {
     fn parse_lhs_expression_rest(&mut self, start: u32, primary: Expression<'a>) -> Expression<'a> {
         let mut in_optional_chain = false;
         let lhs = match self.cur_kind() {
-            Kind::LParen => self.parse_call_expression_rest(start, primary, &mut in_optional_chain),
+            Kind::LParen => {
+                self.parse_call_expression_rest(start, primary, None, &mut in_optional_chain)
+            }
             Kind::Dot
             | Kind::QuestionDot
             | Kind::LBrack
@@ -874,7 +879,7 @@ impl<'a, C: Config> ParserImpl<'a, C> {
             | Kind::Bang
             | Kind::LAngle
             | Kind::ShiftLeft => {
-                let member_expression = self.parse_member_expression_rest(
+                let (member_expression, type_arguments) = self.parse_member_expression_rest(
                     start,
                     primary,
                     &mut in_optional_chain,
@@ -884,6 +889,7 @@ impl<'a, C: Config> ParserImpl<'a, C> {
                     self.parse_call_expression_rest(
                         start,
                         member_expression,
+                        type_arguments,
                         &mut in_optional_chain,
                     )
                 } else {
@@ -980,6 +986,8 @@ impl<'a, C: Config> ParserImpl<'a, C> {
     }
 
     /// parse rhs of a member expression, starting from lhs
+    ///
+    /// Return type arguments followed by `(` separately for the call or `new` expression.
     #[expect(clippy::inline_always)]
     #[inline(always)]
     fn parse_member_expression_rest(
@@ -988,11 +996,11 @@ impl<'a, C: Config> ParserImpl<'a, C> {
         lhs: Expression<'a>,
         in_optional_chain: &mut bool,
         allow_optional_chain: bool,
-    ) -> Expression<'a> {
+    ) -> (Expression<'a>, Option<ArenaBox<'a, TSTypeParameterInstantiation<'a>>>) {
         let mut lhs = lhs;
         loop {
             if self.fatal_error.is_some() {
-                return lhs;
+                return (lhs, None);
             }
 
             match self.cur_kind() {
@@ -1028,7 +1036,7 @@ impl<'a, C: Config> ParserImpl<'a, C> {
                         // This is not a valid optional chain pattern, don't consume ?.
                         // Should be a cold branch here, as most real-world optional chaining will look like
                         // `?.something` or `?.[expr]`
-                        return lhs;
+                        return (lhs, None);
                     }
                 }
                 Kind::LBrack if !self.ctx.has_decorator() => {
@@ -1045,22 +1053,40 @@ impl<'a, C: Config> ParserImpl<'a, C> {
                 }
                 Kind::LAngle | Kind::ShiftLeft if self.is_ts => {
                     if let Some(arguments) = self.parse_type_arguments_in_expression() {
-                        lhs = Expression::new_ts_instantiation_expression(
+                        let instantiation = TSInstantiationExpression::new(
                             self.end_span(lhs_start),
                             lhs,
                             arguments,
                             self,
                         );
+                        if !self.has_fatal_error() {
+                            if self.at(Kind::LParen) {
+                                return (
+                                    instantiation.expression,
+                                    Some(instantiation.type_arguments),
+                                );
+                            }
+                            if self.cur_kind().is_template_start_of_tagged_template() {
+                                lhs = self.parse_tagged_template(
+                                    lhs_start,
+                                    instantiation.expression,
+                                    *in_optional_chain,
+                                    Some(instantiation.type_arguments),
+                                );
+                                continue;
+                            }
+                        }
+                        lhs = Expression::TSInstantiationExpression(self.alloc(instantiation));
                     } else {
                         // `re_lex_as_typescript_l_angle` may have overwritten the original `<<`
                         // in the collected token stream with the single `<` it re-lexed.
                         // Rewind restored the parser's current token, so write it back over that `<`.
                         // This is a no-op when tokens are statically disabled (`NoTokensLexerConfig`).
                         self.lexer.rewrite_last_collected_token(self.token);
-                        return lhs;
+                        return (lhs, None);
                     }
                 }
-                _ => return lhs,
+                _ => return (lhs, None),
             }
         }
     }
@@ -1166,7 +1192,7 @@ impl<'a, C: Config> ParserImpl<'a, C> {
         let rhs_start = self.cur_start();
         let is_import = self.at(Kind::Import); // Syntax Error for `new import('mod')` but not `new (import('mod'))`.
         let mut optional = false;
-        let mut callee = {
+        let (mut callee, mut type_arguments) = {
             let lhs = self.parse_primary_expression();
             self.parse_member_expression_rest(
                 rhs_start,
@@ -1176,8 +1202,9 @@ impl<'a, C: Config> ParserImpl<'a, C> {
             )
         };
 
-        let mut type_arguments = None;
-        if let Expression::TSInstantiationExpression(instantiation_expr) = callee {
+        if type_arguments.is_none()
+            && let Expression::TSInstantiationExpression(instantiation_expr) = callee
+        {
             let instantiation_expr = instantiation_expr.unbox();
             type_arguments.replace(instantiation_expr.type_arguments);
             callee = instantiation_expr.expression;
@@ -1229,6 +1256,7 @@ impl<'a, C: Config> ParserImpl<'a, C> {
         &mut self,
         lhs_start: u32,
         lhs: Expression<'a>,
+        mut type_arguments: Option<ArenaBox<'a, TSTypeParameterInstantiation<'a>>>,
         in_optional_chain: &mut bool,
     ) -> Expression<'a> {
         let mut lhs = lhs;
@@ -1242,14 +1270,16 @@ impl<'a, C: Config> ParserImpl<'a, C> {
         let mut rescan_members = false;
         while self.fatal_error.is_none() {
             if self.at(Kind::LParen) {
-                let type_arguments = if let Expression::TSInstantiationExpression(expr) = lhs {
+                let call_type_arguments = if let Some(args) = type_arguments.take() {
+                    Some(args)
+                } else if let Expression::TSInstantiationExpression(expr) = lhs {
                     let expr = expr.unbox();
                     lhs = expr.expression;
                     Some(expr.type_arguments)
                 } else {
                     None
                 };
-                lhs = self.parse_call_arguments(lhs_start, lhs, false, type_arguments);
+                lhs = self.parse_call_arguments(lhs_start, lhs, false, call_type_arguments);
                 if !matches!(
                     self.cur_kind(),
                     Kind::LParen
@@ -1280,7 +1310,7 @@ impl<'a, C: Config> ParserImpl<'a, C> {
                         | Kind::ShiftLeft
                 )
             {
-                lhs = self.parse_member_expression_rest(
+                (lhs, type_arguments) = self.parse_member_expression_rest(
                     lhs_start,
                     lhs,
                     in_optional_chain,
@@ -1295,7 +1325,6 @@ impl<'a, C: Config> ParserImpl<'a, C> {
                 *in_optional_chain = true;
             }
 
-            let mut type_arguments = None;
             if question_dot {
                 if self.is_ts {
                     if let Some(args) = self.parse_type_arguments_in_expression() {
@@ -1309,13 +1338,21 @@ impl<'a, C: Config> ParserImpl<'a, C> {
                     }
                 }
                 if self.cur_kind().is_template_start_of_tagged_template() {
-                    lhs = self.parse_tagged_template(lhs_start, lhs, question_dot, type_arguments);
+                    lhs = self.parse_tagged_template(
+                        lhs_start,
+                        lhs,
+                        question_dot,
+                        type_arguments.take(),
+                    );
                     continue;
                 }
             }
 
             if type_arguments.is_some() || self.at(Kind::LParen) {
-                if !question_dot && let Expression::TSInstantiationExpression(expr) = lhs {
+                if !question_dot
+                    && type_arguments.is_none()
+                    && let Expression::TSInstantiationExpression(expr) = lhs
+                {
                     let expr = expr.unbox();
                     type_arguments.replace(expr.type_arguments);
                     lhs = expr.expression;
@@ -1827,10 +1864,16 @@ impl<'a, C: Config> ParserImpl<'a, C> {
                         match self.try_parse_arrow_function_expression::<true>(
                             allow_return_type_in_arrow_function,
                         ) {
-                            Some(Expression::ParenthesizedExpression(parenthesized)) => {
+                            // Reused heads cannot produce an arrow expression.
+                            Some(expression)
+                                if !matches!(
+                                    expression,
+                                    Expression::ArrowFunctionExpression(_)
+                                ) =>
+                            {
                                 break 'parse_lhs self.parse_reused_parenthesized_expression_rest(
                                     start,
-                                    parenthesized,
+                                    expression,
                                     pure_comments,
                                 );
                             }
@@ -1904,14 +1947,9 @@ impl<'a, C: Config> ParserImpl<'a, C> {
     fn parse_reused_parenthesized_expression_rest(
         &mut self,
         start: u32,
-        parenthesized: ArenaBox<'a, ParenthesizedExpression<'a>>,
+        primary: Expression<'a>,
         pure_comments: Option<(u32, NonZeroU32)>,
     ) -> Expression<'a> {
-        let primary = if self.options.preserve_parens {
-            Expression::ParenthesizedExpression(parenthesized)
-        } else {
-            parenthesized.unbox().expression
-        };
         let lhs = self.parse_primary_expression_rest(start, primary, pure_comments);
         if kind_to_precedence(self.cur_kind()).is_none() {
             lhs
@@ -2028,12 +2066,12 @@ impl<'a, C: Config> ParserImpl<'a, C> {
         start: u32,
         first_expression: Expression<'a>,
     ) -> Expression<'a> {
-        let mut expressions = ArenaVec::with_capacity_in(2, self);
-        expressions.push(first_expression);
-        while self.eat(Kind::Comma) {
-            let expression = self.parse_assignment_expression_or_higher();
-            expressions.push(expression);
-        }
+        let mut first = Some(first_expression);
+        let expressions = self.collect_list(|p| {
+            first
+                .take()
+                .or_else(|| p.eat(Kind::Comma).then(|| p.parse_assignment_expression_or_higher()))
+        });
         Expression::new_sequence_expression(self.end_span(start), expressions, self)
     }
 
@@ -2142,15 +2180,7 @@ impl<'a, C: Config> ParserImpl<'a, C> {
     }
 
     pub(crate) fn parse_decorators(&mut self) -> ArenaVec<'a, Decorator<'a>> {
-        if self.at(Kind::At) {
-            let mut decorators = ArenaVec::with_capacity_in(1, self);
-            while self.at(Kind::At) {
-                decorators.push(self.parse_decorator());
-            }
-            decorators
-        } else {
-            ArenaVec::new_in(self)
-        }
+        self.collect_list(|p| p.at(Kind::At).then(|| p.parse_decorator()))
     }
 
     /// `Decorator`[Yield, Await]:

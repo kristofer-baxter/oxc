@@ -89,9 +89,7 @@ impl<'a, C: Config> ParserImpl<'a, C> {
 
     /// Parse an ambiguous JS arrow head, retaining whether its final comma prevents it
     /// from also being a parenthesized expression.
-    pub(super) fn parse_cover_arrow_parameters(
-        &mut self,
-    ) -> (ArenaBox<'a, FormalParameters<'a>>, bool) {
+    pub(super) fn parse_cover_arrow_parameters(&mut self) -> (FormalParameters<'a>, bool) {
         debug_assert!(!self.is_ts);
         let start = self.cur_start();
         let opening_span = self.cur_token().span();
@@ -101,7 +99,7 @@ impl<'a, C: Config> ParserImpl<'a, C> {
         let has_trailing_comma =
             list.last().is_some_and(|param| param.span.end < self.prev_token_end);
         self.expect(Kind::RParen);
-        let params = FormalParameters::boxed(
+        let params = FormalParameters::new(
             self.end_span(start),
             FormalParameterKind::ArrowFormalParameters,
             list,
@@ -118,201 +116,156 @@ impl<'a, C: Config> ParserImpl<'a, C> {
         func_kind: FunctionKind,
         opening_span: Span,
     ) -> (ArenaVec<'a, FormalParameter<'a>>, Option<ArenaBox<'a, FormalParameterRest<'a>>>) {
-        let mut list = ArenaVec::new_in(self);
-        let rest = self.parse_formal_parameters_list_into(&mut list, func_kind, opening_span);
-        (list, rest)
-    }
-
-    #[inline(never)]
-    fn push_formal_parameter(
-        &self,
-        first_param: &mut Option<FormalParameter<'a>>,
-        list: &mut ArenaVec<'a, FormalParameter<'a>>,
-        param: FormalParameter<'a>,
-    ) {
-        if list.is_empty() {
-            if let Some(first) = first_param.take() {
-                let cap = if self.at(Kind::RParen) { 2 } else { 4 };
-                *list = ArenaVec::with_capacity_in(cap, self);
-                list.push(first);
-                list.push(param);
-            } else if self.at(Kind::RParen) {
-                *list = ArenaVec::from_value_in(param, self);
-            } else {
-                *first_param = Some(param);
-            }
-        } else {
-            list.push(param);
-        }
-    }
-
-    #[expect(clippy::inline_always)]
-    #[inline(always)]
-    fn parse_formal_parameters_list_into(
-        &mut self,
-        list: &mut ArenaVec<'a, FormalParameter<'a>>,
-        func_kind: FunctionKind,
-        opening_span: Span,
-    ) -> Option<ArenaBox<'a, FormalParameterRest<'a>>> {
         let mut rest: Option<ArenaBox<'a, FormalParameterRest<'a>>> = None;
-        let mut first_param: Option<FormalParameter<'a>> = None;
         let mut first = true;
         let mut has_optional = false;
 
-        loop {
-            let kind = self.cur_kind();
-            if kind == Kind::RParen
-                || matches!(kind, Kind::Eof | Kind::Undetermined)
-                || self.fatal_error.is_some()
-            {
-                break;
-            }
-
-            if first {
-                first = false;
-            } else {
-                let comma_span = self.cur_token().span();
-                if kind != Kind::Comma {
-                    self.handle_expect_closing_or_separator_failure(
-                        Kind::RParen,
-                        Kind::Comma,
-                        kind,
-                        comma_span,
-                        opening_span,
-                    );
-                    break;
+        let list = self.collect_list(|p| {
+            loop {
+                let kind = p.cur_kind();
+                if kind == Kind::RParen
+                    || matches!(kind, Kind::Eof | Kind::Undetermined)
+                    || p.fatal_error.is_some()
+                {
+                    return None;
                 }
-                self.advance(Kind::Comma);
-                let kind = self.cur_kind();
-                if kind == Kind::RParen {
-                    if rest.is_some() && !self.ctx.has_ambient() {
-                        self.error(diagnostics::rest_element_trailing_comma(comma_span));
+
+                if first {
+                    first = false;
+                } else {
+                    let comma_span = p.cur_token().span();
+                    if kind != Kind::Comma {
+                        p.handle_expect_closing_or_separator_failure(
+                            Kind::RParen,
+                            Kind::Comma,
+                            kind,
+                            comma_span,
+                            opening_span,
+                        );
+                        return None;
                     }
-                    break;
+                    p.advance(Kind::Comma);
+                    let kind = p.cur_kind();
+                    if kind == Kind::RParen {
+                        if rest.is_some() && !p.ctx.has_ambient() {
+                            p.error(diagnostics::rest_element_trailing_comma(comma_span));
+                        }
+                        return None;
+                    }
                 }
-            }
 
-            if let Some(r) = &rest {
-                self.set_fatal_error(diagnostics::rest_parameter_last(
-                    r.type_annotation.as_ref().map_or_else(
-                        || r.rest.span,
-                        |type_annotation| r.rest.span.merge(type_annotation.span()),
-                    ),
-                ));
-                break;
-            }
+                if let Some(r) = &rest {
+                    p.set_fatal_error(diagnostics::rest_parameter_last(
+                        r.type_annotation.as_ref().map_or_else(
+                            || r.rest.span,
+                            |type_annotation| r.rest.span.merge(type_annotation.span()),
+                        ),
+                    ));
+                    return None;
+                }
 
-            // Fast path for plain identifier parameters (`function foo(a, b, c)` or `(x: T, y?: U)`)
-            // which cannot have decorators or parameter modifiers.
-            if self.cur_kind() == Kind::Ident {
-                let ident = self.parse_plain_binding_identifier();
-                let ident_span = ident.span;
-                let pattern = BindingPattern::BindingIdentifier(self.alloc(ident));
-                if matches!(self.cur_kind(), Kind::Comma | Kind::RParen) {
-                    if has_optional {
-                        self.error(diagnostics::required_parameter_after_optional_parameter(
+                // Fast path for plain identifier parameters (`function foo(a, b, c)` or `(x: T, y?: U)`)
+                // which cannot have decorators or parameter modifiers.
+                if p.cur_kind() == Kind::Ident {
+                    let ident = p.parse_plain_binding_identifier();
+                    let ident_span = ident.span;
+                    let pattern = BindingPattern::BindingIdentifier(p.alloc(ident));
+                    if matches!(p.cur_kind(), Kind::Comma | Kind::RParen) {
+                        if has_optional {
+                            p.error(diagnostics::required_parameter_after_optional_parameter(
+                                ident_span,
+                            ));
+                        }
+                        return Some(FormalParameter::new(
                             ident_span,
+                            ArenaVec::new_in(p),
+                            pattern,
+                            None,
+                            None,
+                            false,
+                            None,
+                            false,
+                            false,
+                            p,
                         ));
                     }
-                    let param = FormalParameter::new(
-                        ident_span,
-                        ArenaVec::new_in(self),
-                        pattern,
-                        None,
-                        None,
-                        false,
-                        None,
-                        false,
-                        false,
-                        self,
-                    );
-                    self.push_formal_parameter(&mut first_param, list, param);
-                    continue;
-                }
-                let optional = self.is_ts && self.eat(Kind::Question);
-                let type_annotation =
-                    if self.is_ts { self.parse_ts_type_annotation() } else { None };
-                let init = if self.eat(Kind::Eq) {
-                    let init = self.context_add(
-                        Context::In,
-                        ParserImpl::parse_assignment_expression_or_higher,
-                    );
-                    if optional {
-                        self.error(
-                            diagnostics::a_parameter_cannot_have_question_mark_and_initializer(
-                                ident_span,
-                            ),
+                    let optional = p.is_ts && p.eat(Kind::Question);
+                    let type_annotation = if p.is_ts { p.parse_ts_type_annotation() } else { None };
+                    let init = if p.eat(Kind::Eq) {
+                        let init = p.context_add(
+                            Context::In,
+                            ParserImpl::parse_assignment_expression_or_higher,
                         );
+                        if optional {
+                            p.error(
+                                diagnostics::a_parameter_cannot_have_question_mark_and_initializer(
+                                    ident_span,
+                                ),
+                            );
+                        }
+                        Some(ArenaBox::new_in(init, p))
+                    } else {
+                        None
+                    };
+                    let span = p.end_span(ident_span.start);
+                    if optional {
+                        has_optional = true;
+                    } else if has_optional && init.is_none() {
+                        p.error(diagnostics::required_parameter_after_optional_parameter(span));
                     }
-                    Some(ArenaBox::new_in(init, self))
-                } else {
-                    None
-                };
-                let span = self.end_span(ident_span.start);
-                if optional {
-                    has_optional = true;
-                } else if has_optional && init.is_none() {
-                    self.error(diagnostics::required_parameter_after_optional_parameter(span));
-                }
-                let param = FormalParameter::new(
-                    span,
-                    ArenaVec::new_in(self),
-                    pattern,
-                    type_annotation,
-                    init,
-                    optional,
-                    None,
-                    false,
-                    false,
-                    self,
-                );
-                self.push_formal_parameter(&mut first_param, list, param);
-                continue;
-            }
-
-            let start = self.cur_start();
-            let decorators = self.parse_decorators();
-
-            if self.at(Kind::Dot3) {
-                let rest_element = self.parse_rest_element_for_formal_parameter();
-                let type_annotation =
-                    if self.is_ts { self.parse_ts_type_annotation() } else { None };
-
-                let are_decorators_allowed =
-                    matches!(func_kind, FunctionKind::ClassMethod | FunctionKind::Constructor)
-                        && self.is_ts;
-                if !are_decorators_allowed {
-                    for decorator in &decorators {
-                        self.error(diagnostics::decorators_are_not_valid_here(decorator.span));
-                    }
-                }
-
-                rest = Some(FormalParameterRest::boxed(
-                    self.end_span(start),
-                    decorators,
-                    rest_element,
-                    type_annotation,
-                    self,
-                ));
-            } else {
-                let param =
-                    self.parse_formal_parameter_with_decorators(func_kind, start, decorators);
-                if param.optional {
-                    has_optional = true;
-                } else if has_optional && param.initializer.is_none() {
-                    self.error(diagnostics::required_parameter_after_optional_parameter(
-                        param.span,
+                    return Some(FormalParameter::new(
+                        span,
+                        ArenaVec::new_in(p),
+                        pattern,
+                        type_annotation,
+                        init,
+                        optional,
+                        None,
+                        false,
+                        false,
+                        p,
                     ));
                 }
-                self.push_formal_parameter(&mut first_param, list, param);
+
+                let start = p.cur_start();
+                let decorators = p.parse_decorators();
+
+                if p.at(Kind::Dot3) {
+                    let rest_element = p.parse_rest_element_for_formal_parameter();
+                    let type_annotation = if p.is_ts { p.parse_ts_type_annotation() } else { None };
+
+                    let are_decorators_allowed =
+                        matches!(func_kind, FunctionKind::ClassMethod | FunctionKind::Constructor)
+                            && p.is_ts;
+                    if !are_decorators_allowed {
+                        for decorator in &decorators {
+                            p.error(diagnostics::decorators_are_not_valid_here(decorator.span));
+                        }
+                    }
+
+                    rest = Some(FormalParameterRest::boxed(
+                        p.end_span(start),
+                        decorators,
+                        rest_element,
+                        type_annotation,
+                        p,
+                    ));
+                } else {
+                    let param =
+                        p.parse_formal_parameter_with_decorators(func_kind, start, decorators);
+                    if param.optional {
+                        has_optional = true;
+                    } else if has_optional && param.initializer.is_none() {
+                        p.error(diagnostics::required_parameter_after_optional_parameter(
+                            param.span,
+                        ));
+                    }
+                    return Some(param);
+                }
             }
-        }
+        });
 
-        if let Some(first) = first_param {
-            *list = ArenaVec::from_value_in(first, self);
-        }
-
-        rest
+        (list, rest)
     }
 
     fn parse_formal_parameter_with_decorators(
