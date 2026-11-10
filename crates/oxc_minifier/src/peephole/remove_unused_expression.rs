@@ -976,10 +976,13 @@ impl<'a> PeepholeOptimizations {
         if !is_safe_inline_fresh {
             return false;
         }
-        let obj_has_effects = obj.may_have_side_effects(ctx)
-            || Self::discards_observable_read(obj, assign_expr.span.start, ctx);
-        let rhs_has_effects = assign_expr.right.may_have_side_effects(ctx)
-            || Self::discards_observable_read(&assign_expr.right, assign_expr.span.start, ctx);
+        if Self::discards_observable_read(obj, assign_expr.span.start, ctx)
+            || Self::discards_observable_read(&assign_expr.right, assign_expr.span.start, ctx)
+        {
+            return false;
+        }
+        let obj_has_effects = obj.may_have_side_effects(ctx);
+        let rhs_has_effects = assign_expr.right.may_have_side_effects(ctx);
         if !obj_has_effects {
             if !rhs_has_effects {
                 return true;

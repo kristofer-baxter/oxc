@@ -541,6 +541,8 @@ impl<'a> PeepholeOptimizations {
 
     #[expect(clippy::float_cmp, reason = "switch cases use exact JavaScript number equality")]
     fn switch_values_may_collide(a: &ConstantValue<'a>, b: &ConstantValue<'a>) -> bool {
+        #[cfg(test)]
+        tests::COLLISION_COMPARISONS.with(|count| count.set(count.get() + 1));
         match (a, b) {
             (ConstantValue::Number(na), ConstantValue::Number(nb)) => {
                 na == nb || (na.is_nan() && nb.is_nan())
@@ -652,6 +654,14 @@ impl<'a> PeepholeOptimizations {
                     for g2 in (g1 + 1)..groups.len() {
                         let (start1, _, _) = groups[g1];
                         let (start2, end2, _) = groups[g2];
+                        let body2 = Self::switch_body_without_trailing_break(
+                            &switch_stmt.cases[end2].consequent,
+                        );
+                        if body1.len() != body2.len()
+                            || !body1.iter().zip(body2).all(|(a, b)| a.content_eq(b))
+                        {
+                            continue;
+                        }
                         let can_move_across = if g2 == g1 + 1 {
                             true
                         } else {
@@ -673,17 +683,11 @@ impl<'a> PeepholeOptimizations {
                             })
                         };
                         if !can_move_across {
-                            continue;
+                            // Later groups cross the same collision or default case.
+                            break;
                         }
-                        let body2 = Self::switch_body_without_trailing_break(
-                            &switch_stmt.cases[end2].consequent,
-                        );
-                        if body1.len() == body2.len()
-                            && body1.iter().zip(body2).all(|(a, b)| a.content_eq(b))
-                        {
-                            merge_pair = Some((g1, g2));
-                            break 'outer;
-                        }
+                        merge_pair = Some((g1, g2));
+                        break 'outer;
                     }
                 }
                 if let Some((g1, g2)) = merge_pair {
@@ -1195,5 +1199,49 @@ impl<'a> oxc_ast_visit::Visit<'a> for FunctionDeclarationDetector {
         if it.is_declaration() {
             self.found = true;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+    use std::fmt::Write;
+
+    use oxc_allocator::Allocator;
+    use oxc_parser::Parser;
+    use oxc_span::SourceType;
+
+    use crate::{CompressOptions, Minifier, MinifierOptions};
+
+    thread_local! {
+        pub(super) static COLLISION_COMPARISONS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    #[test]
+    fn distinct_switch_bodies_do_not_scan_case_collisions() {
+        let mut source = String::from("switch (value) {");
+        for index in 0..100 {
+            write!(source, "case {index}: handler{index}(); break;")
+                .expect("writing to a String cannot fail");
+        }
+        source.push('}');
+        let allocator = Allocator::default();
+        let parsed = Parser::new(&allocator, &source, SourceType::mjs()).parse();
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let mut program = parsed.program;
+        COLLISION_COMPARISONS.with(|count| count.set(0));
+        Minifier::new(MinifierOptions {
+            compress: Some(CompressOptions::smallest()),
+            mangle: None,
+            ..MinifierOptions::default()
+        })
+        .minify(&allocator, &mut program);
+        COLLISION_COMPARISONS.with(|count| {
+            assert_eq!(
+                count.get(),
+                0,
+                "different bodies cannot merge regardless of case collisions"
+            );
+        });
     }
 }

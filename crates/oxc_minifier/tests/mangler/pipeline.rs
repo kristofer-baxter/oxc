@@ -363,6 +363,52 @@ fn property_extraction_preserves_tdz_exceptions() {
 }
 
 #[test]
+fn inline_member_writes_preserve_cross_script_accessor_reads() {
+    let script = r#"
+        import { createContext, runInContext } from 'node:vm';
+        const context = createContext({});
+        runInContext(`
+            const log = [];
+            Object.defineProperty(globalThis, 'read', {
+                configurable: true,
+                get() { log.push('read'); return true; }
+            });
+            function effect() { log.push('effect'); }
+        `, context);
+        runInContext(process.argv[1], context);
+        console.log(runInContext("JSON.stringify(log)", context));
+    "#;
+    for (expression, expected) in [
+        ("({ x: read && 0 }).x = effect()", "[\"read\",\"effect\"]\n"),
+        ("({ x: read && 0 })['x'] = effect()", "[\"read\",\"effect\"]\n"),
+        ("({ x: read ? 0 : 1 }).x = effect()", "[\"read\",\"effect\"]\n"),
+        ("({ x: 0 }).x = (read && 0)", "[\"read\"]\n"),
+        ("({ x: read && 0 }).x = (read && 0)", "[\"read\",\"read\"]\n"),
+    ] {
+        let source = format!("var read; function run() {{ {expression}; }} run();");
+        let allocator = Allocator::default();
+        let parsed = Parser::new(&allocator, &source, SourceType::script()).parse();
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let mut program = parsed.program;
+        Minifier::new(MinifierOptions {
+            compress: Some(CompressOptions::smallest()),
+            mangle: None,
+            ..MinifierOptions::default()
+        })
+        .minify(&allocator, &mut program);
+        let minified = Codegen::new().build(&program).code;
+        for code in [&source, &minified] {
+            let output = Command::new("node")
+                .args(["--input-type=module", "--eval", script, "--", code])
+                .output()
+                .expect("Node.js is required to verify cross-script accessor reads");
+            assert!(output.status.success(), "{code}\n{}", String::from_utf8_lossy(&output.stderr));
+            assert_eq!(output.stdout, expected.as_bytes(), "{source}\n{code}");
+        }
+    }
+}
+
+#[test]
 fn property_extraction_preserves_inferred_stack_names() {
     for source in [
         "console.log(({ descriptive: function () { return new Error().stack; } }).descriptive());",
