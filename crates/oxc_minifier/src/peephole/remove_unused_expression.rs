@@ -1210,6 +1210,7 @@ impl<'a> PeepholeOptimizations {
                 // so it reports no extraction plan. Cold path — it only runs
                 // when an `Extracts` class is actually removed.
                 let mut exprs = ArenaVec::new_in(ctx);
+                let class_symbol_id = c.id.as_ref().and_then(|id| id.symbol_id.get());
 
                 if c.heritage_expression()
                     .is_some_and(|expression| expression.may_have_side_effects(ctx))
@@ -1243,8 +1244,18 @@ impl<'a> PeepholeOptimizations {
                             ClassElement::AccessorProperty(def) => def.value.take(),
                         }
                     {
-                        // Already checked side effects above.
-                        exprs.push(init);
+                        if class_symbol_id.is_some()
+                            && let Expression::Identifier(id) = init.without_parentheses()
+                            && ctx.scoping().get_reference(id.reference_id()).symbol_id()
+                                == class_symbol_id
+                        {
+                            // The class binding is initialized for static values, but does not
+                            // remain available after its class expression is discarded.
+                            ctx.drop_expression(&init);
+                        } else {
+                            // Already checked side effects above.
+                            exprs.push(init);
+                        }
                     }
                 }
 

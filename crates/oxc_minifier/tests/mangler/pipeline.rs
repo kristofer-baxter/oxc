@@ -228,6 +228,79 @@ fn substituted_iife_arguments_preserve_tdz_exceptions() {
 }
 
 #[test]
+fn unused_class_self_references_do_not_escape_the_class() {
+    for source in [
+        "class Dead { static self = Dead; clone() { return new Dead(); } } console.log('ok');",
+        "const unused = class Dead { static self = Dead; clone() { return new Dead(); } }; console.log('ok');",
+        "(class Dead { static self = Dead; }); console.log('ok');",
+        "class Live { static self = Live; } console.log(Live.self === Live);",
+        "class Live { static self = Live; static { console.log(Live.self === Live); } } console.log('ok');",
+        "class Dead { [Dead]() {} } console.log('ok');",
+        "class Dead extends Dead {} console.log('ok');",
+    ] {
+        let execute = |code: &str| {
+            Command::new("node")
+                .args(["--input-type=module", "--eval", code])
+                .output()
+                .expect("Node.js is required to verify class initialization")
+        };
+        let reference = execute(source);
+        for keep_names in [false, true] {
+            let mut compress = CompressOptions::smallest();
+            compress.keep_names.function = keep_names;
+            compress.keep_names.class = keep_names;
+            let minified =
+                minify_with_compression(source, SourceType::mjs(), keep_names, Some(compress));
+            let output = execute(&minified);
+            assert_eq!(output.status.code(), reference.status.code(), "{source}\n{minified}");
+            assert_eq!(output.stdout, reference.stdout, "{source}\n{minified}");
+            if !reference.status.success() {
+                assert!(
+                    String::from_utf8_lossy(&output.stderr).contains("ReferenceError:"),
+                    "{source}\n{minified}\n{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn exported_closures_preserve_tdz_errors_in_module_cycles() {
+    let source = "if (0) d(); function d() {} let x; export function c() { f(); if (x) y(); else return g; }";
+    let minified = minify_with_compression(
+        source,
+        SourceType::mjs(),
+        false,
+        Some(CompressOptions::smallest()),
+    );
+    let script = r#"
+        import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+        import { tmpdir } from 'node:os';
+        import { join } from 'node:path';
+        import { pathToFileURL } from 'node:url';
+        const dir = mkdtempSync(join(tmpdir(), 'oxc-lexical-cycle-'));
+        try {
+            writeFileSync(join(dir, 'a.mjs'), "import './b.mjs';\n" + process.argv[1]);
+            writeFileSync(join(dir, 'b.mjs'),
+                "import { c } from './a.mjs'; globalThis.f = () => {}; globalThis.g = 'ok'; " +
+                "try { console.log(c()); } catch (error) { console.log(error.name); }");
+            await import(pathToFileURL(join(dir, 'a.mjs')));
+        } finally {
+            rmSync(dir, { recursive: true });
+        }
+    "#;
+    for code in [source, &minified] {
+        let output = Command::new("node")
+            .args(["--input-type=module", "--eval", script, "--", code])
+            .output()
+            .expect("Node.js is required to verify cyclic-module initialization");
+        assert!(output.status.success(), "{code}\n{}", String::from_utf8_lossy(&output.stderr));
+        assert_eq!(output.stdout, b"ReferenceError\n", "{code}");
+    }
+}
+
+#[test]
 fn property_extraction_preserves_tdz_exceptions() {
     for source in [
         "globalThis.result = (({p: void later}).p === void 0); let later = 1;",
