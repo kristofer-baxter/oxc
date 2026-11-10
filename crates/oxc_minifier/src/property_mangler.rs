@@ -156,10 +156,11 @@ impl ManglePropertiesOptions {
 
     /// Create options from an exact allowlist, reserving words in non-annotated strings.
     ///
-    /// Names must still match [`Self::include`]. Exclusions, reservations, numeric names,
-    /// and hard-reserved names take precedence, including over pinned cache entries.
+    /// The default [`Self::include`] matches every name, including empty and multiline names.
+    /// Overrides, exclusions, reservations, numeric names, and hard-reserved names take
+    /// precedence, including over pinned cache entries.
     pub fn from_names(names: impl IntoIterator<Item = impl AsRef<str>>) -> Self {
-        let mut options = Self::new(lazy_regex::Regex::clone(lazy_regex::regex!(".")));
+        let mut options = Self::new(lazy_regex::Regex::clone(lazy_regex::regex!("(?s:.*)")));
         options.include_names =
             Some(names.into_iter().map(|s| CompactStr::new(s.as_ref())).collect());
         options.reserve_string_words = true;

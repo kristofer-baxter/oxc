@@ -89,6 +89,27 @@ fn exact_allowlist_intersects_regex_and_all_reservations() {
 }
 
 #[test]
+fn exact_allowlist_includes_empty_and_line_feed_names() {
+    let include = lazy_regex::Regex::new(".").unwrap();
+    for (name, source) in [
+        ("", r#"const obj = { "": 7, untouched: 2 }; use(obj[""], obj.untouched);"#),
+        ("\n\n", r#"const obj = { "\n\n": 7, untouched: 2 }; use(obj["\n\n"], obj.untouched);"#),
+    ] {
+        let mut opts = ManglePropertiesOptions::from_names([name]);
+        opts.mangle_quoted = true;
+        test(source, source, opts.clone());
+        opts.reserve_string_words = false;
+        test(
+            source,
+            "const obj = { e: 7, untouched: 2 }; use(obj.e, obj.untouched);",
+            opts.clone(),
+        );
+        opts.include = include.clone();
+        test(source, source, opts);
+    }
+}
+
+#[test]
 fn string_words_reserve_sources_and_generated_targets_including_directives() {
     let opts = ManglePropertiesOptions::from_names(["_picked", "_blocked", "_template"]);
     test(
