@@ -146,7 +146,11 @@ impl<'a> SymbolLiveness<'a> {
 
     /// Seed implicit observability from scoping; the function graph is created
     /// lazily at first registration.
-    fn new(source_type: SourceType, scoping: &Scoping, allocator: &'a Allocator) -> Self {
+    pub(crate) fn new(
+        source_type: SourceType,
+        scoping: &Scoping,
+        allocator: &'a Allocator,
+    ) -> Self {
         let symbols_len = scoping.symbols_len();
         let mut implicitly_observable = BitSet::new_in(symbols_len, allocator);
         if source_type.is_script() {
@@ -171,7 +175,7 @@ impl<'a> SymbolLiveness<'a> {
         self.recursive_functions.as_ref().is_some_and(|graph| graph.is_dead(symbol_id))
     }
 
-    fn mark_implicitly_observable(&mut self, symbol_id: SymbolId) {
+    pub(crate) fn mark_implicitly_observable(&mut self, symbol_id: SymbolId) {
         self.implicitly_observable.set_bit(symbol_id.index());
     }
 

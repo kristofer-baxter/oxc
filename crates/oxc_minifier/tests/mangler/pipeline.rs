@@ -4,7 +4,7 @@ use oxc_allocator::Allocator;
 use oxc_ast::ast::{BindingPattern, Statement};
 use oxc_codegen::Codegen;
 use oxc_mangler::{MangleOptions, MangleOptionsKeepNames};
-use oxc_minifier::{CompressOptions, Minifier, MinifierOptions};
+use oxc_minifier::{CompressOptions, Compressor, Minifier, MinifierOptions};
 use oxc_parser::Parser;
 use oxc_span::SourceType;
 
@@ -18,20 +18,27 @@ fn minify_with_compression(
     keep_names: bool,
     compress: Option<CompressOptions>,
 ) -> String {
+    minify_with_options(
+        source,
+        source_type,
+        MinifierOptions {
+            compress,
+            mangle: Some(MangleOptions {
+                top_level: Some(true),
+                keep_names: MangleOptionsKeepNames { function: keep_names, class: false },
+                ..MangleOptions::default()
+            }),
+            ..MinifierOptions::default()
+        },
+    )
+}
+
+fn minify_with_options(source: &str, source_type: SourceType, options: MinifierOptions) -> String {
     let allocator = Allocator::default();
     let parsed = Parser::new(&allocator, source, source_type).parse();
     assert!(parsed.diagnostics.is_empty());
     let mut program = parsed.program;
-    let result = Minifier::new(MinifierOptions {
-        compress,
-        mangle: Some(MangleOptions {
-            top_level: Some(true),
-            keep_names: MangleOptionsKeepNames { function: keep_names, class: false },
-            ..MangleOptions::default()
-        }),
-        ..MinifierOptions::default()
-    })
-    .minify(&allocator, &mut program);
+    let result = Minifier::new(options).minify(&allocator, &mut program);
     Codegen::new().with_scoping(result.scoping).build(&program).code
 }
 
@@ -234,7 +241,7 @@ fn annex_b_aliases_keep_resolved_reference_membership_consistent() {
 }
 
 #[test]
-fn annex_b_aliases_cross_simple_catch_bindings() {
+fn annex_b_copies_and_barriers_survive_compression_and_mangling() {
     for source in [
         "function run(){var value='outer',count=1;try{throw'catch'}catch(value){{let other=1;function value(){}console.log(other)}}console.log(typeof value,typeof count)}run();",
         "function run(){var value='outer';try{throw'catch'}catch(value){{let other=1;function value(){}console.log(other)}console.log(value)}console.log(typeof value)}run();",
@@ -242,6 +249,10 @@ fn annex_b_aliases_cross_simple_catch_bindings() {
         "function run(){var value='outer',count=1;try{throw{value:'catch'}}catch({value}){{let other=1;function value(){}console.log(other)}console.log(value)}console.log(typeof value,typeof count)}run();",
         "function run(){var value='outer',count=1;{let value=globalThis.first;globalThis.read=()=>value;value=globalThis.second;{let other=1;function value(){}console.log(other)}console.log(value)}console.log(typeof value,typeof count)}run();",
         "function run(value){var count=1;{let other=1;function value(){}console.log(other)}console.log(typeof value,typeof count)}run('outer');",
+        "function run(){var count=1;{let value=1;{function value(){}}console.log(value)}console.log(typeof value,typeof count)}run();",
+        "function run(){var value='outer',count=1;{let value='block';{let other=1;function value(){}console.log(other)}console.log(value)}console.log(typeof value,typeof count)}run();",
+        "function run(){var value='outer',count=1;{let value='block';{function value(){}}}console.log(typeof value,typeof count)}run();",
+        "function run(){var value='outer',count=1;{class value{};{function value(){}}}console.log(typeof value,typeof count)}run();",
     ] {
         let execute = |code: &str| {
             let output = Command::new("node")
@@ -252,6 +263,29 @@ fn annex_b_aliases_cross_simple_catch_bindings() {
             output.stdout
         };
         let expected = execute(source);
+        for source_type in [SourceType::script(), SourceType::cjs()] {
+            let allocator = Allocator::default();
+            let parsed = Parser::new(&allocator, source, source_type).parse();
+            assert!(parsed.diagnostics.is_empty());
+            let mut program = parsed.program;
+            Compressor::new(&allocator)
+                .dead_code_elimination(&mut program, CompressOptions::smallest());
+            let minified = Codegen::new().build(&program).code;
+            assert_eq!(execute(&minified), expected, "DCE source={source}\n{minified}");
+            for mut compress in [CompressOptions::smallest(), CompressOptions::safest()] {
+                compress.unused = oxc_minifier::CompressOptionsUnused::Keep;
+                let minified = minify_with_options(
+                    source,
+                    source_type,
+                    MinifierOptions {
+                        compress: Some(compress),
+                        mangle: None,
+                        ..MinifierOptions::default()
+                    },
+                );
+                assert_eq!(execute(&minified), expected, "source={source}\n{minified}");
+            }
+        }
         for keep_names in [false, true] {
             for compress in [None, Some(CompressOptions::smallest())] {
                 let minified =

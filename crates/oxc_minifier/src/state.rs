@@ -1,15 +1,17 @@
 use oxc_allocator::{Allocator, BitSet};
+use oxc_ast::ast::{Function, Program};
+use oxc_ast_visit::{Visit, walk};
 use oxc_data_structures::stack::NonEmptyStack;
 use oxc_semantic::Scoping;
 use oxc_span::SourceType;
 use oxc_str::{Ident, IdentHashSet};
 use oxc_syntax::{
-    scope::ScopeId,
+    scope::{ScopeFlags, ScopeId},
     symbol::{SymbolFlags, SymbolId},
 };
 use rustc_hash::FxHashSet;
 
-use crate::{CompressOptions, symbol_state::SymbolState};
+use crate::{CompressOptions, symbol_liveness::SymbolLiveness, symbol_state::SymbolState};
 
 /// Compression pipeline selected for this run.
 #[derive(Clone, Copy)]
@@ -156,7 +158,8 @@ pub struct MinifierState<'a> {
     /// Bindings that can be written without a resolved write reference: a
     /// function-scoped binding that a sloppy-mode block function declaration of
     /// the same name can overwrite (Annex B.3.3, see
-    /// `annex_b_overwritten_bindings`), and a CommonJS root binding that the
+    /// `annex_b_observable_bindings`), a lexical binding whose presence blocks
+    /// that overwrite, and a CommonJS root binding that the
     /// wrapper's mapped `arguments` aliases (see `commonjs_wrapper_bindings`).
     pub(crate) hidden_writes: FxHashSet<SymbolId>,
 }
@@ -179,47 +182,71 @@ pub fn commonjs_wrapper_bindings(
         .filter_map(move |name| scoping.get_binding(root_scope_id, name.into()))
 }
 
-/// Bindings that a sloppy-mode block-level function declaration assigns when
-/// its block is evaluated. Semantic analysis keeps such a function in its
-/// block scope when the enclosing var scope already binds the name, so the
-/// overwrite of that binding has no write reference. Over-approximates: it
-/// ignores the Annex B conditions that would cancel the assignment.
-fn annex_b_overwritten_bindings(scoping: &Scoping) -> FxHashSet<SymbolId> {
-    let mut overwritten = FxHashSet::default();
-    for symbol_id in scoping.symbol_ids() {
-        let flags = scoping.symbol_flags(symbol_id);
-        if !flags.contains(SymbolFlags::Function)
-            || flags
-                .intersects(SymbolFlags::FunctionExpression | SymbolFlags::AsyncOrGeneratorFunction)
-        {
-            continue;
-        }
-        let scope_id = scoping.symbol_scope_id(symbol_id);
-        let scope_flags = scoping.scope_flags(scope_id);
-        if scope_flags.is_var() || scope_flags.is_strict_mode() {
-            continue;
-        }
-        let Some(var_scope_id) =
-            scoping.scope_ancestors(scope_id).skip(1).find(|&id| scoping.scope_flags(id).is_var())
-        else {
-            continue;
-        };
-        if let Some(binding) = scoping.get_binding(var_scope_id, scoping.symbol_ident(symbol_id)) {
-            overwritten.insert(binding);
+/// Protect implicit Annex B writes and the bindings that block them. Use the
+/// declaration's scope because semantic hoisting can move its symbol past a
+/// lexical barrier.
+fn annex_b_observable_bindings(program: &Program<'_>, scoping: &Scoping) -> FxHashSet<SymbolId> {
+    struct Collector<'s> {
+        scoping: &'s Scoping,
+        bindings: FxHashSet<SymbolId>,
+    }
+
+    impl<'a> Visit<'a> for Collector<'_> {
+        fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
+            if function.is_function_declaration()
+                && !function.r#async
+                && !function.generator
+                && let Some(id) = &function.id
+                && let Some(scope_id) = self.scoping.scope_parent_id(function.scope_id())
+                && !self.scoping.scope_flags(scope_id).is_var()
+                && !self.scoping.scope_flags(scope_id).is_strict_mode()
+            {
+                for ancestor in self.scoping.scope_ancestors(scope_id).skip(1) {
+                    if let Some(binding) = self.scoping.get_binding(ancestor, id.name) {
+                        self.bindings.insert(binding);
+                    }
+                    if self.scoping.scope_flags(ancestor).is_var() {
+                        break;
+                    }
+                }
+            }
+            walk::walk_function(self, function, flags);
         }
     }
-    overwritten
+
+    let mut collector = Collector { scoping, bindings: FxHashSet::default() };
+    collector.visit_program(program);
+    collector.bindings
 }
 
 impl<'a> MinifierState<'a> {
     pub(crate) fn new(
-        source_type: SourceType,
+        program: &Program<'_>,
         options: CompressOptions,
         mode: CompressionMode,
         scoping: &Scoping,
         allocator: &'a Allocator,
     ) -> Self {
-        let symbols = SymbolState::new(source_type, &options, scoping, allocator);
+        let source_type = program.source_type;
+        let mut hidden_writes = if source_type.is_strict() {
+            FxHashSet::default()
+        } else {
+            annex_b_observable_bindings(program, scoping)
+        };
+        hidden_writes.extend(commonjs_wrapper_bindings(source_type, scoping));
+        let mut symbols = SymbolState::new(source_type, &options, scoping, allocator);
+        if !hidden_writes.is_empty() {
+            let liveness =
+                symbols.ensure_liveness(|| SymbolLiveness::new(source_type, scoping, allocator));
+            for &binding in &hidden_writes {
+                if scoping
+                    .symbol_flags(binding)
+                    .intersects(SymbolFlags::BlockScopedVariable | SymbolFlags::Class)
+                {
+                    liveness.mark_implicitly_observable(binding);
+                }
+            }
+        }
         Self {
             config: CompressionConfig { source_type, options, mode },
             symbols,
@@ -249,15 +276,7 @@ impl<'a> MinifierState<'a> {
             next_dirty_scopes: BitSet::new_in(scoping.scopes_len(), allocator),
             own_dirty_scopes: BitSet::new_in(scoping.scopes_len(), allocator),
             next_own_dirty_scopes: BitSet::new_in(scoping.scopes_len(), allocator),
-            hidden_writes: {
-                let mut hidden_writes = if source_type.is_strict() {
-                    FxHashSet::default()
-                } else {
-                    annex_b_overwritten_bindings(scoping)
-                };
-                hidden_writes.extend(commonjs_wrapper_bindings(source_type, scoping));
-                hidden_writes
-            },
+            hidden_writes,
             stmts_scratch: oxc_allocator::Vec::new_in(&allocator),
         }
     }

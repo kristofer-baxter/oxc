@@ -34,11 +34,19 @@ pub fn alias_annex_b_block_functions(
         return names;
     }
     let (scoping, nodes) = semantic.scoping_mut_and_nodes();
-    let aliases: std::vec::Vec<_> = scoping
-        .symbol_ids()
-        .filter_map(|block_function| {
-            annex_b_binding(scoping, nodes, block_function, reserved)
-                .map(|binding| (block_function, binding))
+    let mut seen = FxHashSet::default();
+    let aliases: std::vec::Vec<_> = nodes
+        .iter()
+        .filter_map(|node| {
+            let AstKind::Function(function) = node.kind() else { return None };
+            if !function.is_function_declaration() || function.r#async || function.generator {
+                return None;
+            }
+            let block_function = function.id.as_ref()?.symbol_id.get()?;
+            let binding =
+                annex_b_binding(scoping, nodes, block_function, node.scope_id(), reserved)?;
+            (block_function != binding && seen.insert(block_function))
+                .then_some((block_function, binding))
         })
         .collect();
     for (block_function, binding) in aliases {
@@ -55,12 +63,12 @@ fn annex_b_binding(
     scoping: &Scoping,
     nodes: &AstNodes<'_>,
     symbol_id: SymbolId,
+    block_scope_id: ScopeId,
     reserved: &mut FxHashSet<CompactStr>,
 ) -> Option<SymbolId> {
     if !is_plain_function(scoping.symbol_flags(symbol_id)) {
         return None;
     }
-    let block_scope_id = scoping.symbol_scope_id(symbol_id);
     let block_scope_flags = scoping.scope_flags(block_scope_id);
     if block_scope_flags.is_var() || block_scope_flags.is_strict_mode() {
         return None;
