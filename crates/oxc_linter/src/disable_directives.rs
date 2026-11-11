@@ -365,6 +365,33 @@ impl DisableDirectives {
         self.used_disable_comments.borrow_mut().push(disable_directive);
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.intervals.is_empty()
+    }
+
+    /// Marks disable directives targeting `rule_name` (and blanket `All` directives) as used.
+    ///
+    /// Used when `warn`-configured rules are skipped under `--quiet` so that disable comments
+    /// for those rules are not reported as unused.
+    pub fn mark_rule_directives_used(&self, rule_name: &str) {
+        let mut used = self.used_disable_comments.borrow_mut();
+        for interval in &self.intervals {
+            let rule_matches = match &interval.val {
+                DisabledRule::All { .. } => true,
+                DisabledRule::Single { rule_name: name, .. } => {
+                    if rule_name.contains('/') {
+                        name == rule_name
+                    } else {
+                        name.rsplit_once('/').map_or(name.as_str(), |(_, rule)| rule) == rule_name
+                    }
+                }
+            };
+            if rule_matches && !used.contains(&interval.val) {
+                used.push(interval.val.clone());
+            }
+        }
+    }
+
     pub fn contains(&self, rule_name: &str, span: Span) -> bool {
         // For `eslint-disable-next-line` and `eslint-disable-line` directives, we only check
         // if the diagnostic's starting position falls within the disabled interval.

@@ -49,6 +49,8 @@ pub struct TsGoLintState {
     timings: bool,
     /// If `true`, the linter will create "ignore this section / line" fixes for all diagnostics
     with_ignore_fixes: bool,
+    /// If `true`, skip executing `warn`-severity type-aware rules.
+    deny_only: bool,
 }
 
 impl TsGoLintState {
@@ -67,6 +69,7 @@ impl TsGoLintState {
             type_check_only: false,
             timings: false,
             with_ignore_fixes: false,
+            deny_only: false,
         }
     }
 
@@ -92,6 +95,7 @@ impl TsGoLintState {
             type_check_only: false,
             timings: false,
             with_ignore_fixes: false,
+            deny_only: false,
         })
     }
 
@@ -135,6 +139,12 @@ impl TsGoLintState {
     #[must_use]
     pub fn with_ignore_fixes(mut self, yes: bool) -> Self {
         self.with_ignore_fixes = yes;
+        self
+    }
+
+    #[must_use]
+    pub fn with_deny_only(mut self, yes: bool) -> Self {
+        self.deny_only = yes;
         self
     }
 
@@ -560,6 +570,9 @@ impl TsGoLintState {
 
         let json_input =
             self.json_input(paths, Some(source_overrides.clone()), &mut resolved_configs);
+        if json_input.configs.is_empty() {
+            return Ok(vec![]);
+        }
 
         //  Get the file name of the first path for internal diagnostic filtering
         let path_file_name =
@@ -721,7 +734,12 @@ impl TsGoLintState {
                     .rules
                     .iter()
                     .filter_map(|(rule, status)| {
-                        if status.is_warn_deny() && rule.is_tsgolint_rule() {
+                        let active = if self.deny_only {
+                            *status == AllowWarnDeny::Deny
+                        } else {
+                            status.is_warn_deny()
+                        };
+                        if active && rule.is_tsgolint_rule() {
                             let rule_name = rule.name().to_string();
                             let options = match rule.to_configuration() {
                                 Some(Ok(config)) => Some(config),
@@ -734,7 +752,9 @@ impl TsGoLintState {
                     })
                     .collect();
 
-                config_groups.entry(rules).or_default().push(file_path);
+                if !rules.is_empty() || !self.deny_only || self.type_check {
+                    config_groups.entry(rules).or_default().push(file_path);
+                }
             }
         }
 
@@ -1950,5 +1970,79 @@ mod test {
 
         // Identical rules should be deduplicated
         assert_eq!(rules.len(), 1, "BTreeSet should deduplicate identical rules");
+    }
+
+    #[test]
+    fn test_json_input_deny_only_prunes_warn_rules() {
+        use rustc_hash::FxHashMap;
+        use std::{ffi::OsStr, path::Path, sync::Arc};
+
+        use crate::{
+            AllowWarnDeny, ConfigStore, ConfigStoreBuilder, ExternalPluginStore,
+            rules::{RuleEnum, TypescriptNoFloatingPromises, TypescriptRequireAwait},
+            tsgolint::TsGoLintState,
+        };
+
+        let mut external_plugin_store = ExternalPluginStore::default();
+        let config = ConfigStoreBuilder::empty()
+            .with_rule(
+                RuleEnum::TypescriptRequireAwait(TypescriptRequireAwait),
+                AllowWarnDeny::Warn,
+            )
+            .with_rule(
+                RuleEnum::TypescriptNoFloatingPromises(TypescriptNoFloatingPromises::default()),
+                AllowWarnDeny::Deny,
+            )
+            .build(&mut external_plugin_store)
+            .unwrap();
+        let store = ConfigStore::new(config, FxHashMap::default(), external_plugin_store);
+
+        let paths = [Arc::<OsStr>::from(OsStr::new("/tmp/index.ts"))];
+
+        let state_all = TsGoLintState::new(Path::new("/tmp"), store.clone(), FixKind::None);
+        let mut resolved = FxHashMap::default();
+        let payload_all = state_all.json_input(&paths, None, &mut resolved);
+        assert_eq!(payload_all.configs.len(), 1);
+        let rule_names: Vec<&str> =
+            payload_all.configs[0].rules.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(rule_names, vec!["no-floating-promises", "require-await"]);
+
+        let state_deny_only =
+            TsGoLintState::new(Path::new("/tmp"), store, FixKind::None).with_deny_only(true);
+        let mut resolved = FxHashMap::default();
+        let payload_deny = state_deny_only.json_input(&paths, None, &mut resolved);
+        assert_eq!(payload_deny.configs.len(), 1);
+        let rule_names_deny: Vec<&str> =
+            payload_deny.configs[0].rules.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(rule_names_deny, vec!["no-floating-promises"]);
+    }
+
+    #[test]
+    fn test_json_input_deny_only_skips_when_only_warn_rules() {
+        use rustc_hash::FxHashMap;
+        use std::{ffi::OsStr, path::Path, sync::Arc};
+
+        use crate::{
+            AllowWarnDeny, ConfigStore, ConfigStoreBuilder, ExternalPluginStore,
+            rules::{RuleEnum, TypescriptRequireAwait},
+            tsgolint::TsGoLintState,
+        };
+
+        let mut external_plugin_store = ExternalPluginStore::default();
+        let config = ConfigStoreBuilder::empty()
+            .with_rule(
+                RuleEnum::TypescriptRequireAwait(TypescriptRequireAwait),
+                AllowWarnDeny::Warn,
+            )
+            .build(&mut external_plugin_store)
+            .unwrap();
+        let store = ConfigStore::new(config, FxHashMap::default(), external_plugin_store);
+
+        let paths = [Arc::<OsStr>::from(OsStr::new("/tmp/index.ts"))];
+        let state_deny_only =
+            TsGoLintState::new(Path::new("/tmp"), store, FixKind::None).with_deny_only(true);
+        let mut resolved = FxHashMap::default();
+        let payload_deny = state_deny_only.json_input(&paths, None, &mut resolved);
+        assert!(payload_deny.configs.is_empty());
     }
 }

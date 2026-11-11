@@ -438,6 +438,7 @@ impl CliRunner {
         }
         let deny_warnings = warning_options.deny_warnings || config_store.deny_warnings();
         let max_warnings = warning_options.max_warnings.or(config_store.max_warnings());
+        let deny_only = warning_options.quiet && !deny_warnings && max_warnings.is_none();
 
         // Only propagate Warn/Deny; treat Allow (off) as disabling reports.
         let report_unused_directives = if type_check_only {
@@ -480,7 +481,8 @@ impl CliRunner {
 
         let linter = Linter::new(LintOptions::default(), config_store, external_linter)
             .with_fix(fix_options.fix_kind())
-            .with_report_unused_directives(report_unused_directives);
+            .with_report_unused_directives(report_unused_directives)
+            .with_deny_only(deny_only);
 
         let number_of_files = files_to_lint.len();
         let tsconfig = basic_options.tsconfig;
@@ -2869,5 +2871,135 @@ mod suppression {
             .with_expected_file(false)
             .with_backup_file(false)
             .test(&["--suppress-all", "--type-check"]);
+    }
+
+    #[test]
+    fn test_quiet_prunes_warn_rules_and_runs_error_rules() {
+        use crate::cli::CliRunResult;
+        use crate::tester::Tester;
+        use std::fs;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_path = temp_dir.path().join(".oxlintrc.json");
+        fs::write(
+            &config_path,
+            r#"{
+                "categories": { "correctness": "off" },
+                "rules": {
+                    "no-console": "warn",
+                    "no-debugger": "error"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let warn_only_file = temp_dir.path().join("warn_only.js");
+        fs::write(&warn_only_file, "console.log('warn only');\n").unwrap();
+
+        let (stdout, result) = Tester::new()
+            .with_cwd(temp_dir.path().to_path_buf())
+            .test_output(&["--quiet", "--debug=timings", "warn_only.js"]);
+        assert!(matches!(result, CliRunResult::LintSucceeded), "got {result:?}");
+        assert!(
+            !stdout.contains("eslint/no-console"),
+            "warn rule should not execute under --quiet, stdout:\n{stdout}"
+        );
+
+        let (stdout_deny_warnings, result_deny_warnings) = Tester::new()
+            .with_cwd(temp_dir.path().to_path_buf())
+            .test_output(&["--quiet", "--deny-warnings", "--debug=timings", "warn_only.js"]);
+        assert!(
+            matches!(result_deny_warnings, CliRunResult::LintNoWarningsAllowed),
+            "got {result_deny_warnings:?}"
+        );
+        assert!(
+            stdout_deny_warnings.contains("eslint/no-console"),
+            "warn rule must execute when --deny-warnings is set, stdout:\n{stdout_deny_warnings}"
+        );
+
+        let error_file = temp_dir.path().join("with_error.js");
+        fs::write(&error_file, "console.log('warn');\ndebugger;\n").unwrap();
+
+        let (_, result_err) = Tester::new()
+            .with_cwd(temp_dir.path().to_path_buf())
+            .test_output(&["--quiet", "with_error.js"]);
+        assert!(matches!(result_err, CliRunResult::LintFoundErrors), "got {result_err:?}");
+        let stdout_err = Tester::new()
+            .with_cwd(temp_dir.path().to_path_buf())
+            .test_output_verbose(&["--quiet", "with_error.js"]);
+        assert!(stdout_err.contains("no-debugger"), "stdout:\n{stdout_err}");
+        assert!(!stdout_err.contains("no-console"), "stdout:\n{stdout_err}");
+    }
+
+    #[test]
+    fn test_quiet_preserves_report_unused_disable_directives() {
+        use crate::cli::CliRunResult;
+        use crate::tester::Tester;
+        use std::fs;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_path = temp_dir.path().join(".oxlintrc.json");
+        fs::write(
+            &config_path,
+            r#"{
+                "categories": { "correctness": "off" },
+                "options": {
+                    "reportUnusedDisableDirectives": "error"
+                },
+                "rules": {
+                    "no-console": "warn",
+                    "no-debugger": "error",
+                    "no-alert": "off"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        // 1. Disable directive for a warn-configured rule under --quiet must NOT report as unused.
+        let warn_disabled_file = temp_dir.path().join("warn_disabled.js");
+        fs::write(
+            &warn_disabled_file,
+            "// eslint-disable-next-line no-console\nconsole.log('suppressed warn');\n",
+        )
+        .unwrap();
+        let (stdout_warn, result_warn) = Tester::new()
+            .with_cwd(temp_dir.path().to_path_buf())
+            .test_output(&["--quiet", "warn_disabled.js"]);
+        assert!(
+            matches!(result_warn, CliRunResult::LintSucceeded),
+            "Expected LintSucceeded for warn rule disable under --quiet, got {result_warn:?}\n{stdout_warn}"
+        );
+
+        // 2. Disable directive for an off-configured rule under --quiet MUST still report as unused.
+        let off_disabled_file = temp_dir.path().join("off_disabled.js");
+        fs::write(&off_disabled_file, "// eslint-disable-next-line no-alert\nconst x = 1;\n")
+            .unwrap();
+        let (_, result_off) = Tester::new()
+            .with_cwd(temp_dir.path().to_path_buf())
+            .test_output(&["--quiet", "off_disabled.js"]);
+        assert!(
+            matches!(result_off, CliRunResult::LintFoundErrors),
+            "Expected LintFoundErrors for off rule disable under --quiet, got {result_off:?}"
+        );
+        let stdout_off = Tester::new()
+            .with_cwd(temp_dir.path().to_path_buf())
+            .test_output_verbose(&["--quiet", "off_disabled.js"]);
+        assert!(stdout_off.contains("no-alert"), "stdout:\n{stdout_off}");
+
+        // 3. Unused disable directive for an error-configured rule under --quiet MUST still report as unused.
+        let unused_err_file = temp_dir.path().join("unused_error_disabled.js");
+        fs::write(&unused_err_file, "// eslint-disable-next-line no-debugger\nconst y = 2;\n")
+            .unwrap();
+        let (_, result_err) = Tester::new()
+            .with_cwd(temp_dir.path().to_path_buf())
+            .test_output(&["--quiet", "unused_error_disabled.js"]);
+        assert!(
+            matches!(result_err, CliRunResult::LintFoundErrors),
+            "Expected LintFoundErrors for unused error rule disable under --quiet, got {result_err:?}"
+        );
+        let stdout_err = Tester::new()
+            .with_cwd(temp_dir.path().to_path_buf())
+            .test_output_verbose(&["--quiet", "unused_error_disabled.js"]);
+        assert!(stdout_err.contains("no-debugger"), "stdout:\n{stdout_err}");
     }
 }

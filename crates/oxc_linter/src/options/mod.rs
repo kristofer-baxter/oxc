@@ -15,4 +15,7 @@ pub struct LintOptions {
     pub report_unused_directive: Option<AllowWarnDeny>,
     // If true, the linter will create "ignore this section / line" fixes for all diagnostics
     pub with_ignore_fixes: bool,
+    /// If true, skip executing `warn`-severity rules (used when `--quiet` is enabled without
+    /// `--deny-warnings` or `--max-warnings`).
+    pub deny_only: bool,
 }
