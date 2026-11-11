@@ -1,0 +1,75 @@
+---
+source: crates/oxc_linter/src/tester.rs
+---
+
+  ⚠ eslint(no-restricted-syntax): Using 'WithStatement' is not allowed.
+   ╭─[no_restricted_syntax.tsx:1:1]
+ 1 │ with (me) {}
+   · ────────────
+   ╰────
+
+  ⚠ eslint(no-restricted-syntax): canUseDOM must be called: use canUseDOM()
+   ╭─[no_restricted_syntax.tsx:1:1]
+ 1 │ if (canUseDOM) {}
+   · ─────────────────
+   ╰────
+
+  ⚠ eslint(no-restricted-syntax): canUseDOM must be called: use !canUseDOM()
+   ╭─[no_restricted_syntax.tsx:1:6]
+ 1 │ if (!canUseDOM) {}
+   ·      ─────────
+   ╰────
+
+  ⚠ eslint(no-restricted-syntax): canUseDOM must be called: use canUseDOM() in logical expressions
+   ╭─[no_restricted_syntax.tsx:1:12]
+ 1 │ const ok = canUseDOM && doWork();
+   ·            ─────────
+   ╰────
+
+  ⚠ eslint(no-restricted-syntax): Do not use appStore.use.isBebopPresetEnabled() directly.
+   ╭─[no_restricted_syntax.tsx:1:1]
+ 1 │ appStore.use.isBebopPresetEnabled();
+   · ───────────────────────────────────
+   ╰────
+
+  ⚠ eslint(no-restricted-syntax): React.lazy() is banned on the SSR render path.
+   ╭─[no_restricted_syntax.tsx:1:14]
+ 1 │ const Comp = React.lazy(() => import('./Comp'));
+   ·              ──────────────────────────────────
+   ╰────
+
+  ⚠ eslint(no-restricted-syntax): Do not import SignalR.
+   ╭─[no_restricted_syntax.tsx:1:1]
+ 1 │ import { HubConnection } from '@microsoft/signalr/dist/esm';
+   · ────────────────────────────────────────────────────────────
+   ╰────
+
+  ⚠ eslint(no-restricted-syntax): Do not import SignalR.
+   ╭─[no_restricted_syntax.tsx:1:1]
+ 1 │ export { HubConnection } from '@microsoft/signalr';
+   · ───────────────────────────────────────────────────
+   ╰────
+
+  ⚠ eslint(no-restricted-syntax): Do not import ws.
+   ╭─[no_restricted_syntax.tsx:1:12]
+ 1 │ const ws = require('ws/lib/websocket');
+   ·            ───────────────────────────
+   ╰────
+
+  ⚠ eslint(no-restricted-syntax): Do not import ws.
+   ╭─[no_restricted_syntax.tsx:1:1]
+ 1 │ import ws = require('ws');
+   · ──────────────────────────
+   ╰────
+
+  ⚠ eslint(no-restricted-syntax): Avoid waitForTimeout
+   ╭─[no_restricted_syntax.tsx:1:7]
+ 1 │ await page.waitForTimeout(500); const u = 'http://localhost:3000/test';
+   ·       ────────────────────────
+   ╰────
+
+  ⚠ eslint(no-restricted-syntax): Use buildE2eUrl()
+   ╭─[no_restricted_syntax.tsx:1:43]
+ 1 │ await page.waitForTimeout(500); const u = 'http://localhost:3000/test';
+   ·                                           ────────────────────────────
+   ╰────

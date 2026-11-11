@@ -1,0 +1,378 @@
+use std::{
+    borrow::Cow,
+    ffi::OsStr,
+    fs,
+    hash::BuildHasherDefault,
+    path::{Component, Path, PathBuf},
+    sync::{Arc, LazyLock},
+};
+
+use lazy_regex::regex::Regex;
+use oxc_ast::{
+    AstKind,
+    ast::{Argument, Expression},
+};
+use oxc_diagnostics::OxcDiagnostic;
+use oxc_macros::declare_oxc_lint;
+use oxc_resolver::{ResolveOptions, Resolver};
+use oxc_span::{GetSpan, Span, VALID_EXTENSIONS};
+use oxc_str::JSStr;
+use rustc_hash::FxHasher;
+use schemars::JsonSchema;
+use serde::Deserialize;
+use serde_json::Value;
+use smallvec::SmallVec;
+
+use crate::{
+    AstNode,
+    context::LintContext,
+    rule::{DefaultRuleConfig, Rule},
+};
+
+fn no_relative_packages_diagnostic(
+    span: Span,
+    proper_import: &str,
+    import_path: &str,
+) -> OxcDiagnostic {
+    OxcDiagnostic::warn(format!(
+        "Relative import from another package is not allowed. Use `{proper_import}` instead of `{import_path}`"
+    ))
+    .with_help(format!("Import `{proper_import}` by package name instead of a relative path."))
+    .with_label(span)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NamedPackage {
+    name: String,
+    directory: PathBuf,
+}
+
+#[derive(Deserialize)]
+struct PackageJsonName {
+    name: Option<String>,
+}
+
+type PackageCache =
+    papaya::HashMap<PathBuf, Option<Arc<NamedPackage>>, BuildHasherDefault<FxHasher>>;
+
+static PACKAGE_CACHE: LazyLock<PackageCache> = LazyLock::new(|| {
+    papaya::HashMap::builder()
+        .hasher(BuildHasherDefault::default())
+        .resize_mode(papaya::ResizeMode::Blocking)
+        .build()
+});
+
+static RELATIVE_RESOLVER: LazyLock<Resolver> = LazyLock::new(|| {
+    Resolver::new(ResolveOptions {
+        extensions: VALID_EXTENSIONS.iter().map(|ext| format!(".{ext}")).collect(),
+        main_fields: vec!["module".into(), "main".into()],
+        condition_names: vec![
+            "module".into(),
+            "import".into(),
+            "require".into(),
+            "node".into(),
+            "default".into(),
+        ],
+        extension_alias: vec![
+            (".js".into(), vec![".js".into(), ".ts".into(), ".tsx".into()]),
+            (".jsx".into(), vec![".jsx".into(), ".tsx".into(), ".ts".into()]),
+            (".mjs".into(), vec![".mjs".into(), ".mts".into()]),
+            (".cjs".into(), vec![".cjs".into(), ".cts".into()]),
+        ],
+        ..ResolveOptions::default()
+    })
+});
+
+fn read_package_name(pkg_json_path: &Path) -> Option<String> {
+    let bytes = fs::read(pkg_json_path).ok()?;
+    let parsed: PackageJsonName = serde_json::from_slice(&bytes).ok()?;
+    parsed.name.filter(|name| !name.is_empty())
+}
+
+fn find_named_package(start_dir: &Path) -> Option<Arc<NamedPackage>> {
+    let cache = PACKAGE_CACHE.pin();
+    if let Some(cached) = cache.get(start_dir) {
+        return cached.clone();
+    }
+
+    let mut visited: SmallVec<[PathBuf; 8]> = SmallVec::new();
+    let mut current = Some(start_dir);
+    let mut found = None;
+
+    while let Some(dir) = current {
+        if let Some(cached) = cache.get(dir) {
+            found.clone_from(cached);
+            break;
+        }
+        visited.push(dir.to_path_buf());
+        let pkg_json_path = dir.join("package.json");
+        if pkg_json_path.is_file()
+            && let Some(name) = read_package_name(&pkg_json_path)
+        {
+            found = Some(Arc::new(NamedPackage { name, directory: dir.to_path_buf() }));
+            break;
+        }
+        current = dir.parent();
+    }
+
+    for dir in visited {
+        cache.insert(dir, found.clone());
+    }
+
+    found
+}
+
+#[derive(Debug, Clone, JsonSchema, Deserialize)]
+#[serde(rename_all = "camelCase", default, deny_unknown_fields)]
+pub struct NoRelativePackagesConfig {
+    /// If set to `true`, dependency paths for ES module import statements will be checked.
+    pub esmodule: bool,
+    /// If set to `true`, dependency paths for CommonJS `require()` calls will be checked.
+    pub commonjs: bool,
+    /// If set to `true`, dependency paths for AMD `define()` / `require()` calls will be checked.
+    pub amd: bool,
+    /// List of regex patterns for import paths to ignore.
+    pub ignore: Vec<String>,
+}
+
+impl Default for NoRelativePackagesConfig {
+    fn default() -> Self {
+        Self { esmodule: true, commonjs: false, amd: false, ignore: Vec::new() }
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct NoRelativePackages(Box<NoRelativePackagesState>);
+
+#[derive(Debug, Default, Clone)]
+struct NoRelativePackagesState {
+    config: NoRelativePackagesConfig,
+    ignore_regexes: Vec<Regex>,
+}
+
+declare_oxc_lint!(
+    /// ### What it does
+    ///
+    /// Forbids importing packages through relative paths (`./` or `../`) when the target file
+    /// belongs to a different package (has a different nearest `package.json` with a `"name"` field).
+    ///
+    /// ### Why is this bad?
+    ///
+    /// In monorepos (such as Yarn/pnpm/Lerna workspaces), importing another workspace package via
+    /// a relative path bypasses the package's public entrypoint and `package.json` exports, coupling
+    /// consumers to the other package's internal directory structure.
+    ///
+    /// ### Examples
+    ///
+    /// Examples of **incorrect** code for this rule:
+    /// ```javascript
+    /// import foo from '../other-package';
+    /// import bar from '../../packages/other-package/src/bar';
+    /// ```
+    ///
+    /// Examples of **correct** code for this rule:
+    /// ```javascript
+    /// import foo from 'other-package';
+    /// import bar from './internal-module';
+    /// import baz from '../shared-within-same-package';
+    /// ```
+    NoRelativePackages,
+    import,
+    restriction,
+    fix,
+    config = NoRelativePackagesConfig,
+    version = "1.93.0",
+    short_description = "Forbid importing packages through relative paths.",
+);
+
+impl Rule for NoRelativePackages {
+    fn from_configuration(value: Value) -> Result<Self, serde_json::error::Error> {
+        let config = DefaultRuleConfig::<NoRelativePackagesConfig>::from_value(value)?.into_inner();
+        let ignore_regexes = config.ignore.iter().filter_map(|pat| Regex::new(pat).ok()).collect();
+        Ok(Self(Box::new(NoRelativePackagesState { config, ignore_regexes })))
+    }
+
+    fn run<'a>(&self, node: &AstNode<'a>, ctx: &LintContext<'a>) {
+        match node.kind() {
+            AstKind::ImportDeclaration(import_decl) if self.0.config.esmodule => {
+                self.check_import(import_decl.source.value, import_decl.source.span, ctx);
+            }
+            AstKind::ExportFromDeclaration(export_decl) if self.0.config.esmodule => {
+                self.check_import(export_decl.source.value, export_decl.source.span, ctx);
+            }
+            AstKind::ExportAllDeclaration(export_decl) if self.0.config.esmodule => {
+                self.check_import(export_decl.source.value, export_decl.source.span, ctx);
+            }
+            AstKind::CallExpression(call_expr) if self.0.config.commonjs || self.0.config.amd => {
+                let Expression::Identifier(ident) = &call_expr.callee else {
+                    return;
+                };
+                let func_name = ident.name.as_str();
+                let count = call_expr.arguments.len();
+                if matches!(func_name, "require" | "define") && count > 0 {
+                    match &call_expr.arguments[0] {
+                        Argument::StringLiteral(str_literal)
+                            if count == 1 && func_name == "require" && self.0.config.commonjs =>
+                        {
+                            self.check_import(str_literal.value, str_literal.span, ctx);
+                        }
+                        Argument::ArrayExpression(arr_expr) if count == 2 && self.0.config.amd => {
+                            for el in &arr_expr.elements {
+                                if let Some(Expression::StringLiteral(literal)) = el.as_expression()
+                                {
+                                    self.check_import(literal.value, el.span(), ctx);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+impl NoRelativePackages {
+    fn check_import(&self, import_js_str: JSStr<'_>, span: Span, ctx: &LintContext<'_>) {
+        let Some(import_path) = import_js_str.as_str() else {
+            return;
+        };
+
+        if !is_relative_import(import_path) {
+            return;
+        }
+
+        if self.0.ignore_regexes.iter().any(|re| re.is_match(import_path)) {
+            return;
+        }
+
+        let context_path = ctx.file_path();
+        let Some(context_dir) = context_path.parent() else {
+            return;
+        };
+
+        let Some(context_pkg) = find_named_package(context_dir) else {
+            return;
+        };
+
+        let loaded_module = ctx.module_record().get_loaded_module(import_path);
+        let resolved_import: Cow<'_, Path> = if let Some(loaded) = loaded_module.as_deref() {
+            Cow::Borrowed(loaded.resolved_absolute_path.as_path())
+        } else if let Ok(resolution) = RELATIVE_RESOLVER.resolve_file(context_path, import_path) {
+            Cow::Owned(resolution.into_path_buf())
+        } else {
+            return;
+        };
+
+        let Some(import_dir) = resolved_import.parent() else {
+            return;
+        };
+
+        if import_dir == context_dir {
+            return;
+        }
+
+        let Some(import_pkg) = find_named_package(import_dir) else {
+            return;
+        };
+
+        if import_pkg.name != context_pkg.name {
+            let proper_import =
+                compute_proper_import(&import_pkg, import_path, resolved_import.as_ref());
+            let replacement = serde_json::to_string(&proper_import)
+                .unwrap_or_else(|_| format!("\"{proper_import}\""));
+            ctx.diagnostic_with_fix(
+                no_relative_packages_diagnostic(span, &proper_import, import_path),
+                |fixer| fixer.replace(span, replacement),
+            );
+        }
+    }
+}
+
+#[inline]
+fn is_relative_import(path: &str) -> bool {
+    path == "."
+        || path == ".."
+        || path.starts_with("./")
+        || path.starts_with("../")
+        || path.starts_with(".\\")
+        || path.starts_with("..\\")
+}
+
+fn posix_basename(path: &str) -> &str {
+    let trimmed = path.trim_end_matches(['/', '\\']);
+    trimmed.rsplit(['/', '\\']).next().unwrap_or(trimmed)
+}
+
+fn compute_proper_import(
+    import_pkg: &NamedPackage,
+    import_path: &str,
+    resolved_import: &Path,
+) -> String {
+    let import_base_name = posix_basename(import_path);
+    let import_root = &import_pkg.directory;
+    let import_root_base_name = import_root.file_name().and_then(OsStr::to_str).unwrap_or("");
+
+    let mut result = import_pkg.name.clone();
+
+    if let Ok(proper_path) = resolved_import.strip_prefix(import_root)
+        && let Some(proper_dir) = proper_path.parent()
+    {
+        for component in proper_dir.components() {
+            if let Component::Normal(part) = component
+                && let Some(part_str) = part.to_str()
+                && !part_str.is_empty()
+            {
+                result.push('/');
+                result.push_str(part_str);
+            }
+        }
+    }
+
+    if import_base_name != import_root_base_name
+        && !import_base_name.is_empty()
+        && import_base_name != "."
+        && import_base_name != ".."
+    {
+        result.push('/');
+        result.push_str(import_base_name);
+    }
+
+    result
+}
+
+#[test]
+fn test() {
+    use crate::tester::Tester;
+    use serde_json::json;
+
+    let pass = vec![
+        (r"import foo from './bar'", None),
+        (r"import foo from '../bar'", None),
+        (r"import foo from 'package-named'", None),
+        (r"import foo from './package/index.js'", None),
+        (r"import foo from './package-named'", Some(json!([{ "ignore": ["package-named"] }]))),
+        (r"const foo = require('./package-named')", None),
+    ];
+
+    let fail = vec![
+        (r"import foo from './package-named'", None),
+        (r"import foo from './package-named/index.js'", None),
+        (r"import foo from './package-scoped'", None),
+        (r"export { foo } from './package-named'", None),
+        (r"export * from './package-scoped'", None),
+        (r"const foo = require('./package-named')", Some(json!([{ "commonjs": true }]))),
+    ];
+
+    let fix = vec![
+        (r"import foo from './package-named'", r#"import foo from "package-named""#, None),
+        (r"import foo from './package-scoped'", r#"import foo from "@scope/package-named""#, None),
+    ];
+
+    Tester::new(NoRelativePackages::NAME, NoRelativePackages::PLUGIN, pass, fail)
+        .expect_fix(fix)
+        .change_rule_path("index.js")
+        .with_import_plugin(true)
+        .test_and_snapshot();
+}

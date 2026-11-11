@@ -1,0 +1,45 @@
+---
+source: crates/oxc_linter/src/tester.rs
+---
+
+  ⚠ import(no-relative-packages): Relative import from another package is not allowed. Use `package-named` instead of `./package-named`
+   ╭─[index.js:1:17]
+ 1 │ import foo from './package-named'
+   ·                 ─────────────────
+   ╰────
+  help: Import `package-named` by package name instead of a relative path.
+
+  ⚠ import(no-relative-packages): Relative import from another package is not allowed. Use `package-named/index.js` instead of `./package-named/index.js`
+   ╭─[index.js:1:17]
+ 1 │ import foo from './package-named/index.js'
+   ·                 ──────────────────────────
+   ╰────
+  help: Import `package-named/index.js` by package name instead of a relative path.
+
+  ⚠ import(no-relative-packages): Relative import from another package is not allowed. Use `@scope/package-named` instead of `./package-scoped`
+   ╭─[index.js:1:17]
+ 1 │ import foo from './package-scoped'
+   ·                 ──────────────────
+   ╰────
+  help: Import `@scope/package-named` by package name instead of a relative path.
+
+  ⚠ import(no-relative-packages): Relative import from another package is not allowed. Use `package-named` instead of `./package-named`
+   ╭─[index.js:1:21]
+ 1 │ export { foo } from './package-named'
+   ·                     ─────────────────
+   ╰────
+  help: Import `package-named` by package name instead of a relative path.
+
+  ⚠ import(no-relative-packages): Relative import from another package is not allowed. Use `@scope/package-named` instead of `./package-scoped`
+   ╭─[index.js:1:15]
+ 1 │ export * from './package-scoped'
+   ·               ──────────────────
+   ╰────
+  help: Import `@scope/package-named` by package name instead of a relative path.
+
+  ⚠ import(no-relative-packages): Relative import from another package is not allowed. Use `package-named` instead of `./package-named`
+   ╭─[index.js:1:21]
+ 1 │ const foo = require('./package-named')
+   ·                     ─────────────────
+   ╰────
+  help: Import `package-named` by package name instead of a relative path.

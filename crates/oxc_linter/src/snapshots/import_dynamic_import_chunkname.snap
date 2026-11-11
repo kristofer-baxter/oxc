@@ -1,0 +1,39 @@
+---
+source: crates/oxc_linter/src/tester.rs
+---
+
+  ⚠ import(dynamic-import-chunkname): dynamic imports require a leading comment with the webpack chunkname
+   ╭─[dynamic_import_chunkname.tsx:1:1]
+ 1 │ import('./a')
+   · ─────────────
+   ╰────
+
+  ⚠ import(dynamic-import-chunkname): dynamic imports require a leading comment in the form /*webpackChunkName: ["']([0-9a-zA-Z-_/.]|\[(request|index)\])+["'],? */
+   ╭─[dynamic_import_chunkname.tsx:1:1]
+ 1 │ import(/* webpackChunkName: "" */ './a')
+   · ────────────────────────────────────────
+   ╰────
+
+  ⚠ import(dynamic-import-chunkname): dynamic imports require a /* foo */ style comment, not a // foo comment
+   ╭─[dynamic_import_chunkname.tsx:1:1]
+ 1 │ ╭─▶ import(// webpackChunkName: "my-chunk-name"
+ 2 │ ╰─▶             './a')
+   ╰────
+
+  ⚠ import(dynamic-import-chunkname): dynamic imports require a block comment padded with spaces - /* foo */
+   ╭─[dynamic_import_chunkname.tsx:1:1]
+ 1 │ import(/*webpackChunkName: "my-chunk-name"*/ './a')
+   · ───────────────────────────────────────────────────
+   ╰────
+
+  ⚠ import(dynamic-import-chunkname): dynamic imports using eager mode do not need a webpackChunkName
+   ╭─[dynamic_import_chunkname.tsx:1:1]
+ 1 │ import(/* webpackChunkName: "my-chunk-name", webpackMode: "eager" */ './a')
+   · ───────────────────────────────────────────────────────────────────────────
+   ╰────
+
+  ⚠ import(dynamic-import-chunkname): dynamic imports require a leading comment with the webpack chunkname
+   ╭─[dynamic_import_chunkname.tsx:1:1]
+ 1 │ dynamicImport('./a')
+   · ────────────────────
+   ╰────

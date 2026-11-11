@@ -454,7 +454,11 @@ impl ConfigStoreBuilder {
             RULES
                 .iter()
                 .filter(|rule| {
-                    LintPlugins::try_from(rule.plugin_name())
+                    matches!(
+                        rule,
+                        RuleEnum::ImportNoRelativePackages(_)
+                            | RuleEnum::ImportDynamicImportChunkname(_)
+                    ) || LintPlugins::try_from(rule.plugin_name())
                         .is_ok_and(|plugin_flag| builtin_plugins.contains(plugin_flag))
                 })
                 .cloned()
@@ -503,7 +507,11 @@ impl ConfigStoreBuilder {
             .rules
             .into_iter()
             .filter(|(r, _)| {
-                LintPlugins::try_from(r.plugin_name())
+                matches!(
+                    r,
+                    RuleEnum::ImportNoRelativePackages(_)
+                        | RuleEnum::ImportDynamicImportChunkname(_)
+                ) || LintPlugins::try_from(r.plugin_name())
                     .is_ok_and(|plugin_name| plugins.contains(plugin_name))
             })
             .collect();

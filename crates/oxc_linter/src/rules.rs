@@ -7,6 +7,7 @@
 pub(crate) mod import {
     pub mod consistent_type_specifier_style;
     pub mod default;
+    pub mod dynamic_import_chunkname;
     pub mod export;
     pub mod exports_last;
     pub mod extensions;
@@ -32,6 +33,7 @@ pub(crate) mod import {
     pub mod no_named_export;
     pub mod no_namespace;
     pub mod no_nodejs_modules;
+    pub mod no_relative_packages;
     pub mod no_relative_parent_imports;
     pub mod no_self_import;
     pub mod no_unassigned_import;
@@ -155,6 +157,7 @@ pub(crate) mod eslint {
     pub mod no_restricted_globals;
     pub mod no_restricted_imports;
     pub mod no_restricted_properties;
+    pub mod no_restricted_syntax;
     pub mod no_return_assign;
     pub mod no_script_url;
     pub mod no_self_assign;
