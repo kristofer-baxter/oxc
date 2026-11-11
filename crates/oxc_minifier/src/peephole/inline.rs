@@ -594,7 +594,7 @@ impl<'a> PeepholeOptimizations {
             } else {
                 None
             }?;
-            if !Self::is_direct_constant_return_expr(ret_expr)
+            if !Self::is_direct_constant_return_expr(ret_expr, ctx)
                 || ret_expr.may_have_side_effects(ctx)
                 || Self::may_yield_anonymous_function(ret_expr)
                 || Self::reads_non_inlineable_constant(ret_expr, ctx)
@@ -649,7 +649,7 @@ impl<'a> PeepholeOptimizations {
                 return Some(TrivialFunction::Identity1Param);
             }
             if ctx.scoping().symbol_is_unused(param_sym)
-                && Self::is_direct_constant_return_expr(ret_expr)
+                && Self::is_direct_constant_return_expr(ret_expr, ctx)
                 && !ret_expr.may_have_side_effects(ctx)
                 && !Self::reads_non_inlineable_constant(ret_expr, ctx)
                 && let Some(val @ ConstantValue::Undefined) = ret_expr.evaluate_value(ctx)
@@ -660,13 +660,13 @@ impl<'a> PeepholeOptimizations {
         None
     }
 
-    fn is_direct_constant_return_expr(expr: &Expression<'a>) -> bool {
+    fn is_direct_constant_return_expr(expr: &Expression<'a>, ctx: &TraverseCtx<'a>) -> bool {
         match expr.without_parentheses() {
             Expression::NumericLiteral(_)
             | Expression::StringLiteral(_)
             | Expression::BooleanLiteral(_)
             | Expression::NullLiteral(_) => true,
-            Expression::Identifier(id) => id.name == "undefined",
+            Expression::Identifier(id) => id.name == "undefined" && ctx.is_global_reference(id),
             Expression::UnaryExpression(u) => {
                 matches!(
                     u.operator,
@@ -675,7 +675,7 @@ impl<'a> PeepholeOptimizations {
                         | UnaryOperator::LogicalNot
                         | UnaryOperator::BitwiseNot
                         | UnaryOperator::Void
-                ) && Self::is_direct_constant_return_expr(&u.argument)
+                ) && Self::is_direct_constant_return_expr(&u.argument, ctx)
             }
             _ => false,
         }
@@ -1274,9 +1274,10 @@ impl<'a> InliningCandidateScanner<'_, 'a> {
             if PeepholeOptimizations::is_reserved_object_prototype_key(key_str.as_str()) {
                 return None;
             }
-            if let Some(val) = PeepholeOptimizations::is_direct_constant_return_expr(&p.value)
-                .then(|| p.value.evaluate_value(self.ctx))
-                .flatten()
+            if let Some(val) =
+                PeepholeOptimizations::is_direct_constant_return_expr(&p.value, self.ctx)
+                    .then(|| p.value.evaluate_value(self.ctx))
+                    .flatten()
             {
                 let inlineable = match &val {
                     ConstantValue::Number(_)
@@ -1498,7 +1499,7 @@ impl<'a> InliningCandidateScanner<'_, 'a> {
                 {
                     return None;
                 }
-                if !PeepholeOptimizations::is_direct_constant_return_expr(&assign.right) {
+                if !PeepholeOptimizations::is_direct_constant_return_expr(&assign.right, self.ctx) {
                     return None;
                 }
                 let val = assign.right.evaluate_value(self.ctx)?;
@@ -1525,7 +1526,10 @@ impl<'a> InliningCandidateScanner<'_, 'a> {
                     return None;
                 }
                 if let Expression::StringLiteral(key_lit) = m.expression.without_parentheses() {
-                    if !PeepholeOptimizations::is_direct_constant_return_expr(&assign.right) {
+                    if !PeepholeOptimizations::is_direct_constant_return_expr(
+                        &assign.right,
+                        self.ctx,
+                    ) {
                         return None;
                     }
                     let key_str = key_lit.value.as_str()?;
@@ -1546,7 +1550,10 @@ impl<'a> InliningCandidateScanner<'_, 'a> {
                     return None;
                 };
                 if inner.operator != AssignmentOperator::Assign
-                    || !PeepholeOptimizations::is_direct_constant_return_expr(&inner.right)
+                    || !PeepholeOptimizations::is_direct_constant_return_expr(
+                        &inner.right,
+                        self.ctx,
+                    )
                     || inner.right.may_have_side_effects(self.ctx)
                 {
                     return None;

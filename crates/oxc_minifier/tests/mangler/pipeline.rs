@@ -363,6 +363,39 @@ fn property_extraction_preserves_tdz_exceptions() {
 }
 
 #[test]
+fn constant_extraction_preserves_shadowed_undefined_tdz() {
+    for source in [
+        "const f = () => void undefined; console.log(f()); let undefined;",
+        "const f = unused => void undefined; console.log(f(0)); let undefined;",
+        "const obj = { x: void undefined }; console.log(obj.x); let undefined;",
+        "const obj = { x: +void undefined }; console.log(obj.x); let undefined;",
+        "let E; (e => { e.X = +void undefined; })(E || (E = {})); console.log(E.X); let undefined;",
+        "let E; (e => { e[e.X = +void undefined] = 'X'; })(E || (E = {})); console.log(E.X); let undefined;",
+    ] {
+        for keep_names in [false, true] {
+            let minified = minify_with_compression(
+                source,
+                SourceType::mjs(),
+                keep_names,
+                Some(CompressOptions::smallest()),
+            );
+            for code in [source, &minified] {
+                let output = Command::new("node")
+                    .args(["--input-type=module", "--eval", code])
+                    .output()
+                    .expect("Node.js is required to verify constant extraction exceptions");
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(
+                    !output.status.success(),
+                    "TDZ read must throw:\n{source}\noutput:\n{code}"
+                );
+                assert!(stderr.contains("ReferenceError:"), "{code}\n{stderr}");
+            }
+        }
+    }
+}
+
+#[test]
 fn inline_member_writes_preserve_cross_script_accessor_reads() {
     let script = r#"
         import { createContext, runInContext } from 'node:vm';
