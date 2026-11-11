@@ -4,7 +4,7 @@ use std::{
     fs,
     hash::BuildHasherDefault,
     path::{Component, Path, PathBuf},
-    sync::{Arc, LazyLock},
+    sync::Arc,
 };
 
 use lazy_regex::regex::Regex;
@@ -41,10 +41,11 @@ fn no_relative_packages_diagnostic(
     .with_label(span)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 struct NamedPackage {
     name: String,
     directory: PathBuf,
+    manifest_mtime: Option<std::time::SystemTime>,
 }
 
 #[derive(Deserialize)]
@@ -52,74 +53,137 @@ struct PackageJsonName {
     name: Option<String>,
 }
 
-type PackageCache =
-    papaya::HashMap<PathBuf, Option<Arc<NamedPackage>>, BuildHasherDefault<FxHasher>>;
-
-static PACKAGE_CACHE: LazyLock<PackageCache> = LazyLock::new(|| {
-    papaya::HashMap::builder()
-        .hasher(BuildHasherDefault::default())
-        .resize_mode(papaya::ResizeMode::Blocking)
-        .build()
-});
-
-static RELATIVE_RESOLVER: LazyLock<Resolver> = LazyLock::new(|| {
-    Resolver::new(ResolveOptions {
-        extensions: VALID_EXTENSIONS.iter().map(|ext| format!(".{ext}")).collect(),
-        main_fields: vec!["module".into(), "main".into()],
-        condition_names: vec![
-            "module".into(),
-            "import".into(),
-            "require".into(),
-            "node".into(),
-            "default".into(),
-        ],
-        extension_alias: vec![
-            (".js".into(), vec![".js".into(), ".ts".into(), ".tsx".into()]),
-            (".jsx".into(), vec![".jsx".into(), ".tsx".into(), ".ts".into()]),
-            (".mjs".into(), vec![".mjs".into(), ".mts".into()]),
-            (".cjs".into(), vec![".cjs".into(), ".cts".into()]),
-        ],
-        ..ResolveOptions::default()
-    })
-});
-
-fn read_package_name(pkg_json_path: &Path) -> Option<String> {
-    let bytes = fs::read(pkg_json_path).ok()?;
-    let parsed: PackageJsonName = serde_json::from_slice(&bytes).ok()?;
-    parsed.name.filter(|name| !name.is_empty())
+#[derive(Clone)]
+struct CachedPackageEntry {
+    package: Option<Arc<NamedPackage>>,
+    local_pkg_mtime: Option<std::time::SystemTime>,
 }
 
-fn find_named_package(start_dir: &Path) -> Option<Arc<NamedPackage>> {
-    let cache = PACKAGE_CACHE.pin();
-    if let Some(cached) = cache.get(start_dir) {
-        return cached.clone();
+fn file_mtime(path: &Path) -> Option<std::time::SystemTime> {
+    fs::metadata(path).ok()?.modified().ok()
+}
+
+fn read_package_name(pkg_json_path: &Path) -> Option<(String, Option<std::time::SystemTime>)> {
+    let mtime = file_mtime(pkg_json_path);
+    let bytes = fs::read(pkg_json_path).ok()?;
+    let parsed: PackageJsonName = serde_json::from_slice(&bytes).ok()?;
+    let name = parsed.name.filter(|name| !name.is_empty())?;
+    Some((name, mtime))
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct NoRelativePackages(Box<NoRelativePackagesState>);
+
+struct NoRelativePackagesState {
+    config: NoRelativePackagesConfig,
+    ignore_regexes: Vec<Regex>,
+    package_cache: papaya::HashMap<PathBuf, CachedPackageEntry, BuildHasherDefault<FxHasher>>,
+    resolver: Resolver,
+}
+
+impl std::fmt::Debug for NoRelativePackagesState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NoRelativePackagesState")
+            .field("config", &self.config)
+            .field("ignore_regexes", &self.ignore_regexes)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Clone for NoRelativePackagesState {
+    fn clone(&self) -> Self {
+        Self::new(self.config.clone(), self.ignore_regexes.clone())
+    }
+}
+
+impl Default for NoRelativePackagesState {
+    fn default() -> Self {
+        Self::new(NoRelativePackagesConfig::default(), Vec::new())
+    }
+}
+
+impl NoRelativePackagesState {
+    fn new(config: NoRelativePackagesConfig, ignore_regexes: Vec<Regex>) -> Self {
+        let package_cache = papaya::HashMap::builder()
+            .hasher(BuildHasherDefault::default())
+            .resize_mode(papaya::ResizeMode::Blocking)
+            .build();
+        let resolver = Resolver::new(ResolveOptions {
+            extensions: VALID_EXTENSIONS.iter().map(|ext| format!(".{ext}")).collect(),
+            main_fields: vec!["module".into(), "main".into()],
+            condition_names: vec![
+                "module".into(),
+                "import".into(),
+                "require".into(),
+                "node".into(),
+                "default".into(),
+            ],
+            extension_alias: vec![
+                (".js".into(), vec![".js".into(), ".ts".into(), ".tsx".into()]),
+                (".jsx".into(), vec![".jsx".into(), ".tsx".into(), ".ts".into()]),
+                (".mjs".into(), vec![".mjs".into(), ".mts".into()]),
+                (".cjs".into(), vec![".cjs".into(), ".cts".into()]),
+            ],
+            ..ResolveOptions::default()
+        });
+        Self { config, ignore_regexes, package_cache, resolver }
     }
 
-    let mut visited: SmallVec<[PathBuf; 8]> = SmallVec::new();
-    let mut current = Some(start_dir);
-    let mut found = None;
-
-    while let Some(dir) = current {
-        if let Some(cached) = cache.get(dir) {
-            found.clone_from(cached);
-            break;
+    fn is_cached_entry_fresh(dir: &Path, entry: &CachedPackageEntry) -> bool {
+        let local_pkg = dir.join("package.json");
+        if file_mtime(&local_pkg) != entry.local_pkg_mtime {
+            return false;
         }
-        visited.push(dir.to_path_buf());
-        let pkg_json_path = dir.join("package.json");
-        if pkg_json_path.is_file()
-            && let Some(name) = read_package_name(&pkg_json_path)
+        if let Some(pkg) = &entry.package {
+            let manifest_path = pkg.directory.join("package.json");
+            if file_mtime(&manifest_path) != pkg.manifest_mtime {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn find_named_package(&self, start_dir: &Path) -> Option<Arc<NamedPackage>> {
+        let cache = self.package_cache.pin();
+        if let Some(cached) = cache.get(start_dir)
+            && Self::is_cached_entry_fresh(start_dir, cached)
         {
-            found = Some(Arc::new(NamedPackage { name, directory: dir.to_path_buf() }));
-            break;
+            return cached.package.clone();
         }
-        current = dir.parent();
-    }
 
-    for dir in visited {
-        cache.insert(dir, found.clone());
-    }
+        let mut visited: SmallVec<[(PathBuf, Option<std::time::SystemTime>); 8]> = SmallVec::new();
+        let mut current = Some(start_dir);
+        let mut found = None;
 
-    found
+        while let Some(dir) = current {
+            if let Some(cached) = cache.get(dir)
+                && Self::is_cached_entry_fresh(dir, cached)
+            {
+                found.clone_from(&cached.package);
+                break;
+            }
+            let pkg_json_path = dir.join("package.json");
+            let local_mtime = file_mtime(&pkg_json_path);
+            visited.push((dir.to_path_buf(), local_mtime));
+            if local_mtime.is_some()
+                && let Some((name, manifest_mtime)) = read_package_name(&pkg_json_path)
+            {
+                found = Some(Arc::new(NamedPackage {
+                    name,
+                    directory: dir.to_path_buf(),
+                    manifest_mtime,
+                }));
+                break;
+            }
+            current = dir.parent();
+        }
+
+        for (dir, local_pkg_mtime) in visited {
+            cache.insert(dir, CachedPackageEntry { package: found.clone(), local_pkg_mtime });
+        }
+
+        found
+    }
 }
 
 #[derive(Debug, Clone, JsonSchema, Deserialize)]
@@ -139,15 +203,6 @@ impl Default for NoRelativePackagesConfig {
     fn default() -> Self {
         Self { esmodule: true, commonjs: false, amd: false, ignore: Vec::new() }
     }
-}
-
-#[derive(Debug, Default, Clone)]
-pub struct NoRelativePackages(Box<NoRelativePackagesState>);
-
-#[derive(Debug, Default, Clone)]
-struct NoRelativePackagesState {
-    config: NoRelativePackagesConfig,
-    ignore_regexes: Vec<Regex>,
 }
 
 declare_oxc_lint!(
@@ -195,7 +250,7 @@ impl Rule for NoRelativePackages {
             })?;
             ignore_regexes.push(re);
         }
-        Ok(Self(Box::new(NoRelativePackagesState { config, ignore_regexes })))
+        Ok(Self(Box::new(NoRelativePackagesState::new(config, ignore_regexes))))
     }
 
     fn run<'a>(&self, node: &AstNode<'a>, ctx: &LintContext<'a>) {
@@ -258,14 +313,14 @@ impl NoRelativePackages {
             return;
         };
 
-        let Some(context_pkg) = find_named_package(context_dir) else {
+        let Some(context_pkg) = self.0.find_named_package(context_dir) else {
             return;
         };
 
         let loaded_module = ctx.module_record().get_loaded_module(import_path);
         let resolved_import: Cow<'_, Path> = if let Some(loaded) = loaded_module.as_deref() {
             Cow::Borrowed(loaded.resolved_absolute_path.as_path())
-        } else if let Ok(resolution) = RELATIVE_RESOLVER.resolve_file(context_path, import_path) {
+        } else if let Ok(resolution) = self.0.resolver.resolve_file(context_path, import_path) {
             Cow::Owned(resolution.into_path_buf())
         } else {
             return;
@@ -279,13 +334,17 @@ impl NoRelativePackages {
             return;
         }
 
-        let Some(import_pkg) = find_named_package(import_dir) else {
+        let Some(import_pkg) = self.0.find_named_package(import_dir) else {
             return;
         };
 
         if import_pkg.name != context_pkg.name {
-            let proper_import =
-                compute_proper_import(&import_pkg, import_path, resolved_import.as_ref());
+            let proper_import = compute_proper_import(
+                &import_pkg,
+                context_dir,
+                import_path,
+                resolved_import.as_ref(),
+            );
             let replacement = serde_json::to_string(&proper_import)
                 .unwrap_or_else(|_| format!("\"{proper_import}\""));
             ctx.diagnostic_with_fix(
@@ -311,18 +370,48 @@ fn posix_basename(path: &str) -> &str {
     trimmed.rsplit(['/', '\\']).next().unwrap_or(trimmed)
 }
 
+fn normalize_lexical_path(base: &Path, relative_specifier: &str) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for comp in base.components() {
+        normalized.push(comp.as_os_str());
+    }
+    for segment in relative_specifier.split(['/', '\\']) {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                normalized.pop();
+            }
+            part => normalized.push(part),
+        }
+    }
+    normalized
+}
+
 fn compute_proper_import(
     import_pkg: &NamedPackage,
+    context_dir: &Path,
     import_path: &str,
     resolved_import: &Path,
 ) -> String {
-    let import_base_name = posix_basename(import_path);
     let import_root = &import_pkg.directory;
+    let requested_target = normalize_lexical_path(context_dir, import_path);
+    if let Ok(rel_requested) = requested_target.strip_prefix(import_root) {
+        let mut result = import_pkg.name.clone();
+        for component in rel_requested.components() {
+            if let Component::Normal(part) = component
+                && let Some(part_str) = part.to_str()
+                && !part_str.is_empty()
+            {
+                result.push('/');
+                result.push_str(part_str);
+            }
+        }
+        return result;
+    }
+
+    let import_base_name = posix_basename(import_path);
     let import_root_base_name = import_root.file_name().and_then(OsStr::to_str).unwrap_or("");
-
     let mut result = import_pkg.name.clone();
-
-    let mut dir_parts: Vec<&str> = Vec::new();
     if let Ok(proper_path) = resolved_import.strip_prefix(import_root)
         && let Some(proper_dir) = proper_path.parent()
     {
@@ -331,24 +420,12 @@ fn compute_proper_import(
                 && let Some(part_str) = part.to_str()
                 && !part_str.is_empty()
             {
-                dir_parts.push(part_str);
+                result.push('/');
+                result.push_str(part_str);
             }
         }
     }
-
-    let resolved_file_stem = resolved_import.file_stem().and_then(OsStr::to_str).unwrap_or("");
-    let is_directory_index_import = resolved_file_stem == "index"
-        && import_base_name != "index"
-        && !import_base_name.starts_with("index.")
-        && dir_parts.last().copied() == Some(import_base_name);
-
-    for part_str in &dir_parts {
-        result.push('/');
-        result.push_str(part_str);
-    }
-
-    if !is_directory_index_import
-        && import_base_name != import_root_base_name
+    if import_base_name != import_root_base_name
         && !import_base_name.is_empty()
         && import_base_name != "."
         && import_base_name != ".."
@@ -356,7 +433,6 @@ fn compute_proper_import(
         result.push('/');
         result.push_str(import_base_name);
     }
-
     result
 }
 
@@ -400,11 +476,34 @@ fn test_compute_proper_import_directory_index() {
     let pkg = NamedPackage {
         name: "package-named".to_string(),
         directory: PathBuf::from("/workspace/packages/pkg"),
+        manifest_mtime: None,
     };
+    let context_dir = Path::new("/workspace/packages/app");
     let resolved_dir_index = Path::new("/workspace/packages/pkg/src/index.js");
-    assert_eq!(compute_proper_import(&pkg, "../pkg/src", resolved_dir_index), "package-named/src");
     assert_eq!(
-        compute_proper_import(&pkg, "../pkg/src/index.js", resolved_dir_index),
+        compute_proper_import(
+            &pkg,
+            context_dir,
+            "../pkg",
+            Path::new("/workspace/packages/pkg/dist/index.js"),
+        ),
+        "package-named"
+    );
+    assert_eq!(
+        compute_proper_import(&pkg, context_dir, "../pkg/src", resolved_dir_index),
+        "package-named/src"
+    );
+    assert_eq!(
+        compute_proper_import(&pkg, context_dir, "../pkg/src/index.js", resolved_dir_index),
         "package-named/src/index.js"
+    );
+    assert_eq!(
+        compute_proper_import(
+            &pkg,
+            context_dir,
+            "../pkg/src/pkg",
+            Path::new("/workspace/packages/pkg/src/pkg.ts"),
+        ),
+        "package-named/src/pkg"
     );
 }

@@ -2,10 +2,14 @@ use lazy_regex::regex::{Regex, RegexBuilder};
 use oxc_ast::{
     AstKind,
     ast::{
-        Argument, AssignmentTarget, BindingPattern, ChainElement, Expression, FunctionType,
-        ImportOrExportKind, JSXAttributeItem, JSXAttributeName, JSXAttributeValue, JSXElementName,
-        JSXMemberExpressionObject, MethodDefinitionKind, ModuleExportName, PropertyKey,
-        PropertyKind, SimpleAssignmentTarget, TSModuleReference,
+        Argument, ArrayExpressionElement, ArrowFunctionBody, AssignmentTarget,
+        AssignmentTargetMaybeDefault, BindingPattern, BindingProperty, ChainElement, ClassElement,
+        Declaration, ExportDefaultDeclarationKind, ExportSpecifier, Expression, ForStatementInit,
+        ForStatementLeft, FormalParameters, FunctionType, ImportDeclarationSpecifier,
+        ImportOrExportKind, JSXAttributeItem, JSXAttributeName, JSXAttributeValue, JSXChild,
+        JSXElementName, JSXMemberExpressionObject, MethodDefinitionKind, ModuleExportName,
+        ObjectPropertyKind, PropertyKey, PropertyKind, SimpleAssignmentTarget, Statement,
+        SwitchCase, TSEnumMember, TSModuleReference, TemplateElement, VariableDeclarator,
     },
     ast_kind::{AST_TYPE_MAX, AstType},
 };
@@ -15,6 +19,7 @@ use oxc_span::{GetSpan, Span};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use smallvec::SmallVec;
 
 use crate::{AstNode, context::LintContext, rule::Rule};
 
@@ -97,8 +102,19 @@ impl NodeTypeConstraint {
 
     fn matches(&self, kind: AstKind<'_>) -> bool {
         match self {
-            Self::Any => true,
-            Self::AstTypes(bits) => bits.has(kind.ty()),
+            Self::Any => !is_estree_transparent_wrapper(kind),
+            Self::AstTypes(bits) => match kind {
+                AstKind::FormalParameter(param) => {
+                    if param.has_modifier() {
+                        bits.has(AstType::FormalParameter)
+                    } else if param.initializer.is_some() {
+                        bits.has(AstType::AssignmentPattern)
+                    } else {
+                        false
+                    }
+                }
+                _ => bits.has(kind.ty()),
+            },
             Self::FunctionDeclaration => {
                 matches!(kind, AstKind::Function(f) if f.is_declaration() || f.r#type == FunctionType::TSDeclareFunction)
             }
@@ -108,6 +124,40 @@ impl NodeTypeConstraint {
             Self::ClassDeclaration => matches!(kind, AstKind::Class(c) if c.is_declaration()),
             Self::ClassExpression => matches!(kind, AstKind::Class(c) if c.is_expression()),
         }
+    }
+}
+
+#[inline]
+fn is_estree_transparent_wrapper(kind: AstKind<'_>) -> bool {
+    match kind {
+        AstKind::ParenthesizedExpression(_)
+        | AstKind::FormalParameters(_)
+        | AstKind::CatchParameter(_) => true,
+        AstKind::FormalParameter(param) => !param.has_modifier() && param.initializer.is_none(),
+        _ => false,
+    }
+}
+
+/// Returns the next ESTree-visible parent `AstNode` in the serialized ESTree graph,
+/// skipping Oxc-internal wrapper nodes (`ParenthesizedExpression`, `FormalParameters`,
+/// `CatchParameter`, and plain `FormalParameter` wrappers that have neither a modifier
+/// nor a default initializer).
+fn next_estree_parent<'b, 'a>(
+    current_id: oxc_syntax::node::NodeId,
+    nodes: &'b oxc_semantic::AstNodes<'a>,
+) -> Option<&'b AstNode<'a>> {
+    let mut id = current_id;
+    loop {
+        let parent_id = nodes.parent_id(id);
+        if parent_id == id {
+            return None;
+        }
+        let parent = nodes.get_node(parent_id);
+        if is_estree_transparent_wrapper(parent.kind()) {
+            id = parent_id;
+            continue;
+        }
+        return Some(parent);
     }
 }
 
@@ -148,7 +198,20 @@ impl CompoundSelector {
         base
     }
 
-    fn matches_node<'a>(&self, node: &AstNode<'a>, ctx: &LintContext<'a>) -> bool {
+    fn has_any_has(&self) -> bool {
+        if !self.has_alternatives.is_empty() {
+            return true;
+        }
+        self.matches_alternatives.iter().flatten().any(SelectorChain::has_any_has)
+            || self.not_alternatives.iter().any(SelectorChain::has_any_has)
+    }
+
+    fn matches_node<'a>(
+        &self,
+        node: &AstNode<'a>,
+        ctx: &LintContext<'a>,
+        children_by_parent: Option<&[SmallVec<[oxc_syntax::node::NodeId; 4]>]>,
+    ) -> bool {
         let kind = node.kind();
         if !self.type_constraint.matches(kind) {
             return false;
@@ -159,17 +222,17 @@ impl CompoundSelector {
             }
         }
         for group in &self.matches_alternatives {
-            if !group.iter().any(|alt| alt.matches_node(node, ctx)) {
+            if !group.iter().any(|alt| alt.matches_node(node, ctx, children_by_parent)) {
                 return false;
             }
         }
         for neg in &self.not_alternatives {
-            if neg.matches_node(node, ctx) {
+            if neg.matches_node(node, ctx, children_by_parent) {
                 return false;
             }
         }
         for group in &self.has_alternatives {
-            if !group.iter().any(|alt| alt.matches_within(node, ctx)) {
+            if !group.iter().any(|alt| alt.matches_within(node, ctx, children_by_parent)) {
                 return false;
             }
         }
@@ -190,19 +253,59 @@ impl SelectorChain {
         self.head.target_types()
     }
 
-    fn matches_node<'a>(&self, node: &AstNode<'a>, ctx: &LintContext<'a>) -> bool {
-        if !self.head.matches_node(node, ctx) {
+    fn has_any_has(&self) -> bool {
+        self.head.has_any_has() || self.ancestors.iter().any(|(_, c)| c.has_any_has())
+    }
+
+    fn matches_node<'a>(
+        &self,
+        node: &AstNode<'a>,
+        ctx: &LintContext<'a>,
+        children_by_parent: Option<&[SmallVec<[oxc_syntax::node::NodeId; 4]>]>,
+    ) -> bool {
+        if !self.head.matches_node(node, ctx, children_by_parent) {
             return false;
         }
         if self.ancestors.is_empty() {
             return true;
         }
-        Self::match_ancestors(&self.ancestors, node, ctx)
+        Self::match_ancestors(&self.ancestors, node, ctx, children_by_parent)
     }
 
-    fn matches_within<'a>(&self, root: &AstNode<'a>, ctx: &LintContext<'a>) -> bool {
+    fn matches_within<'a>(
+        &self,
+        root: &AstNode<'a>,
+        ctx: &LintContext<'a>,
+        children_by_parent: Option<&[SmallVec<[oxc_syntax::node::NodeId; 4]>]>,
+    ) -> bool {
         let nodes = ctx.nodes();
         let root_id = root.id();
+        if let Some(children_map) = children_by_parent {
+            let mut stack: SmallVec<[oxc_syntax::node::NodeId; 16]> = SmallVec::new();
+            if let Some(direct) = children_map.get(root_id.index()) {
+                stack.extend(direct.iter().copied());
+            }
+            while let Some(cand_id) = stack.pop() {
+                let candidate = nodes.get_node(cand_id);
+                if self.head.matches_node(candidate, ctx, children_by_parent)
+                    && (self.ancestors.is_empty()
+                        || Self::match_ancestors_bounded(
+                            &self.ancestors,
+                            candidate,
+                            root_id,
+                            ctx,
+                            children_by_parent,
+                        ))
+                {
+                    return true;
+                }
+                if let Some(children) = children_map.get(cand_id.index()) {
+                    stack.extend(children.iter().copied());
+                }
+            }
+            return false;
+        }
+
         let root_span = root.kind().span();
         for candidate in nodes {
             if candidate.id() == root_id {
@@ -215,11 +318,11 @@ impl SelectorChain {
             if !Self::is_descendant_of(candidate, root_id, nodes) {
                 continue;
             }
-            if !self.head.matches_node(candidate, ctx) {
+            if !self.head.matches_node(candidate, ctx, None) {
                 continue;
             }
             if self.ancestors.is_empty()
-                || Self::match_ancestors_bounded(&self.ancestors, candidate, root_id, ctx)
+                || Self::match_ancestors_bounded(&self.ancestors, candidate, root_id, ctx, None)
             {
                 return true;
             }
@@ -249,6 +352,7 @@ impl SelectorChain {
         current: &AstNode<'a>,
         root_id: oxc_syntax::node::NodeId,
         ctx: &LintContext<'a>,
+        children_by_parent: Option<&[SmallVec<[oxc_syntax::node::NodeId; 4]>]>,
     ) -> bool {
         let Some(((combinator, selector), rest)) = remaining.split_first() else {
             return true;
@@ -256,45 +360,44 @@ impl SelectorChain {
         let nodes = ctx.nodes();
         match combinator {
             Combinator::Child => {
-                let mut parent_id = nodes.parent_id(current.id());
-                while parent_id != current.id() {
-                    let parent = nodes.get_node(parent_id);
-                    if matches!(
-                        parent.kind(),
-                        AstKind::ParenthesizedExpression(_) | AstKind::ChainExpression(_)
-                    ) {
-                        let next_id = nodes.parent_id(parent_id);
-                        if next_id == parent_id {
-                            return false;
-                        }
-                        parent_id = next_id;
-                        continue;
-                    }
-                    if parent_id != root_id && !Self::is_descendant_of(parent, root_id, nodes) {
-                        return false;
-                    }
-                    return selector.matches_node(parent, ctx)
-                        && (rest.is_empty()
-                            || Self::match_ancestors_bounded(rest, parent, root_id, ctx));
+                let Some(parent) = next_estree_parent(current.id(), nodes) else {
+                    return false;
+                };
+                if parent.id() != root_id && !Self::is_descendant_of(parent, root_id, nodes) {
+                    return false;
                 }
-                false
+                selector.matches_node(parent, ctx, children_by_parent)
+                    && (rest.is_empty()
+                        || Self::match_ancestors_bounded(
+                            rest,
+                            parent,
+                            root_id,
+                            ctx,
+                            children_by_parent,
+                        ))
             }
             Combinator::Descendant => {
-                let mut parent_id = nodes.parent_id(current.id());
-                let mut prev_id = current.id();
-                while parent_id != prev_id {
-                    let parent = nodes.get_node(parent_id);
-                    if selector.matches_node(parent, ctx)
+                let mut cur_id = current.id();
+                while let Some(parent) = next_estree_parent(cur_id, nodes) {
+                    if parent.id() != root_id && !Self::is_descendant_of(parent, root_id, nodes) {
+                        return false;
+                    }
+                    if selector.matches_node(parent, ctx, children_by_parent)
                         && (rest.is_empty()
-                            || Self::match_ancestors_bounded(rest, parent, root_id, ctx))
+                            || Self::match_ancestors_bounded(
+                                rest,
+                                parent,
+                                root_id,
+                                ctx,
+                                children_by_parent,
+                            ))
                     {
                         return true;
                     }
-                    if parent_id == root_id {
+                    if parent.id() == root_id {
                         break;
                     }
-                    prev_id = parent_id;
-                    parent_id = nodes.parent_id(parent_id);
+                    cur_id = parent.id();
                 }
                 false
             }
@@ -305,6 +408,7 @@ impl SelectorChain {
         remaining: &[(Combinator, CompoundSelector)],
         current: &AstNode<'a>,
         ctx: &LintContext<'a>,
+        children_by_parent: Option<&[SmallVec<[oxc_syntax::node::NodeId; 4]>]>,
     ) -> bool {
         let Some(((combinator, selector), rest)) = remaining.split_first() else {
             return true;
@@ -312,37 +416,23 @@ impl SelectorChain {
         let nodes = ctx.nodes();
         match combinator {
             Combinator::Child => {
-                let mut parent_id = nodes.parent_id(current.id());
-                while parent_id != current.id() {
-                    let parent = nodes.get_node(parent_id);
-                    if matches!(
-                        parent.kind(),
-                        AstKind::ParenthesizedExpression(_) | AstKind::ChainExpression(_)
-                    ) {
-                        let next_id = nodes.parent_id(parent_id);
-                        if next_id == parent_id {
-                            return false;
-                        }
-                        parent_id = next_id;
-                        continue;
-                    }
-                    return selector.matches_node(parent, ctx)
-                        && (rest.is_empty() || Self::match_ancestors(rest, parent, ctx));
-                }
-                false
+                let Some(parent) = next_estree_parent(current.id(), nodes) else {
+                    return false;
+                };
+                selector.matches_node(parent, ctx, children_by_parent)
+                    && (rest.is_empty()
+                        || Self::match_ancestors(rest, parent, ctx, children_by_parent))
             }
             Combinator::Descendant => {
-                let mut parent_id = nodes.parent_id(current.id());
-                let mut prev_id = current.id();
-                while parent_id != prev_id {
-                    let parent = nodes.get_node(parent_id);
-                    if selector.matches_node(parent, ctx)
-                        && (rest.is_empty() || Self::match_ancestors(rest, parent, ctx))
+                let mut cur_id = current.id();
+                while let Some(parent) = next_estree_parent(cur_id, nodes) {
+                    if selector.matches_node(parent, ctx, children_by_parent)
+                        && (rest.is_empty()
+                            || Self::match_ancestors(rest, parent, ctx, children_by_parent))
                     {
                         return true;
                     }
-                    prev_id = parent_id;
-                    parent_id = nodes.parent_id(parent_id);
+                    cur_id = parent.id();
                 }
                 false
             }
@@ -364,6 +454,7 @@ struct NoRestrictedSyntaxState {
     patterns: Vec<CompiledPattern>,
     target_types: AstTypesBitset,
     has_unbounded_selector: bool,
+    has_has_selector: bool,
     /// Per-AstType indices into `patterns`: `(pattern_idx, chain_idx)`
     by_type: Box<[Vec<(usize, usize)>; AST_TYPE_MAX as usize + 1]>,
     unbounded_chains: Vec<(usize, usize)>,
@@ -375,6 +466,7 @@ impl Default for NoRestrictedSyntaxState {
             patterns: Vec::new(),
             target_types: AstTypesBitset::new(),
             has_unbounded_selector: false,
+            has_has_selector: false,
             by_type: Box::new(std::array::from_fn(|_| Vec::new())),
             unbounded_chains: Vec::new(),
         }
@@ -454,6 +546,9 @@ impl Rule for NoRestrictedSyntax {
             })?;
             let pattern_idx = rule.patterns.len();
             for (chain_idx, chain) in chains.iter().enumerate() {
+                if chain.has_any_has() {
+                    rule.has_has_selector = true;
+                }
                 if let Some(types) = chain.target_types() {
                     for ty in &types {
                         rule.target_types.set(ty);
@@ -485,8 +580,28 @@ impl Rule for NoRestrictedSyntax {
             return;
         }
 
-        // Track which patterns have already fired on the current node so a `:matches(A, B)` or
-        // comma-separated selector list within one pattern only reports once per node.
+        let children_map: Option<Vec<SmallVec<[oxc_syntax::node::NodeId; 4]>>> =
+            if state.has_has_selector {
+                let mut map = vec![SmallVec::new(); nodes.len()];
+                for node in nodes {
+                    let id = node.id();
+                    let parent_id = nodes.parent_id(id);
+                    if parent_id != id
+                        && let Some(slot) = map.get_mut(parent_id.index())
+                    {
+                        slot.push(id);
+                    }
+                }
+                Some(map)
+            } else {
+                None
+            };
+        let children_by_parent = children_map.as_deref();
+
+        // Track which patterns have already fired on the current node so a `:matches(A, B)`,
+        // comma-separated selector list, or mixed typed/unbounded selector within one pattern
+        // only reports once per node.
+        let mut reported_patterns: SmallVec<[usize; 8]> = SmallVec::new();
         for node in nodes {
             let ty = node.kind().ty();
             let typed_candidates = &state.by_type[ty as usize];
@@ -494,16 +609,16 @@ impl Rule for NoRestrictedSyntax {
                 continue;
             }
 
-            let mut last_reported_pattern: Option<usize> = None;
+            reported_patterns.clear();
             for &(pattern_idx, chain_idx) in
                 typed_candidates.iter().chain(state.unbounded_chains.iter())
             {
-                if last_reported_pattern == Some(pattern_idx) {
+                if reported_patterns.contains(&pattern_idx) {
                     continue;
                 }
                 let pattern = &state.patterns[pattern_idx];
-                if pattern.chains[chain_idx].matches_node(node, ctx) {
-                    last_reported_pattern = Some(pattern_idx);
+                if pattern.chains[chain_idx].matches_node(node, ctx, children_by_parent) {
+                    reported_patterns.push(pattern_idx);
                     ctx.diagnostic(no_restricted_syntax_diagnostic(
                         node.kind().span(),
                         &pattern.message,
@@ -516,22 +631,32 @@ impl Rule for NoRestrictedSyntax {
 
 impl AttrPredicate {
     fn matches(&self, root: PropValue<'_>) -> bool {
-        let mut current = root;
+        let mut current = Some(root);
         for segment in &self.path {
-            let Some(next) = current.get_prop(segment) else {
-                return false;
-            };
-            current = next;
+            current = current.and_then(|val| val.get_prop(segment));
+            if current.is_none() {
+                break;
+            }
         }
         match &self.matcher {
-            AttrMatcher::Exists => !matches!(current, PropValue::Null),
-            AttrMatcher::Equals(lit) => current.equals_literal(lit),
-            AttrMatcher::NotEquals(lit) => !current.equals_literal(lit),
-            AttrMatcher::Regex(re) => current.as_str().is_some_and(|s| re.is_match(s)),
-            AttrMatcher::LessThan(n) => current.as_number().is_some_and(|v| v < *n),
-            AttrMatcher::LessEqual(n) => current.as_number().is_some_and(|v| v <= *n),
-            AttrMatcher::GreaterThan(n) => current.as_number().is_some_and(|v| v > *n),
-            AttrMatcher::GreaterEqual(n) => current.as_number().is_some_and(|v| v >= *n),
+            AttrMatcher::Exists => current.is_some_and(|val| !matches!(val, PropValue::Null)),
+            AttrMatcher::Equals(lit) => current.is_some_and(|val| val.equals_literal(lit)),
+            AttrMatcher::NotEquals(lit) => current.is_none_or(|val| !val.equals_literal(lit)),
+            AttrMatcher::Regex(re) => {
+                current.and_then(PropValue::as_str).is_some_and(|s| re.is_match(s))
+            }
+            AttrMatcher::LessThan(n) => {
+                current.and_then(PropValue::as_number).is_some_and(|v| v < *n)
+            }
+            AttrMatcher::LessEqual(n) => {
+                current.and_then(PropValue::as_number).is_some_and(|v| v <= *n)
+            }
+            AttrMatcher::GreaterThan(n) => {
+                current.and_then(PropValue::as_number).is_some_and(|v| v > *n)
+            }
+            AttrMatcher::GreaterEqual(n) => {
+                current.and_then(PropValue::as_number).is_some_and(|v| v >= *n)
+            }
         }
     }
 }
@@ -543,20 +668,46 @@ enum PropValue<'a> {
     Number(f64),
     Null,
     AstKind(AstKind<'a>),
+    Statement(&'a Statement<'a>),
+    Declaration(&'a Declaration<'a>),
     Expression(&'a Expression<'a>),
     Argument(&'a Argument<'a>),
     AssignmentTarget(&'a AssignmentTarget<'a>),
+    AssignmentTargetMaybeDefault(&'a AssignmentTargetMaybeDefault<'a>),
     BindingPattern(&'a BindingPattern<'a>),
+    BindingProperty(&'a BindingProperty<'a>),
     PropertyKey(&'a PropertyKey<'a>),
+    ObjectPropertyKind(&'a ObjectPropertyKind<'a>),
+    ArrayExpressionElement(&'a ArrayExpressionElement<'a>),
+    ClassElement(&'a ClassElement<'a>),
     ModuleExportName(&'a ModuleExportName<'a>),
     TSModuleReference(&'a TSModuleReference<'a>),
+    ImportDeclarationSpecifier(&'a ImportDeclarationSpecifier<'a>),
+    ExportDefaultDeclarationKind(&'a ExportDefaultDeclarationKind<'a>),
+    ForStatementInit(&'a ForStatementInit<'a>),
+    ForStatementLeft(&'a ForStatementLeft<'a>),
     JSXElementName(&'a JSXElementName<'a>),
     JSXMemberExpressionObject(&'a JSXMemberExpressionObject<'a>),
     JSXAttributeName(&'a JSXAttributeName<'a>),
     JSXAttributeValue(&'a JSXAttributeValue<'a>),
+    JSXChild(&'a JSXChild<'a>),
     Arguments(&'a [Argument<'a>]),
     Expressions(&'a [Expression<'a>]),
     JSXAttributes(&'a [JSXAttributeItem<'a>]),
+    JSXChildren(&'a [JSXChild<'a>]),
+    Statements(&'a [Statement<'a>]),
+    FormalParameters(&'a FormalParameters<'a>),
+    VariableDeclarators(&'a [VariableDeclarator<'a>]),
+    ObjectProperties(&'a [ObjectPropertyKind<'a>]),
+    ArrayElements(&'a [ArrayExpressionElement<'a>]),
+    BindingProperties(&'a [BindingProperty<'a>]),
+    ArrayPatternElements(&'a [Option<BindingPattern<'a>>]),
+    ClassElements(&'a [ClassElement<'a>]),
+    ImportSpecifiers(&'a [ImportDeclarationSpecifier<'a>]),
+    ExportSpecifiers(&'a [ExportSpecifier<'a>]),
+    SwitchCases(&'a [SwitchCase<'a>]),
+    TemplateElements(&'a [TemplateElement<'a>]),
+    TSEnumMembers(&'a [TSEnumMember<'a>]),
 }
 
 impl<'a> PropValue<'a> {
@@ -587,6 +738,8 @@ impl<'a> PropValue<'a> {
     fn estree_type(self) -> Option<&'static str> {
         match self {
             Self::AstKind(kind) => Some(ast_kind_estree_type(kind)),
+            Self::Statement(stmt) => Some(statement_estree_type(stmt)),
+            Self::Declaration(decl) => Some(declaration_estree_type(decl)),
             Self::Expression(expr) => Some(expression_estree_type(expr)),
             Self::Argument(arg) => match arg {
                 Argument::SpreadElement(_) => Some("SpreadElement"),
@@ -597,6 +750,15 @@ impl<'a> PropValue<'a> {
                 AssignmentTarget::ObjectAssignmentTarget(_) => Some("ObjectPattern"),
                 _ => target.as_simple_assignment_target().map(simple_target_estree_type),
             },
+            Self::AssignmentTargetMaybeDefault(target) => match target {
+                AssignmentTargetMaybeDefault::AssignmentTargetWithDefault(_) => {
+                    Some("AssignmentPattern")
+                }
+                _ => target
+                    .as_assignment_target()
+                    .and_then(|t| Self::AssignmentTarget(t).estree_type()),
+            },
+            Self::BindingProperty(_) => Some("Property"),
             Self::BindingPattern(pat) => Some(match pat {
                 BindingPattern::BindingIdentifier(_) => "Identifier",
                 BindingPattern::ObjectPattern(_) => "ObjectPattern",
@@ -608,6 +770,22 @@ impl<'a> PropValue<'a> {
                 PropertyKey::PrivateIdentifier(_) => Some("PrivateIdentifier"),
                 _ => key.as_expression().map(expression_estree_type),
             },
+            Self::ObjectPropertyKind(prop) => Some(match prop {
+                ObjectPropertyKind::ObjectProperty(_) => "Property",
+                ObjectPropertyKind::SpreadProperty(_) => "SpreadElement",
+            }),
+            Self::ArrayExpressionElement(el) => match el {
+                ArrayExpressionElement::SpreadElement(_) => Some("SpreadElement"),
+                ArrayExpressionElement::Elision(_) => None,
+                _ => el.as_expression().map(expression_estree_type),
+            },
+            Self::ClassElement(el) => Some(match el {
+                ClassElement::StaticBlock(_) => "StaticBlock",
+                ClassElement::MethodDefinition(_) => "MethodDefinition",
+                ClassElement::PropertyDefinition(_) => "PropertyDefinition",
+                ClassElement::AccessorProperty(_) => "AccessorProperty",
+                ClassElement::TSIndexSignature(_) => "TSIndexSignature",
+            }),
             Self::ModuleExportName(name) => Some(match name {
                 ModuleExportName::IdentifierName(_) | ModuleExportName::IdentifierReference(_) => {
                     "Identifier"
@@ -619,6 +797,31 @@ impl<'a> PropValue<'a> {
                 TSModuleReference::IdentifierReference(_) => "Identifier",
                 TSModuleReference::QualifiedName(_) => "TSQualifiedName",
             }),
+            Self::ImportDeclarationSpecifier(spec) => Some(match spec {
+                ImportDeclarationSpecifier::ImportSpecifier(_) => "ImportSpecifier",
+                ImportDeclarationSpecifier::ImportDefaultSpecifier(_) => "ImportDefaultSpecifier",
+                ImportDeclarationSpecifier::ImportNamespaceSpecifier(_) => {
+                    "ImportNamespaceSpecifier"
+                }
+            }),
+            Self::ExportDefaultDeclarationKind(decl) => match decl {
+                ExportDefaultDeclarationKind::FunctionDeclaration(_) => Some("FunctionDeclaration"),
+                ExportDefaultDeclarationKind::ClassDeclaration(_) => Some("ClassDeclaration"),
+                ExportDefaultDeclarationKind::TSInterfaceDeclaration(_) => {
+                    Some("TSInterfaceDeclaration")
+                }
+                _ => decl.as_expression().map(expression_estree_type),
+            },
+            Self::ForStatementInit(init) => match init {
+                ForStatementInit::VariableDeclaration(_) => Some("VariableDeclaration"),
+                _ => init.as_expression().map(expression_estree_type),
+            },
+            Self::ForStatementLeft(left) => match left {
+                ForStatementLeft::VariableDeclaration(_) => Some("VariableDeclaration"),
+                _ => left
+                    .as_assignment_target()
+                    .and_then(|t| Self::AssignmentTarget(t).estree_type()),
+            },
             Self::JSXElementName(name) => Some(match name {
                 JSXElementName::Identifier(_)
                 | JSXElementName::IdentifierReference(_)
@@ -641,13 +844,34 @@ impl<'a> PropValue<'a> {
                 JSXAttributeValue::Element(_) => "JSXElement",
                 JSXAttributeValue::Fragment(_) => "JSXFragment",
             }),
+            Self::JSXChild(child) => Some(match child {
+                JSXChild::Text(_) => "JSXText",
+                JSXChild::Element(_) => "JSXElement",
+                JSXChild::Fragment(_) => "JSXFragment",
+                JSXChild::ExpressionContainer(_) => "JSXExpressionContainer",
+                JSXChild::Spread(_) => "JSXSpreadChild",
+            }),
             Self::Str(_)
             | Self::Bool(_)
             | Self::Number(_)
             | Self::Null
             | Self::Arguments(_)
             | Self::Expressions(_)
-            | Self::JSXAttributes(_) => None,
+            | Self::JSXAttributes(_)
+            | Self::JSXChildren(_)
+            | Self::Statements(_)
+            | Self::FormalParameters(_)
+            | Self::VariableDeclarators(_)
+            | Self::ObjectProperties(_)
+            | Self::ArrayElements(_)
+            | Self::BindingProperties(_)
+            | Self::ArrayPatternElements(_)
+            | Self::ClassElements(_)
+            | Self::ImportSpecifiers(_)
+            | Self::ExportSpecifiers(_)
+            | Self::SwitchCases(_)
+            | Self::TemplateElements(_)
+            | Self::TSEnumMembers(_) => None,
         }
     }
 
@@ -658,6 +882,8 @@ impl<'a> PropValue<'a> {
 
         match self {
             Self::AstKind(kind) => get_ast_kind_prop(kind, segment),
+            Self::Statement(stmt) => get_statement_prop(stmt, segment),
+            Self::Declaration(decl) => get_declaration_prop(decl, segment),
             Self::Expression(expr) => get_expression_prop(expr, segment),
             Self::Argument(arg) => match arg {
                 Argument::SpreadElement(spread) => match segment {
@@ -666,25 +892,44 @@ impl<'a> PropValue<'a> {
                 },
                 _ => get_expression_prop(arg.as_expression()?, segment),
             },
-            Self::AssignmentTarget(target) => {
-                if let Some(simple) = target.as_simple_assignment_target() {
-                    get_simple_assignment_target_prop(simple, segment)
-                } else {
-                    None
+            Self::AssignmentTarget(target) => match target {
+                AssignmentTarget::ArrayAssignmentTarget(arr) => {
+                    get_ast_kind_prop(AstKind::ArrayAssignmentTarget(arr), segment)
                 }
-            }
+                AssignmentTarget::ObjectAssignmentTarget(obj) => {
+                    get_ast_kind_prop(AstKind::ObjectAssignmentTarget(obj), segment)
+                }
+                _ => get_simple_assignment_target_prop(
+                    target.as_simple_assignment_target()?,
+                    segment,
+                ),
+            },
+            Self::AssignmentTargetMaybeDefault(target) => match target {
+                AssignmentTargetMaybeDefault::AssignmentTargetWithDefault(def) => {
+                    get_ast_kind_prop(AstKind::AssignmentTargetWithDefault(def), segment)
+                }
+                _ => Self::AssignmentTarget(target.as_assignment_target()?).get_prop(segment),
+            },
             Self::BindingPattern(pat) => match pat {
                 BindingPattern::BindingIdentifier(id) => match segment {
                     "name" => Some(PropValue::Str(id.name.as_str())),
                     _ => None,
                 },
+                BindingPattern::ObjectPattern(obj) => {
+                    get_ast_kind_prop(AstKind::ObjectPattern(obj), segment)
+                }
+                BindingPattern::ArrayPattern(arr) => {
+                    get_ast_kind_prop(AstKind::ArrayPattern(arr), segment)
+                }
                 BindingPattern::AssignmentPattern(assign) => match segment {
                     "left" => Some(PropValue::BindingPattern(&assign.left)),
                     "right" => Some(PropValue::Expression(&assign.right)),
                     _ => None,
                 },
-                _ => None,
             },
+            Self::BindingProperty(prop) => {
+                get_ast_kind_prop(AstKind::BindingProperty(prop), segment)
+            }
             Self::PropertyKey(key) => match key {
                 PropertyKey::StaticIdentifier(id) => match segment {
                     "name" => Some(PropValue::Str(id.name.as_str())),
@@ -695,6 +940,34 @@ impl<'a> PropValue<'a> {
                     _ => None,
                 },
                 _ => get_expression_prop(key.as_expression()?, segment),
+            },
+            Self::ObjectPropertyKind(prop) => match prop {
+                ObjectPropertyKind::ObjectProperty(p) => {
+                    get_ast_kind_prop(AstKind::ObjectProperty(p), segment)
+                }
+                ObjectPropertyKind::SpreadProperty(s) => {
+                    get_ast_kind_prop(AstKind::SpreadElement(s), segment)
+                }
+            },
+            Self::ArrayExpressionElement(el) => match el {
+                ArrayExpressionElement::SpreadElement(s) => {
+                    get_ast_kind_prop(AstKind::SpreadElement(s), segment)
+                }
+                ArrayExpressionElement::Elision(_) => None,
+                _ => get_expression_prop(el.as_expression()?, segment),
+            },
+            Self::ClassElement(el) => match el {
+                ClassElement::StaticBlock(b) => get_ast_kind_prop(AstKind::StaticBlock(b), segment),
+                ClassElement::MethodDefinition(m) => {
+                    get_ast_kind_prop(AstKind::MethodDefinition(m), segment)
+                }
+                ClassElement::PropertyDefinition(p) => {
+                    get_ast_kind_prop(AstKind::PropertyDefinition(p), segment)
+                }
+                ClassElement::AccessorProperty(a) => {
+                    get_ast_kind_prop(AstKind::AccessorProperty(a), segment)
+                }
+                ClassElement::TSIndexSignature(_) => None,
             },
             Self::ModuleExportName(name) => match name {
                 ModuleExportName::IdentifierName(id) => match segment {
@@ -724,6 +997,41 @@ impl<'a> PropValue<'a> {
                 TSModuleReference::QualifiedName(q) => {
                     get_ast_kind_prop(AstKind::TSQualifiedName(q), segment)
                 }
+            },
+            Self::ImportDeclarationSpecifier(spec) => match spec {
+                ImportDeclarationSpecifier::ImportSpecifier(s) => {
+                    get_ast_kind_prop(AstKind::ImportSpecifier(s), segment)
+                }
+                ImportDeclarationSpecifier::ImportDefaultSpecifier(s) => {
+                    get_ast_kind_prop(AstKind::ImportDefaultSpecifier(s), segment)
+                }
+                ImportDeclarationSpecifier::ImportNamespaceSpecifier(s) => {
+                    get_ast_kind_prop(AstKind::ImportNamespaceSpecifier(s), segment)
+                }
+            },
+            Self::ExportDefaultDeclarationKind(decl) => match decl {
+                ExportDefaultDeclarationKind::FunctionDeclaration(f) => {
+                    get_ast_kind_prop(AstKind::Function(f), segment)
+                }
+                ExportDefaultDeclarationKind::ClassDeclaration(c) => {
+                    get_ast_kind_prop(AstKind::Class(c), segment)
+                }
+                ExportDefaultDeclarationKind::TSInterfaceDeclaration(i) => {
+                    get_ast_kind_prop(AstKind::TSInterfaceDeclaration(i), segment)
+                }
+                _ => get_expression_prop(decl.as_expression()?, segment),
+            },
+            Self::ForStatementInit(init) => match init {
+                ForStatementInit::VariableDeclaration(v) => {
+                    get_ast_kind_prop(AstKind::VariableDeclaration(v), segment)
+                }
+                _ => get_expression_prop(init.as_expression()?, segment),
+            },
+            Self::ForStatementLeft(left) => match left {
+                ForStatementLeft::VariableDeclaration(v) => {
+                    get_ast_kind_prop(AstKind::VariableDeclaration(v), segment)
+                }
+                _ => Self::AssignmentTarget(left.as_assignment_target()?).get_prop(segment),
             },
             Self::JSXElementName(name) => match name {
                 JSXElementName::Identifier(id) => match segment {
@@ -781,6 +1089,15 @@ impl<'a> PropValue<'a> {
                     get_ast_kind_prop(AstKind::JSXFragment(f), segment)
                 }
             },
+            Self::JSXChild(child) => match child {
+                JSXChild::Text(t) => get_ast_kind_prop(AstKind::JSXText(t), segment),
+                JSXChild::Element(el) => get_ast_kind_prop(AstKind::JSXElement(el), segment),
+                JSXChild::Fragment(f) => get_ast_kind_prop(AstKind::JSXFragment(f), segment),
+                JSXChild::ExpressionContainer(c) => {
+                    get_ast_kind_prop(AstKind::JSXExpressionContainer(c), segment)
+                }
+                JSXChild::Spread(_) => None,
+            },
             Self::Arguments(args) => {
                 if segment == "length" {
                     #[expect(clippy::cast_precision_loss)]
@@ -811,6 +1128,138 @@ impl<'a> PropValue<'a> {
                         Some(PropValue::AstKind(AstKind::JSXSpreadAttribute(s)))
                     }
                 }
+            }
+            Self::JSXChildren(children) => {
+                if segment == "length" {
+                    #[expect(clippy::cast_precision_loss)]
+                    return Some(PropValue::Number(children.len() as f64));
+                }
+                let idx = segment.parse::<usize>().ok()?;
+                children.get(idx).map(PropValue::JSXChild)
+            }
+            Self::Statements(stmts) => {
+                if segment == "length" {
+                    #[expect(clippy::cast_precision_loss)]
+                    return Some(PropValue::Number(stmts.len() as f64));
+                }
+                let idx = segment.parse::<usize>().ok()?;
+                stmts.get(idx).map(PropValue::Statement)
+            }
+            Self::FormalParameters(params) => {
+                let total_len = params.items.len() + usize::from(params.rest.is_some());
+                if segment == "length" {
+                    #[expect(clippy::cast_precision_loss)]
+                    return Some(PropValue::Number(total_len as f64));
+                }
+                let idx = segment.parse::<usize>().ok()?;
+                if let Some(item) = params.items.get(idx) {
+                    if item.has_modifier() || item.initializer.is_some() {
+                        Some(PropValue::AstKind(AstKind::FormalParameter(item)))
+                    } else {
+                        Some(PropValue::BindingPattern(&item.pattern))
+                    }
+                } else if idx == params.items.len() {
+                    params
+                        .rest
+                        .as_deref()
+                        .map(|r| PropValue::AstKind(AstKind::FormalParameterRest(r)))
+                } else {
+                    None
+                }
+            }
+            Self::VariableDeclarators(decls) => {
+                if segment == "length" {
+                    #[expect(clippy::cast_precision_loss)]
+                    return Some(PropValue::Number(decls.len() as f64));
+                }
+                let idx = segment.parse::<usize>().ok()?;
+                decls.get(idx).map(|d| PropValue::AstKind(AstKind::VariableDeclarator(d)))
+            }
+            Self::ObjectProperties(props) => {
+                if segment == "length" {
+                    #[expect(clippy::cast_precision_loss)]
+                    return Some(PropValue::Number(props.len() as f64));
+                }
+                let idx = segment.parse::<usize>().ok()?;
+                props.get(idx).map(PropValue::ObjectPropertyKind)
+            }
+            Self::ArrayElements(els) => {
+                if segment == "length" {
+                    #[expect(clippy::cast_precision_loss)]
+                    return Some(PropValue::Number(els.len() as f64));
+                }
+                let idx = segment.parse::<usize>().ok()?;
+                match els.get(idx)? {
+                    ArrayExpressionElement::Elision(_) => Some(PropValue::Null),
+                    other => Some(PropValue::ArrayExpressionElement(other)),
+                }
+            }
+            Self::BindingProperties(props) => {
+                if segment == "length" {
+                    #[expect(clippy::cast_precision_loss)]
+                    return Some(PropValue::Number(props.len() as f64));
+                }
+                let idx = segment.parse::<usize>().ok()?;
+                props.get(idx).map(PropValue::BindingProperty)
+            }
+            Self::ArrayPatternElements(els) => {
+                if segment == "length" {
+                    #[expect(clippy::cast_precision_loss)]
+                    return Some(PropValue::Number(els.len() as f64));
+                }
+                let idx = segment.parse::<usize>().ok()?;
+                match els.get(idx)? {
+                    Some(pat) => Some(PropValue::BindingPattern(pat)),
+                    None => Some(PropValue::Null),
+                }
+            }
+            Self::ClassElements(els) => {
+                if segment == "length" {
+                    #[expect(clippy::cast_precision_loss)]
+                    return Some(PropValue::Number(els.len() as f64));
+                }
+                let idx = segment.parse::<usize>().ok()?;
+                els.get(idx).map(PropValue::ClassElement)
+            }
+            Self::ImportSpecifiers(specs) => {
+                if segment == "length" {
+                    #[expect(clippy::cast_precision_loss)]
+                    return Some(PropValue::Number(specs.len() as f64));
+                }
+                let idx = segment.parse::<usize>().ok()?;
+                specs.get(idx).map(PropValue::ImportDeclarationSpecifier)
+            }
+            Self::ExportSpecifiers(specs) => {
+                if segment == "length" {
+                    #[expect(clippy::cast_precision_loss)]
+                    return Some(PropValue::Number(specs.len() as f64));
+                }
+                let idx = segment.parse::<usize>().ok()?;
+                specs.get(idx).map(|s| PropValue::AstKind(AstKind::ExportSpecifier(s)))
+            }
+            Self::SwitchCases(cases) => {
+                if segment == "length" {
+                    #[expect(clippy::cast_precision_loss)]
+                    return Some(PropValue::Number(cases.len() as f64));
+                }
+                let idx = segment.parse::<usize>().ok()?;
+                cases.get(idx).map(|c| PropValue::AstKind(AstKind::SwitchCase(c)))
+            }
+            Self::TemplateElements(quasis) => {
+                if segment == "length" {
+                    #[expect(clippy::cast_precision_loss)]
+                    return Some(PropValue::Number(quasis.len() as f64));
+                }
+                let idx = segment.parse::<usize>().ok()?;
+                quasis.get(idx).map(|q| PropValue::AstKind(AstKind::TemplateElement(q)))
+            }
+            Self::TSEnumMembers(members) => {
+                if segment == "length" {
+                    #[expect(clippy::cast_precision_loss)]
+                    return Some(PropValue::Number(members.len() as f64));
+                }
+                let idx = segment.parse::<usize>().ok()?;
+                members.get(idx).map(|m| PropValue::AstKind(AstKind::TSEnumMember(m)))
             }
             Self::Str(_) | Self::Bool(_) | Self::Number(_) | Self::Null => None,
         }
@@ -951,8 +1400,179 @@ fn import_or_export_kind_str(kind: ImportOrExportKind) -> &'static str {
     }
 }
 
+fn get_statement_prop<'a>(stmt: &'a Statement<'a>, segment: &str) -> Option<PropValue<'a>> {
+    match stmt {
+        Statement::BlockStatement(s) => get_ast_kind_prop(AstKind::BlockStatement(s), segment),
+        Statement::BreakStatement(s) => get_ast_kind_prop(AstKind::BreakStatement(s), segment),
+        Statement::ContinueStatement(s) => {
+            get_ast_kind_prop(AstKind::ContinueStatement(s), segment)
+        }
+        Statement::DebuggerStatement(s) => {
+            get_ast_kind_prop(AstKind::DebuggerStatement(s), segment)
+        }
+        Statement::DoWhileStatement(s) => get_ast_kind_prop(AstKind::DoWhileStatement(s), segment),
+        Statement::EmptyStatement(s) => get_ast_kind_prop(AstKind::EmptyStatement(s), segment),
+        Statement::ExpressionStatement(s) => {
+            get_ast_kind_prop(AstKind::ExpressionStatement(s), segment)
+        }
+        Statement::ForInStatement(s) => get_ast_kind_prop(AstKind::ForInStatement(s), segment),
+        Statement::ForOfStatement(s) => get_ast_kind_prop(AstKind::ForOfStatement(s), segment),
+        Statement::ForStatement(s) => get_ast_kind_prop(AstKind::ForStatement(s), segment),
+        Statement::IfStatement(s) => get_ast_kind_prop(AstKind::IfStatement(s), segment),
+        Statement::LabeledStatement(s) => get_ast_kind_prop(AstKind::LabeledStatement(s), segment),
+        Statement::ReturnStatement(s) => get_ast_kind_prop(AstKind::ReturnStatement(s), segment),
+        Statement::SwitchStatement(s) => get_ast_kind_prop(AstKind::SwitchStatement(s), segment),
+        Statement::ThrowStatement(s) => get_ast_kind_prop(AstKind::ThrowStatement(s), segment),
+        Statement::TryStatement(s) => get_ast_kind_prop(AstKind::TryStatement(s), segment),
+        Statement::WhileStatement(s) => get_ast_kind_prop(AstKind::WhileStatement(s), segment),
+        Statement::WithStatement(s) => get_ast_kind_prop(AstKind::WithStatement(s), segment),
+        Statement::VariableDeclaration(d) => {
+            get_ast_kind_prop(AstKind::VariableDeclaration(d), segment)
+        }
+        Statement::FunctionDeclaration(d) => get_ast_kind_prop(AstKind::Function(d), segment),
+        Statement::ClassDeclaration(d) => get_ast_kind_prop(AstKind::Class(d), segment),
+        Statement::ImportDeclaration(d) => {
+            get_ast_kind_prop(AstKind::ImportDeclaration(d), segment)
+        }
+        Statement::ExportAllDeclaration(d) => {
+            get_ast_kind_prop(AstKind::ExportAllDeclaration(d), segment)
+        }
+        Statement::ExportDefaultDeclaration(d) => {
+            get_ast_kind_prop(AstKind::ExportDefaultDeclaration(d), segment)
+        }
+        Statement::ExportDeclaration(d) => {
+            get_ast_kind_prop(AstKind::ExportDeclaration(d), segment)
+        }
+        Statement::ExportNamedDeclaration(d) => {
+            get_ast_kind_prop(AstKind::ExportNamedDeclaration(d), segment)
+        }
+        Statement::ExportFromDeclaration(d) => {
+            get_ast_kind_prop(AstKind::ExportFromDeclaration(d), segment)
+        }
+        Statement::TSTypeAliasDeclaration(d) => {
+            get_ast_kind_prop(AstKind::TSTypeAliasDeclaration(d), segment)
+        }
+        Statement::TSInterfaceDeclaration(d) => {
+            get_ast_kind_prop(AstKind::TSInterfaceDeclaration(d), segment)
+        }
+        Statement::TSEnumDeclaration(d) => {
+            get_ast_kind_prop(AstKind::TSEnumDeclaration(d), segment)
+        }
+        Statement::TSExternalModuleDeclaration(_)
+        | Statement::TSNamespaceDeclaration(_)
+        | Statement::TSGlobalDeclaration(_)
+        | Statement::TSNamespaceExportDeclaration(_) => None,
+        Statement::TSImportEqualsDeclaration(d) => {
+            get_ast_kind_prop(AstKind::TSImportEqualsDeclaration(d), segment)
+        }
+        Statement::TSExportAssignment(d) => {
+            get_ast_kind_prop(AstKind::TSExportAssignment(d), segment)
+        }
+    }
+}
+
+fn statement_estree_type(stmt: &Statement<'_>) -> &'static str {
+    match stmt {
+        Statement::BlockStatement(_) => "BlockStatement",
+        Statement::BreakStatement(_) => "BreakStatement",
+        Statement::ContinueStatement(_) => "ContinueStatement",
+        Statement::DebuggerStatement(_) => "DebuggerStatement",
+        Statement::DoWhileStatement(_) => "DoWhileStatement",
+        Statement::EmptyStatement(_) => "EmptyStatement",
+        Statement::ExpressionStatement(_) => "ExpressionStatement",
+        Statement::ForInStatement(_) => "ForInStatement",
+        Statement::ForOfStatement(_) => "ForOfStatement",
+        Statement::ForStatement(_) => "ForStatement",
+        Statement::IfStatement(_) => "IfStatement",
+        Statement::LabeledStatement(_) => "LabeledStatement",
+        Statement::ReturnStatement(_) => "ReturnStatement",
+        Statement::SwitchStatement(_) => "SwitchStatement",
+        Statement::ThrowStatement(_) => "ThrowStatement",
+        Statement::TryStatement(_) => "TryStatement",
+        Statement::WhileStatement(_) => "WhileStatement",
+        Statement::WithStatement(_) => "WithStatement",
+        Statement::VariableDeclaration(_) => "VariableDeclaration",
+        Statement::FunctionDeclaration(_) => "FunctionDeclaration",
+        Statement::ClassDeclaration(_) => "ClassDeclaration",
+        Statement::ImportDeclaration(_) => "ImportDeclaration",
+        Statement::ExportAllDeclaration(_) => "ExportAllDeclaration",
+        Statement::ExportDefaultDeclaration(_) => "ExportDefaultDeclaration",
+        Statement::ExportDeclaration(_)
+        | Statement::ExportNamedDeclaration(_)
+        | Statement::ExportFromDeclaration(_) => "ExportNamedDeclaration",
+        Statement::TSTypeAliasDeclaration(_) => "TSTypeAliasDeclaration",
+        Statement::TSInterfaceDeclaration(_) => "TSInterfaceDeclaration",
+        Statement::TSEnumDeclaration(_) => "TSEnumDeclaration",
+        Statement::TSExternalModuleDeclaration(_)
+        | Statement::TSNamespaceDeclaration(_)
+        | Statement::TSGlobalDeclaration(_) => "TSModuleDeclaration",
+        Statement::TSImportEqualsDeclaration(_) => "TSImportEqualsDeclaration",
+        Statement::TSExportAssignment(_) => "TSExportAssignment",
+        Statement::TSNamespaceExportDeclaration(_) => "TSNamespaceExportDeclaration",
+    }
+}
+
+fn get_declaration_prop<'a>(decl: &'a Declaration<'a>, segment: &str) -> Option<PropValue<'a>> {
+    match decl {
+        Declaration::VariableDeclaration(d) => {
+            get_ast_kind_prop(AstKind::VariableDeclaration(d), segment)
+        }
+        Declaration::FunctionDeclaration(d) => get_ast_kind_prop(AstKind::Function(d), segment),
+        Declaration::ClassDeclaration(d) => get_ast_kind_prop(AstKind::Class(d), segment),
+        Declaration::TSTypeAliasDeclaration(d) => {
+            get_ast_kind_prop(AstKind::TSTypeAliasDeclaration(d), segment)
+        }
+        Declaration::TSInterfaceDeclaration(d) => {
+            get_ast_kind_prop(AstKind::TSInterfaceDeclaration(d), segment)
+        }
+        Declaration::TSEnumDeclaration(d) => {
+            get_ast_kind_prop(AstKind::TSEnumDeclaration(d), segment)
+        }
+        Declaration::TSExternalModuleDeclaration(_)
+        | Declaration::TSNamespaceDeclaration(_)
+        | Declaration::TSGlobalDeclaration(_) => None,
+        Declaration::TSImportEqualsDeclaration(d) => {
+            get_ast_kind_prop(AstKind::TSImportEqualsDeclaration(d), segment)
+        }
+    }
+}
+
+fn declaration_estree_type(decl: &Declaration<'_>) -> &'static str {
+    match decl {
+        Declaration::VariableDeclaration(_) => "VariableDeclaration",
+        Declaration::FunctionDeclaration(_) => "FunctionDeclaration",
+        Declaration::ClassDeclaration(_) => "ClassDeclaration",
+        Declaration::TSTypeAliasDeclaration(_) => "TSTypeAliasDeclaration",
+        Declaration::TSInterfaceDeclaration(_) => "TSInterfaceDeclaration",
+        Declaration::TSEnumDeclaration(_) => "TSEnumDeclaration",
+        Declaration::TSExternalModuleDeclaration(_)
+        | Declaration::TSNamespaceDeclaration(_)
+        | Declaration::TSGlobalDeclaration(_) => "TSModuleDeclaration",
+        Declaration::TSImportEqualsDeclaration(_) => "TSImportEqualsDeclaration",
+    }
+}
+
 fn get_ast_kind_prop<'a>(kind: AstKind<'a>, segment: &str) -> Option<PropValue<'a>> {
     match kind {
+        AstKind::Program(prog) => match segment {
+            "body" => Some(PropValue::Statements(&prog.body)),
+            "sourceType" => {
+                Some(PropValue::Str(if prog.source_type.is_module() { "module" } else { "script" }))
+            }
+            _ => None,
+        },
+        AstKind::BlockStatement(block) => match segment {
+            "body" => Some(PropValue::Statements(&block.body)),
+            _ => None,
+        },
+        AstKind::FunctionBody(body) => match segment {
+            "body" => Some(PropValue::Statements(&body.statements)),
+            _ => None,
+        },
+        AstKind::StaticBlock(block) => match segment {
+            "body" => Some(PropValue::Statements(&block.body)),
+            _ => None,
+        },
         AstKind::IdentifierReference(id) => match segment {
             "name" => Some(PropValue::Str(id.name.as_str())),
             _ => None,
@@ -977,6 +1597,11 @@ fn get_ast_kind_prop<'a>(kind: AstKind<'a>, segment: &str) -> Option<PropValue<'
             "name" => Some(PropValue::Str(id.name.as_str())),
             _ => None,
         },
+        AstKind::JSXText(text) => match segment {
+            "value" => Some(PropValue::Str(text.value.as_str())),
+            "raw" => text.raw.as_ref().map(|r| PropValue::Str(r.as_str())),
+            _ => None,
+        },
         AstKind::CallExpression(call) => match segment {
             "callee" => Some(PropValue::Expression(&call.callee)),
             "arguments" => Some(PropValue::Arguments(&call.arguments)),
@@ -986,6 +1611,26 @@ fn get_ast_kind_prop<'a>(kind: AstKind<'a>, segment: &str) -> Option<PropValue<'
         AstKind::NewExpression(new_expr) => match segment {
             "callee" => Some(PropValue::Expression(&new_expr.callee)),
             "arguments" => Some(PropValue::Arguments(&new_expr.arguments)),
+            _ => None,
+        },
+        AstKind::ChainExpression(chain) => match segment {
+            "expression" => Some(match &chain.expression {
+                ChainElement::CallExpression(call) => {
+                    PropValue::AstKind(AstKind::CallExpression(call))
+                }
+                ChainElement::TSNonNullExpression(ts) => {
+                    PropValue::AstKind(AstKind::TSNonNullExpression(ts))
+                }
+                ChainElement::ComputedMemberExpression(mem) => {
+                    PropValue::AstKind(AstKind::ComputedMemberExpression(mem))
+                }
+                ChainElement::StaticMemberExpression(mem) => {
+                    PropValue::AstKind(AstKind::StaticMemberExpression(mem))
+                }
+                ChainElement::PrivateFieldExpression(mem) => {
+                    PropValue::AstKind(AstKind::PrivateFieldExpression(mem))
+                }
+            }),
             _ => None,
         },
         AstKind::StaticMemberExpression(mem) => match segment {
@@ -1011,17 +1656,49 @@ fn get_ast_kind_prop<'a>(kind: AstKind<'a>, segment: &str) -> Option<PropValue<'
         },
         AstKind::ImportDeclaration(decl) => match segment {
             "source" => Some(PropValue::AstKind(AstKind::StringLiteral(&decl.source))),
+            "specifiers" => Some(PropValue::ImportSpecifiers(
+                decl.specifiers.as_ref().map_or(&[], |v| v.as_slice()),
+            )),
             "importKind" => Some(PropValue::Str(import_or_export_kind_str(decl.import_kind))),
             _ => None,
         },
-        AstKind::ExportNamedDeclaration(decl) => match segment {
+        AstKind::ImportSpecifier(spec) => match segment {
+            "imported" => Some(PropValue::ModuleExportName(&spec.imported)),
+            "local" => Some(PropValue::AstKind(AstKind::BindingIdentifier(&spec.local))),
+            "importKind" => Some(PropValue::Str(import_or_export_kind_str(spec.import_kind))),
+            _ => None,
+        },
+        AstKind::ImportDefaultSpecifier(spec) => match segment {
+            "local" => Some(PropValue::AstKind(AstKind::BindingIdentifier(&spec.local))),
+            _ => None,
+        },
+        AstKind::ImportNamespaceSpecifier(spec) => match segment {
+            "local" => Some(PropValue::AstKind(AstKind::BindingIdentifier(&spec.local))),
+            _ => None,
+        },
+        AstKind::ExportDeclaration(decl) => match segment {
             "source" => Some(PropValue::Null),
+            "specifiers" => Some(PropValue::ExportSpecifiers(&[])),
+            "declaration" => Some(PropValue::Declaration(&decl.declaration)),
+            "exportKind" => Some(PropValue::Str(import_or_export_kind_str(decl.export_kind()))),
+            _ => None,
+        },
+        AstKind::ExportNamedDeclaration(decl) => match segment {
+            "source" | "declaration" => Some(PropValue::Null),
+            "specifiers" => Some(PropValue::ExportSpecifiers(&decl.specifiers)),
             "exportKind" => Some(PropValue::Str(import_or_export_kind_str(decl.export_kind))),
             _ => None,
         },
         AstKind::ExportFromDeclaration(decl) => match segment {
             "source" => Some(PropValue::AstKind(AstKind::StringLiteral(&decl.source))),
+            "specifiers" => Some(PropValue::ExportSpecifiers(&decl.specifiers)),
+            "declaration" => Some(PropValue::Null),
             "exportKind" => Some(PropValue::Str(import_or_export_kind_str(decl.export_kind))),
+            _ => None,
+        },
+        AstKind::ExportDefaultDeclaration(decl) => match segment {
+            "declaration" => Some(PropValue::ExportDefaultDeclarationKind(&decl.declaration)),
+            "exportKind" => Some(PropValue::Str("value")),
             _ => None,
         },
         AstKind::ExportAllDeclaration(decl) => match segment {
@@ -1033,36 +1710,132 @@ fn get_ast_kind_prop<'a>(kind: AstKind<'a>, segment: &str) -> Option<PropValue<'
                 .map_or(Some(PropValue::Null), |e| Some(PropValue::ModuleExportName(e))),
             _ => None,
         },
+        AstKind::ExportSpecifier(spec) => match segment {
+            "local" => Some(PropValue::ModuleExportName(&spec.local)),
+            "exported" => Some(PropValue::ModuleExportName(&spec.exported)),
+            "exportKind" => Some(PropValue::Str(import_or_export_kind_str(spec.export_kind))),
+            _ => None,
+        },
         AstKind::ImportExpression(imp) => match segment {
             "source" => Some(PropValue::Expression(&imp.source)),
+            "options" => imp
+                .options
+                .as_ref()
+                .map_or(Some(PropValue::Null), |e| Some(PropValue::Expression(e))),
             _ => None,
         },
         AstKind::TSImportEqualsDeclaration(decl) => match segment {
             "id" => Some(PropValue::AstKind(AstKind::BindingIdentifier(&decl.id))),
             "moduleReference" => Some(PropValue::TSModuleReference(&decl.module_reference)),
             "importKind" => Some(PropValue::Str(import_or_export_kind_str(decl.import_kind))),
+            "isExport" => Some(PropValue::Bool(false)),
             _ => None,
         },
         AstKind::TSExternalModuleReference(ext) => match segment {
             "expression" => Some(PropValue::AstKind(AstKind::StringLiteral(&ext.expression))),
             _ => None,
         },
+        AstKind::TSExportAssignment(assign) => match segment {
+            "expression" => Some(PropValue::Expression(&assign.expression)),
+            _ => None,
+        },
         AstKind::IfStatement(stmt) => match segment {
             "test" => Some(PropValue::Expression(&stmt.test)),
+            "consequent" => Some(PropValue::Statement(&stmt.consequent)),
+            "alternate" => stmt
+                .alternate
+                .as_ref()
+                .map_or(Some(PropValue::Null), |s| Some(PropValue::Statement(s))),
             _ => None,
         },
         AstKind::WhileStatement(stmt) => match segment {
             "test" => Some(PropValue::Expression(&stmt.test)),
+            "body" => Some(PropValue::Statement(&stmt.body)),
             _ => None,
         },
         AstKind::DoWhileStatement(stmt) => match segment {
             "test" => Some(PropValue::Expression(&stmt.test)),
+            "body" => Some(PropValue::Statement(&stmt.body)),
             _ => None,
         },
         AstKind::ForStatement(stmt) => match segment {
+            "init" => stmt
+                .init
+                .as_ref()
+                .map_or(Some(PropValue::Null), |i| Some(PropValue::ForStatementInit(i))),
             "test" => {
                 stmt.test.as_ref().map_or(Some(PropValue::Null), |e| Some(PropValue::Expression(e)))
             }
+            "update" => stmt
+                .update
+                .as_ref()
+                .map_or(Some(PropValue::Null), |e| Some(PropValue::Expression(e))),
+            "body" => Some(PropValue::Statement(&stmt.body)),
+            _ => None,
+        },
+        AstKind::ForInStatement(stmt) => match segment {
+            "left" => Some(PropValue::ForStatementLeft(&stmt.left)),
+            "right" => Some(PropValue::Expression(&stmt.right)),
+            "body" => Some(PropValue::Statement(&stmt.body)),
+            _ => None,
+        },
+        AstKind::ForOfStatement(stmt) => match segment {
+            "left" => Some(PropValue::ForStatementLeft(&stmt.left)),
+            "right" => Some(PropValue::Expression(&stmt.right)),
+            "body" => Some(PropValue::Statement(&stmt.body)),
+            "await" => Some(PropValue::Bool(stmt.r#await)),
+            _ => None,
+        },
+        AstKind::SwitchStatement(stmt) => match segment {
+            "discriminant" => Some(PropValue::Expression(&stmt.discriminant)),
+            "cases" => Some(PropValue::SwitchCases(&stmt.cases)),
+            _ => None,
+        },
+        AstKind::SwitchCase(case) => match segment {
+            "test" => {
+                case.test.as_ref().map_or(Some(PropValue::Null), |e| Some(PropValue::Expression(e)))
+            }
+            "consequent" => Some(PropValue::Statements(&case.consequent)),
+            _ => None,
+        },
+        AstKind::TryStatement(stmt) => match segment {
+            "block" => Some(PropValue::AstKind(AstKind::BlockStatement(&stmt.block))),
+            "handler" => stmt.handler.as_deref().map_or(Some(PropValue::Null), |h| {
+                Some(PropValue::AstKind(AstKind::CatchClause(h)))
+            }),
+            "finalizer" => stmt.finalizer.as_deref().map_or(Some(PropValue::Null), |f| {
+                Some(PropValue::AstKind(AstKind::BlockStatement(f)))
+            }),
+            _ => None,
+        },
+        AstKind::CatchClause(clause) => match segment {
+            "param" => clause
+                .param
+                .as_ref()
+                .map_or(Some(PropValue::Null), |p| Some(PropValue::BindingPattern(&p.pattern))),
+            "body" => Some(PropValue::AstKind(AstKind::BlockStatement(&clause.body))),
+            _ => None,
+        },
+        AstKind::LabeledStatement(stmt) => match segment {
+            "label" => Some(PropValue::AstKind(AstKind::LabelIdentifier(&stmt.label))),
+            "body" => Some(PropValue::Statement(&stmt.body)),
+            _ => None,
+        },
+        AstKind::BreakStatement(stmt) => match segment {
+            "label" => stmt.label.as_ref().map_or(Some(PropValue::Null), |l| {
+                Some(PropValue::AstKind(AstKind::LabelIdentifier(l)))
+            }),
+            _ => None,
+        },
+        AstKind::ContinueStatement(stmt) => match segment {
+            "label" => stmt.label.as_ref().map_or(Some(PropValue::Null), |l| {
+                Some(PropValue::AstKind(AstKind::LabelIdentifier(l)))
+            }),
+            _ => None,
+        },
+        AstKind::WithStatement(stmt) => match segment {
+            "object" => Some(PropValue::Expression(&stmt.object)),
+            "body" => Some(PropValue::Statement(&stmt.body)),
             _ => None,
         },
         AstKind::UnaryExpression(u) => match segment {
@@ -1074,11 +1847,18 @@ fn get_ast_kind_prop<'a>(kind: AstKind<'a>, segment: &str) -> Option<PropValue<'
         AstKind::UpdateExpression(u) => match segment {
             "operator" => Some(PropValue::Str(u.operator.as_str())),
             "prefix" => Some(PropValue::Bool(u.prefix)),
+            "argument" => Some(PropValue::AssignmentTarget(u.argument.as_assignment_target())),
             _ => None,
         },
         AstKind::BinaryExpression(b) => match segment {
             "operator" => Some(PropValue::Str(b.operator.as_str())),
             "left" => Some(PropValue::Expression(&b.left)),
+            "right" => Some(PropValue::Expression(&b.right)),
+            _ => None,
+        },
+        AstKind::PrivateInExpression(b) => match segment {
+            "operator" => Some(PropValue::Str("in")),
+            "left" => Some(PropValue::AstKind(AstKind::PrivateIdentifier(&b.left))),
             "right" => Some(PropValue::Expression(&b.right)),
             _ => None,
         },
@@ -1094,15 +1874,21 @@ fn get_ast_kind_prop<'a>(kind: AstKind<'a>, segment: &str) -> Option<PropValue<'
             "alternate" => Some(PropValue::Expression(&c.alternate)),
             _ => None,
         },
+        AstKind::SequenceExpression(s) => match segment {
+            "expressions" => Some(PropValue::Expressions(&s.expressions)),
+            _ => None,
+        },
         AstKind::VariableDeclarator(decl) => match segment {
             "id" => Some(PropValue::BindingPattern(&decl.id)),
             "init" => {
                 decl.init.as_ref().map_or(Some(PropValue::Null), |e| Some(PropValue::Expression(e)))
             }
+            "definite" => Some(PropValue::Bool(decl.definite)),
             _ => None,
         },
         AstKind::VariableDeclaration(decl) => match segment {
             "kind" => Some(PropValue::Str(decl.kind.as_str())),
+            "declarations" => Some(PropValue::VariableDeclarators(&decl.declarations)),
             "declare" => Some(PropValue::Bool(decl.declare)),
             _ => None,
         },
@@ -1112,6 +1898,99 @@ fn get_ast_kind_prop<'a>(kind: AstKind<'a>, segment: &str) -> Option<PropValue<'
             "right" => Some(PropValue::Expression(&a.right)),
             _ => None,
         },
+        AstKind::ObjectExpression(o) => match segment {
+            "properties" => Some(PropValue::ObjectProperties(&o.properties)),
+            _ => None,
+        },
+        AstKind::ArrayExpression(a) => match segment {
+            "elements" => Some(PropValue::ArrayElements(&a.elements)),
+            _ => None,
+        },
+        AstKind::ObjectPattern(o) => match segment {
+            "properties" => Some(PropValue::BindingProperties(&o.properties)),
+            _ => None,
+        },
+        AstKind::ArrayPattern(a) => match segment {
+            "elements" => Some(PropValue::ArrayPatternElements(&a.elements)),
+            _ => None,
+        },
+        AstKind::AssignmentPattern(a) => match segment {
+            "left" => Some(PropValue::BindingPattern(&a.left)),
+            "right" => Some(PropValue::Expression(&a.right)),
+            _ => None,
+        },
+        AstKind::AssignmentTargetWithDefault(a) => match segment {
+            "left" => Some(PropValue::AssignmentTarget(&a.binding)),
+            "right" => Some(PropValue::Expression(&a.init)),
+            _ => None,
+        },
+        AstKind::BindingProperty(p) => match segment {
+            "key" => Some(PropValue::PropertyKey(&p.key)),
+            "value" => Some(PropValue::BindingPattern(&p.value)),
+            "shorthand" => Some(PropValue::Bool(p.shorthand)),
+            "computed" => Some(PropValue::Bool(p.computed)),
+            "method" => Some(PropValue::Bool(false)),
+            "kind" => Some(PropValue::Str("init")),
+            _ => None,
+        },
+        AstKind::AssignmentTargetPropertyIdentifier(p) => match segment {
+            "key" => Some(PropValue::AstKind(AstKind::IdentifierReference(&p.binding))),
+            "value" => match &p.init {
+                Some(init) => Some(PropValue::Expression(init)),
+                None => Some(PropValue::AstKind(AstKind::IdentifierReference(&p.binding))),
+            },
+            "shorthand" => Some(PropValue::Bool(true)),
+            "computed" | "method" => Some(PropValue::Bool(false)),
+            "kind" => Some(PropValue::Str("init")),
+            _ => None,
+        },
+        AstKind::AssignmentTargetPropertyProperty(p) => match segment {
+            "key" => Some(PropValue::PropertyKey(&p.name)),
+            "value" => Some(PropValue::AssignmentTargetMaybeDefault(&p.binding)),
+            "shorthand" | "method" => Some(PropValue::Bool(false)),
+            "computed" => Some(PropValue::Bool(p.computed)),
+            "kind" => Some(PropValue::Str("init")),
+            _ => None,
+        },
+        AstKind::BindingRestElement(r) => match segment {
+            "argument" => Some(PropValue::BindingPattern(&r.argument)),
+            _ => None,
+        },
+        AstKind::FormalParameterRest(r) => match segment {
+            "argument" => Some(PropValue::BindingPattern(&r.rest.argument)),
+            _ => None,
+        },
+        AstKind::AssignmentTargetRest(r) => match segment {
+            "argument" => Some(PropValue::AssignmentTarget(&r.target)),
+            _ => None,
+        },
+        AstKind::SpreadElement(s) => match segment {
+            "argument" => Some(PropValue::Expression(&s.argument)),
+            _ => None,
+        },
+        AstKind::FormalParameter(p) => {
+            if p.has_modifier() {
+                match segment {
+                    "accessibility" => p
+                        .accessibility
+                        .map_or(Some(PropValue::Null), |a| Some(PropValue::Str(a.as_str()))),
+                    "readonly" => Some(PropValue::Bool(p.readonly)),
+                    "override" => Some(PropValue::Bool(p.r#override)),
+                    "static" => Some(PropValue::Bool(false)),
+                    "parameter" => Some(PropValue::BindingPattern(&p.pattern)),
+                    _ => None,
+                }
+            } else if let Some(init) = &p.initializer {
+                match segment {
+                    "left" => Some(PropValue::BindingPattern(&p.pattern)),
+                    "right" => Some(PropValue::Expression(init)),
+                    "optional" => Some(PropValue::Bool(p.optional)),
+                    _ => None,
+                }
+            } else {
+                PropValue::BindingPattern(&p.pattern).get_prop(segment)
+            }
+        }
         AstKind::StringLiteral(lit) => match segment {
             "value" => lit.value.as_str().map(PropValue::Str),
             "raw" => lit.raw.as_ref().map(|r| PropValue::Str(r.as_str())),
@@ -1142,27 +2021,53 @@ fn get_ast_kind_prop<'a>(kind: AstKind<'a>, segment: &str) -> Option<PropValue<'
             "id" => f.id.as_ref().map_or(Some(PropValue::Null), |id| {
                 Some(PropValue::AstKind(AstKind::BindingIdentifier(id)))
             }),
+            "params" => Some(PropValue::FormalParameters(&f.params)),
+            "body" => f.body.as_deref().map_or(Some(PropValue::Null), |b| {
+                Some(PropValue::AstKind(AstKind::FunctionBody(b)))
+            }),
             "async" => Some(PropValue::Bool(f.r#async)),
             "generator" => Some(PropValue::Bool(f.generator)),
             "expression" => Some(PropValue::Bool(false)),
+            "declare" => Some(PropValue::Bool(f.declare)),
             _ => None,
         },
         AstKind::ArrowFunctionExpression(f) => match segment {
+            "id" => Some(PropValue::Null),
+            "params" => Some(PropValue::FormalParameters(&f.params)),
+            "body" => match &f.body {
+                ArrowFunctionBody::FunctionBody(b) => {
+                    Some(PropValue::AstKind(AstKind::FunctionBody(b)))
+                }
+                _ => f.body.as_expression().map(PropValue::Expression),
+            },
             "async" => Some(PropValue::Bool(f.r#async)),
+            "generator" => Some(PropValue::Bool(false)),
+            "expression" => Some(PropValue::Bool(f.is_expression())),
             _ => None,
         },
         AstKind::Class(c) => match segment {
             "id" => c.id.as_ref().map_or(Some(PropValue::Null), |id| {
                 Some(PropValue::AstKind(AstKind::BindingIdentifier(id)))
             }),
+            "superClass" => c
+                .heritage_expression()
+                .map_or(Some(PropValue::Null), |s| Some(PropValue::Expression(s))),
+            "body" => Some(PropValue::AstKind(AstKind::ClassBody(&c.body))),
             "abstract" => Some(PropValue::Bool(c.r#abstract)),
             "declare" => Some(PropValue::Bool(c.declare)),
             _ => None,
         },
+        AstKind::ClassBody(body) => match segment {
+            "body" => Some(PropValue::ClassElements(&body.body)),
+            _ => None,
+        },
         AstKind::MethodDefinition(m) => match segment {
             "key" => Some(PropValue::PropertyKey(&m.key)),
+            "value" => Some(PropValue::AstKind(AstKind::Function(&m.value))),
             "static" => Some(PropValue::Bool(m.r#static)),
             "computed" => Some(PropValue::Bool(m.computed)),
+            "override" => Some(PropValue::Bool(m.r#override)),
+            "optional" => Some(PropValue::Bool(m.optional)),
             "kind" => Some(PropValue::Str(match m.kind {
                 MethodDefinitionKind::Constructor => "constructor",
                 MethodDefinitionKind::Method => "method",
@@ -1178,6 +2083,21 @@ fn get_ast_kind_prop<'a>(kind: AstKind<'a>, segment: &str) -> Option<PropValue<'
             }
             "static" => Some(PropValue::Bool(p.r#static)),
             "computed" => Some(PropValue::Bool(p.computed)),
+            "readonly" => Some(PropValue::Bool(p.readonly)),
+            "override" => Some(PropValue::Bool(p.r#override)),
+            "optional" => Some(PropValue::Bool(p.optional)),
+            "declare" => Some(PropValue::Bool(p.declare)),
+            "definite" => Some(PropValue::Bool(p.definite)),
+            _ => None,
+        },
+        AstKind::AccessorProperty(p) => match segment {
+            "key" => Some(PropValue::PropertyKey(&p.key)),
+            "value" => {
+                p.value.as_ref().map_or(Some(PropValue::Null), |e| Some(PropValue::Expression(e)))
+            }
+            "static" => Some(PropValue::Bool(p.r#static)),
+            "computed" => Some(PropValue::Bool(p.computed)),
+            "definite" => Some(PropValue::Bool(p.definite)),
             _ => None,
         },
         AstKind::ObjectProperty(p) => match segment {
@@ -1200,6 +2120,11 @@ fn get_ast_kind_prop<'a>(kind: AstKind<'a>, segment: &str) -> Option<PropValue<'
         },
         AstKind::TemplateLiteral(t) => match segment {
             "expressions" => Some(PropValue::Expressions(&t.expressions)),
+            "quasis" => Some(PropValue::TemplateElements(&t.quasis)),
+            _ => None,
+        },
+        AstKind::TemplateElement(el) => match segment {
+            "tail" => Some(PropValue::Bool(el.tail)),
             _ => None,
         },
         AstKind::AwaitExpression(a) => match segment {
@@ -1227,17 +2152,43 @@ fn get_ast_kind_prop<'a>(kind: AstKind<'a>, segment: &str) -> Option<PropValue<'
         },
         AstKind::ExpressionStatement(e) => match segment {
             "expression" => Some(PropValue::Expression(&e.expression)),
+            "directive" => Some(PropValue::Null),
+            _ => None,
+        },
+        AstKind::Directive(d) => match segment {
+            "expression" => Some(PropValue::AstKind(AstKind::StringLiteral(&d.expression))),
+            "directive" => Some(PropValue::Str(d.directive.as_str())),
             _ => None,
         },
         AstKind::JSXElement(el) => match segment {
             "openingElement" => {
                 Some(PropValue::AstKind(AstKind::JSXOpeningElement(&el.opening_element)))
             }
+            "closingElement" => el.closing_element.as_deref().map_or(Some(PropValue::Null), |c| {
+                Some(PropValue::AstKind(AstKind::JSXClosingElement(c)))
+            }),
+            "children" => Some(PropValue::JSXChildren(&el.children)),
             _ => None,
         },
         AstKind::JSXOpeningElement(el) => match segment {
             "name" => Some(PropValue::JSXElementName(&el.name)),
             "attributes" => Some(PropValue::JSXAttributes(&el.attributes)),
+            _ => None,
+        },
+        AstKind::JSXClosingElement(el) => match segment {
+            "name" => Some(PropValue::JSXElementName(&el.name)),
+            _ => None,
+        },
+        AstKind::JSXFragment(f) => match segment {
+            "children" => Some(PropValue::JSXChildren(&f.children)),
+            _ => None,
+        },
+        AstKind::JSXExpressionContainer(c) => match segment {
+            "expression" => c.expression.as_expression().map(PropValue::Expression),
+            _ => None,
+        },
+        AstKind::JSXSpreadAttribute(s) => match segment {
+            "argument" => Some(PropValue::Expression(&s.argument)),
             _ => None,
         },
         AstKind::JSXAttribute(attr) => match segment {
@@ -1276,8 +2227,16 @@ fn get_ast_kind_prop<'a>(kind: AstKind<'a>, segment: &str) -> Option<PropValue<'
         },
         AstKind::TSEnumDeclaration(decl) => match segment {
             "id" => Some(PropValue::AstKind(AstKind::BindingIdentifier(&decl.id))),
+            "members" => Some(PropValue::TSEnumMembers(&decl.body.members)),
             "const" => Some(PropValue::Bool(decl.r#const)),
             "declare" => Some(PropValue::Bool(decl.declare)),
+            _ => None,
+        },
+        AstKind::TSEnumMember(member) => match segment {
+            "initializer" => member
+                .initializer
+                .as_ref()
+                .map_or(Some(PropValue::Null), |e| Some(PropValue::Expression(e))),
             _ => None,
         },
         AstKind::TSInterfaceDeclaration(decl) => match segment {
@@ -1292,6 +2251,10 @@ fn get_ast_kind_prop<'a>(kind: AstKind<'a>, segment: &str) -> Option<PropValue<'
         },
         AstKind::TSQualifiedName(q) => match segment {
             "right" => Some(PropValue::AstKind(AstKind::IdentifierName(&q.right))),
+            _ => None,
+        },
+        AstKind::Decorator(d) => match segment {
+            "expression" => Some(PropValue::Expression(&d.expression)),
             _ => None,
         },
         _ => None,
@@ -1379,11 +2342,11 @@ fn ast_kind_estree_type(kind: AstKind<'_>) -> &'static str {
         AstKind::Super(_) => "Super",
         AstKind::AwaitExpression(_) => "AwaitExpression",
         AstKind::ChainExpression(_) => "ChainExpression",
-        AstKind::BlockStatement(_) => "BlockStatement",
+        AstKind::BlockStatement(_) | AstKind::FunctionBody(_) => "BlockStatement",
         AstKind::VariableDeclaration(_) => "VariableDeclaration",
         AstKind::VariableDeclarator(_) => "VariableDeclarator",
         AstKind::EmptyStatement(_) => "EmptyStatement",
-        AstKind::ExpressionStatement(_) => "ExpressionStatement",
+        AstKind::ExpressionStatement(_) | AstKind::Directive(_) => "ExpressionStatement",
         AstKind::IfStatement(_) => "IfStatement",
         AstKind::DoWhileStatement(_) => "DoWhileStatement",
         AstKind::WhileStatement(_) => "WhileStatement",
@@ -1403,6 +2366,20 @@ fn ast_kind_estree_type(kind: AstKind<'_>) -> &'static str {
         AstKind::DebuggerStatement(_) => "DebuggerStatement",
         AstKind::AssignmentPattern(_) | AstKind::AssignmentTargetWithDefault(_) => {
             "AssignmentPattern"
+        }
+        AstKind::FormalParameter(param) => {
+            if param.has_modifier() {
+                "TSParameterProperty"
+            } else if param.initializer.is_some() {
+                "AssignmentPattern"
+            } else {
+                match &param.pattern {
+                    BindingPattern::BindingIdentifier(_) => "Identifier",
+                    BindingPattern::ObjectPattern(_) => "ObjectPattern",
+                    BindingPattern::ArrayPattern(_) => "ArrayPattern",
+                    BindingPattern::AssignmentPattern(_) => "AssignmentPattern",
+                }
+            }
         }
         AstKind::ObjectPattern(_) | AstKind::ObjectAssignmentTarget(_) => "ObjectPattern",
         AstKind::ArrayPattern(_) | AstKind::ArrayAssignmentTarget(_) => "ArrayPattern",
@@ -1436,9 +2413,9 @@ fn ast_kind_estree_type(kind: AstKind<'_>) -> &'static str {
         AstKind::ImportSpecifier(_) => "ImportSpecifier",
         AstKind::ImportDefaultSpecifier(_) => "ImportDefaultSpecifier",
         AstKind::ImportNamespaceSpecifier(_) => "ImportNamespaceSpecifier",
-        AstKind::ExportNamedDeclaration(_) | AstKind::ExportFromDeclaration(_) => {
-            "ExportNamedDeclaration"
-        }
+        AstKind::ExportDeclaration(_)
+        | AstKind::ExportNamedDeclaration(_)
+        | AstKind::ExportFromDeclaration(_) => "ExportNamedDeclaration",
         AstKind::ExportDefaultDeclaration(_) => "ExportDefaultDeclaration",
         AstKind::ExportAllDeclaration(_) => "ExportAllDeclaration",
         AstKind::ExportSpecifier(_) => "ExportSpecifier",
@@ -1533,9 +2510,11 @@ fn parse_node_type_constraint(type_name: &str) -> Option<NodeTypeConstraint> {
         "ImportSpecifier" => &[AstType::ImportSpecifier],
         "ImportDefaultSpecifier" => &[AstType::ImportDefaultSpecifier],
         "ImportNamespaceSpecifier" => &[AstType::ImportNamespaceSpecifier],
-        "ExportNamedDeclaration" => {
-            &[AstType::ExportNamedDeclaration, AstType::ExportFromDeclaration]
-        }
+        "ExportNamedDeclaration" => &[
+            AstType::ExportDeclaration,
+            AstType::ExportNamedDeclaration,
+            AstType::ExportFromDeclaration,
+        ],
         "ExportAllDeclaration" => &[AstType::ExportAllDeclaration],
         "ExportDefaultDeclaration" => &[AstType::ExportDefaultDeclaration],
         "ExportSpecifier" => &[AstType::ExportSpecifier],
@@ -1573,7 +2552,12 @@ fn parse_node_type_constraint(type_name: &str) -> Option<NodeTypeConstraint> {
         "ArrayExpression" => &[AstType::ArrayExpression],
         "ObjectPattern" => &[AstType::ObjectPattern, AstType::ObjectAssignmentTarget],
         "ArrayPattern" => &[AstType::ArrayPattern, AstType::ArrayAssignmentTarget],
-        "AssignmentPattern" => &[AstType::AssignmentPattern, AstType::AssignmentTargetWithDefault],
+        "AssignmentPattern" => &[
+            AstType::AssignmentPattern,
+            AstType::AssignmentTargetWithDefault,
+            AstType::FormalParameter,
+        ],
+        "TSParameterProperty" => &[AstType::FormalParameter],
         "RestElement" => &[
             AstType::BindingRestElement,
             AstType::FormalParameterRest,
@@ -1588,8 +2572,8 @@ fn parse_node_type_constraint(type_name: &str) -> Option<NodeTypeConstraint> {
         "ThisExpression" => &[AstType::ThisExpression],
         "Super" => &[AstType::Super],
         "ChainExpression" => &[AstType::ChainExpression],
-        "BlockStatement" => &[AstType::BlockStatement],
-        "ExpressionStatement" => &[AstType::ExpressionStatement],
+        "BlockStatement" => &[AstType::BlockStatement, AstType::FunctionBody],
+        "ExpressionStatement" => &[AstType::ExpressionStatement, AstType::Directive],
         "ReturnStatement" => &[AstType::ReturnStatement],
         "ThrowStatement" => &[AstType::ThrowStatement],
         "TryStatement" => &[AstType::TryStatement],
@@ -1926,6 +2910,95 @@ fn find_matching_delim(input: &str, open: char, close: char) -> Option<usize> {
     None
 }
 
+fn is_supported_attr_segment(segment: &str) -> bool {
+    if segment.parse::<usize>().is_ok() {
+        return true;
+    }
+    matches!(
+        segment,
+        "type"
+            | "name"
+            | "value"
+            | "raw"
+            | "bigint"
+            | "pattern"
+            | "length"
+            | "callee"
+            | "arguments"
+            | "optional"
+            | "object"
+            | "property"
+            | "computed"
+            | "source"
+            | "specifiers"
+            | "importKind"
+            | "exportKind"
+            | "exported"
+            | "local"
+            | "imported"
+            | "declaration"
+            | "declarations"
+            | "options"
+            | "id"
+            | "moduleReference"
+            | "isExport"
+            | "expression"
+            | "expressions"
+            | "test"
+            | "consequent"
+            | "alternate"
+            | "init"
+            | "update"
+            | "body"
+            | "left"
+            | "right"
+            | "await"
+            | "discriminant"
+            | "cases"
+            | "block"
+            | "handler"
+            | "finalizer"
+            | "param"
+            | "params"
+            | "label"
+            | "operator"
+            | "prefix"
+            | "argument"
+            | "definite"
+            | "kind"
+            | "declare"
+            | "properties"
+            | "elements"
+            | "key"
+            | "shorthand"
+            | "method"
+            | "accessibility"
+            | "readonly"
+            | "override"
+            | "static"
+            | "parameter"
+            | "async"
+            | "generator"
+            | "superClass"
+            | "tag"
+            | "quasi"
+            | "quasis"
+            | "tail"
+            | "delegate"
+            | "directive"
+            | "openingElement"
+            | "closingElement"
+            | "children"
+            | "attributes"
+            | "selfClosing"
+            | "namespace"
+            | "members"
+            | "const"
+            | "initializer"
+            | "sourceType"
+    )
+}
+
 fn parse_attr_predicate(inner: &str) -> Option<AttrPredicate> {
     let inner = inner.trim();
     if inner.is_empty() {
@@ -1957,7 +3030,7 @@ fn parse_attr_predicate(inner: &str) -> Option<AttrPredicate> {
             .filter(|s| !s.is_empty())
             .map(ToString::to_string)
             .collect();
-        if path.is_empty() {
+        if path.is_empty() || !path.iter().all(|seg| is_supported_attr_segment(seg)) {
             return None;
         }
         return Some(AttrPredicate { path, matcher: AttrMatcher::Exists });
@@ -1969,7 +3042,7 @@ fn parse_attr_predicate(inner: &str) -> Option<AttrPredicate> {
 
     let path: Vec<String> =
         lhs.split('.').map(str::trim).filter(|s| !s.is_empty()).map(ToString::to_string).collect();
-    if path.is_empty() || rhs.is_empty() {
+    if path.is_empty() || rhs.is_empty() || !path.iter().all(|seg| is_supported_attr_segment(seg)) {
         return None;
     }
 
@@ -2230,4 +3303,35 @@ fn test_has_pseudo_and_rejects_unsupported_selector() {
 
     let bad_flags = NoRestrictedSyntax::from_configuration(json!(["Identifier[name=/foo/xyz]"]));
     assert!(bad_flags.is_err(), "unsupported regex flags in selector must fail closed");
+
+    let bad_prop =
+        NoRestrictedSyntax::from_configuration(json!(["FunctionDeclaration[unknownProp=1]"]));
+    assert!(bad_prop.is_err(), "unsupported ESTree attribute segment must fail closed");
+}
+
+#[test]
+fn test_estree_normalization_and_deduplication() {
+    use crate::tester::Tester;
+    use serde_json::json;
+
+    let pass = vec![
+        (r"foo?.();", Some(json!(["ExpressionStatement > CallExpression"]))),
+        (r"eval('1');", Some(json!(["CallExpression[callee.name!='eval']"]))),
+        (r"function f() {}", Some(json!(["FunctionDeclaration[params.length>0]"]))),
+    ];
+
+    let fail = vec![
+        (r"foo?.();", Some(json!(["ChainExpression > CallExpression"]))),
+        (r"obj.run();", Some(json!(["CallExpression[callee.name!='eval']"]))),
+        (r"function f(x) {}", Some(json!(["FunctionDeclaration > Identifier[name='x']"]))),
+        (
+            r"function f(x = 1) {}",
+            Some(json!(["FunctionDeclaration > AssignmentPattern > Identifier[name='x']"])),
+        ),
+        (r"function f(x) {}", Some(json!(["FunctionDeclaration[params.length>0]"]))),
+        (r"function f() { return 1; }", Some(json!(["FunctionDeclaration > BlockStatement"]))),
+        (r"foo(eval('x'));", Some(json!(["CallExpression:has(Identifier[name='eval'])"]))),
+    ];
+
+    Tester::new(NoRestrictedSyntax::NAME, NoRestrictedSyntax::PLUGIN, pass, fail).test();
 }

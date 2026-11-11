@@ -208,7 +208,11 @@ impl DynamicImportChunkname {
             return;
         };
 
-        let leading_comments: Vec<&Comment> = ctx.comments_range(callee_end..arg_start).collect();
+        let comment_search_start = ctx
+            .find_prev_token_within(callee_end, arg_start, "(")
+            .map_or(callee_end, |offset| callee_end + offset + 1);
+        let leading_comments: Vec<&Comment> =
+            ctx.comments_range(comment_search_start..arg_start).collect();
 
         if leading_comments.is_empty() {
             if !self.0.config.allow_empty {
@@ -348,6 +352,7 @@ fn test() {
         (r#"import(/*webpackChunkName: "my-chunk-name"*/ './a')"#, None),
         (r#"import(/* webpackChunkName: "my-chunk-name", webpackMode: "eager" */ './a')"#, None),
         (r"dynamicImport('./a')", Some(json!([{ "importFunctions": ["dynamicImport"] }]))),
+        (r#"import /* webpackChunkName: "my-chunk-name" */ ('./a')"#, None),
     ];
 
     let fix = vec![(

@@ -37,3 +37,9 @@ source: crates/oxc_linter/src/tester.rs
  1 │ dynamicImport('./a')
    · ────────────────────
    ╰────
+
+  ⚠ import(dynamic-import-chunkname): dynamic imports require a leading comment with the webpack chunkname
+   ╭─[dynamic_import_chunkname.tsx:1:1]
+ 1 │ import /* webpackChunkName: "my-chunk-name" */ ('./a')
+   · ──────────────────────────────────────────────────────
+   ╰────
