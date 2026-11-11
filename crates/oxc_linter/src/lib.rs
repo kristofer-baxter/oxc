@@ -295,6 +295,12 @@ impl Linter {
         self
     }
 
+    #[must_use]
+    pub fn with_deny_only(mut self, deny_only: bool) -> Self {
+        self.options.deny_only = deny_only;
+        self
+    }
+
     pub(crate) fn options(&self) -> &LintOptions {
         &self.options
     }
@@ -312,7 +318,7 @@ impl Linter {
 
     /// Return `true` if `Linter` has an external linter (JS plugins).
     pub fn has_external_linter(&self) -> bool {
-        self.external_linter.is_some()
+        self.external_linter.is_some() && self.config.has_external_rules(self.options.deny_only)
     }
 
     /// # Panics
@@ -358,6 +364,7 @@ impl Linter {
             .unwrap_or_default();
         react_compiler_env_options.report_todo_and_invariant = rules
             .iter()
+            .filter(|(_, severity)| !self.options.deny_only || *severity == AllowWarnDeny::Deny)
             .any(|(rule, _)| matches!(rule, RuleEnum::ReactTodo(_) | RuleEnum::ReactInvariant(_)));
 
         let mut ctx_host = Rc::new(
@@ -391,10 +398,39 @@ impl Linter {
 
         // Pass 1: Run native rules on every sub host in turn
         loop {
+            if self.options.deny_only
+                && self.options.report_unused_directive.is_some_and(AllowWarnDeny::is_warn_deny)
+            {
+                let disable_directives = ctx_host.disable_directives();
+                if !disable_directives.is_empty() {
+                    for (rule, severity) in rules.iter() {
+                        if *severity == AllowWarnDeny::Warn {
+                            disable_directives.mark_rule_directives_used(rule.name());
+                        }
+                    }
+                    for &(external_rule_id, _, severity) in external_rules.iter() {
+                        if severity == AllowWarnDeny::Warn {
+                            let (plugin_name, rule_name) =
+                                self.config.resolve_plugin_rule_names(external_rule_id);
+                            disable_directives
+                                .mark_rule_directives_used(&format!("{plugin_name}/{rule_name}"));
+                            if let Some(stripped) = plugin_name.strip_suffix("-js") {
+                                disable_directives
+                                    .mark_rule_directives_used(&format!("{stripped}/{rule_name}"));
+                            }
+                        }
+                    }
+                }
+            }
+
             let semantic = ctx_host.semantic();
             let rules = rules
                 .iter()
-                .filter(|(rule, _)| {
+                .filter(|(rule, severity)| {
+                    if self.options.deny_only && *severity == AllowWarnDeny::Warn {
+                        return false;
+                    }
+
                     if rule.is_tsgolint_rule() {
                         return false;
                     }
@@ -474,19 +510,35 @@ impl Linter {
         }
 
         // Pass 2: Run JS plugin rules on every sub host in turn
-        ctx_host.rewind_sub_hosts();
-        loop {
-            self.run_external_rules(
-                &external_rules,
-                path,
-                &mut ctx_host,
-                allocator,
-                js_allocator_pool,
-                rule_timing_store,
-            );
+        let external_rules: std::borrow::Cow<
+            '_,
+            [(ExternalRuleId, ExternalOptionsId, AllowWarnDeny)],
+        > = if self.options.deny_only {
+            std::borrow::Cow::Owned(
+                external_rules
+                    .iter()
+                    .copied()
+                    .filter(|(_, _, severity)| *severity == AllowWarnDeny::Deny)
+                    .collect(),
+            )
+        } else {
+            std::borrow::Cow::Borrowed(&external_rules)
+        };
+        if !external_rules.is_empty() {
+            ctx_host.rewind_sub_hosts();
+            loop {
+                self.run_external_rules(
+                    &external_rules,
+                    path,
+                    &mut ctx_host,
+                    allocator,
+                    js_allocator_pool,
+                    rule_timing_store,
+                );
 
-            if !ctx_host.next_sub_host() {
-                break;
+                if !ctx_host.next_sub_host() {
+                    break;
+                }
             }
         }
 

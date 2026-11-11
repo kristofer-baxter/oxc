@@ -409,9 +409,16 @@ impl ConfigStoreBuilder {
                 LintFilterKind::Category(category) => {
                     self.upsert_where(severity, |r| r.category() == *category);
                 }
-                LintFilterKind::Rule(plugin, rule) => {
-                    let (plugin, rule) = super::rules::unalias_plugin_name(plugin, rule);
+                LintFilterKind::Rule(raw_plugin, rule) => {
+                    let (plugin, rule) = super::rules::unalias_plugin_name(raw_plugin, rule);
                     self.upsert_where(severity, |r| r.plugin_name() == plugin && r.name() == rule);
+                    if matches!(raw_plugin.as_ref(), "@1js" | "import-js") && plugin == "import" {
+                        for r in
+                            RULES.iter().filter(|r| r.plugin_name() == plugin && r.name() == rule)
+                        {
+                            self.rules.insert(r.clone(), severity);
+                        }
+                    }
                 }
                 LintFilterKind::Generic(name) => self.upsert_where(severity, |r| r.name() == name),
                 LintFilterKind::All => {
@@ -503,7 +510,11 @@ impl ConfigStoreBuilder {
             .rules
             .into_iter()
             .filter(|(r, _)| {
-                LintPlugins::try_from(r.plugin_name())
+                matches!(
+                    r,
+                    RuleEnum::ImportNoRelativePackages(_)
+                        | RuleEnum::ImportDynamicImportChunkname(_)
+                ) || LintPlugins::try_from(r.plugin_name())
                     .is_ok_and(|plugin_name| plugins.contains(plugin_name))
             })
             .collect();
@@ -925,6 +936,64 @@ mod test {
         let builder = ConfigStoreBuilder::empty();
         assert_eq!(builder.plugins(), LintPlugins::default());
         assert!(builder.rules.is_empty());
+    }
+
+    #[test]
+    fn test_category_filter_does_not_enable_import_rules_when_import_plugin_disabled() {
+        let mut external_plugin_store = ExternalPluginStore::default();
+        let config = ConfigStoreBuilder::empty()
+            .with_filter(&LintFilter::deny(RuleCategory::Style))
+            .with_filter(&LintFilter::deny(RuleCategory::Restriction))
+            .build(&mut external_plugin_store)
+            .unwrap();
+        assert!(
+            config.rules().iter().all(|(r, _)| r.plugin_name() != "import"),
+            "Category filters must not enable import/* rules when LintPlugins::IMPORT is disabled"
+        );
+
+        let aliased = ConfigStoreBuilder::empty()
+            .with_filter(
+                &LintFilter::new(AllowWarnDeny::Deny, "import-js/no-relative-packages").unwrap(),
+            )
+            .build(&mut external_plugin_store)
+            .unwrap();
+        assert!(
+            aliased
+                .rules()
+                .iter()
+                .any(|(r, _)| r.plugin_name() == "import" && r.name() == "no-relative-packages"),
+            "Explicit import-js/no-relative-packages alias filter should enable the rule"
+        );
+
+        let oxlintrc: Oxlintrc = serde_json::from_value(serde_json::json!({
+            "rules": {
+                "import-js/no-relative-packages": "error",
+                "@1js/dynamic-import-chunkname": "warn"
+            }
+        }))
+        .unwrap();
+        let from_rc = ConfigStoreBuilder::from_oxlintrc(
+            false,
+            oxlintrc,
+            None,
+            &mut external_plugin_store,
+            None,
+        )
+        .unwrap()
+        .build(&mut external_plugin_store)
+        .unwrap();
+        assert!(
+            from_rc
+                .rules()
+                .iter()
+                .any(|(r, _)| r.plugin_name() == "import" && r.name() == "no-relative-packages"),
+            ".oxlintrc import-js/no-relative-packages should load even when import plugin is not in plugins[]"
+        );
+        assert!(
+            from_rc.rules().iter().any(|(r, _)| r.plugin_name() == "import"
+                && r.name() == "dynamic-import-chunkname"),
+            ".oxlintrc @1js/dynamic-import-chunkname should load even when import plugin is not in plugins[]"
+        );
     }
 
     #[test]

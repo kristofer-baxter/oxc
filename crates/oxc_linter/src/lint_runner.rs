@@ -271,7 +271,8 @@ impl LintRunnerBuilder {
                         .with_type_check(self.type_check)
                         .with_type_check_only(self.type_check_only)
                         .with_timings(self.timings)
-                        .with_ignore_fixes(self.with_ignore_fixes),
+                        .with_ignore_fixes(self.with_ignore_fixes)
+                        .with_deny_only(self.regular_linter.options().deny_only),
                 ),
                 Err(e) => return Err(e),
             }

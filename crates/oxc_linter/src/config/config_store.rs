@@ -123,6 +123,17 @@ impl Config {
         self.base.rules.len()
     }
 
+    pub fn has_external_rules(&self, deny_only: bool) -> bool {
+        let is_active = |severity: AllowWarnDeny| {
+            if deny_only { severity == AllowWarnDeny::Deny } else { severity.is_warn_deny() }
+        };
+        self.base.external_rules.iter().any(|(_, _, sev)| is_active(*sev))
+            || self
+                .overrides
+                .iter()
+                .any(|ov| ov.rules.external_rules.iter().any(|(_, _, sev)| is_active(*sev)))
+    }
+
     pub fn apply_overrides(&self, path: &Path) -> ResolvedLinterState {
         if self.overrides.is_empty() {
             return self.base.clone();
@@ -167,7 +178,11 @@ impl Config {
             .base_rules
             .iter()
             .filter(|(rule, _)| {
-                LintPlugins::try_from(rule.plugin_name())
+                matches!(
+                    rule,
+                    RuleEnum::ImportNoRelativePackages(_)
+                        | RuleEnum::ImportDynamicImportChunkname(_)
+                ) || LintPlugins::try_from(rule.plugin_name())
                     .is_ok_and(|plugin| builtin_rule_plugins.contains(plugin))
             })
             .cloned()
@@ -429,6 +444,11 @@ impl ConfigStore {
 
     pub fn external_plugin_store(&self) -> &ExternalPluginStore {
         &self.external_plugin_store
+    }
+
+    pub fn has_external_rules(&self, deny_only: bool) -> bool {
+        self.base.has_external_rules(deny_only)
+            || self.nested_configs.values().any(|config| config.has_external_rules(deny_only))
     }
 }
 

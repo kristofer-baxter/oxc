@@ -146,11 +146,23 @@ impl OxlintRules {
                 let severity = rule_config.severity;
 
                 if LintPlugins::try_from(plugin_name).is_ok() {
-                    let rule = rules_map.get(&plugin_name).copied().or_else(|| {
-                        all_rules
-                            .iter()
-                            .find(|r| r.name() == rule_name && r.plugin_name() == plugin_name)
-                    });
+                    let is_native_aliased_import_rule = plugin_name == "import"
+                        && matches!(rule_name, "no-relative-packages" | "dynamic-import-chunkname");
+                    let rule = rules_map
+                        .get(&plugin_name)
+                        .copied()
+                        .or_else(|| {
+                            all_rules
+                                .iter()
+                                .find(|r| r.name() == rule_name && r.plugin_name() == plugin_name)
+                        })
+                        .or_else(|| {
+                            is_native_aliased_import_rule.then(|| {
+                                RULES.iter().find(|r| {
+                                    r.name() == rule_name && r.plugin_name() == plugin_name
+                                })
+                            })?
+                        });
                     if let Some(rule) = rule {
                         // If the user provided a non-empty options array for a rule that does not
                         // declare a `config =` type in its declaration, treat this as an invalid
@@ -246,6 +258,12 @@ fn transform_rule_and_plugin_name<'a>(
 ) -> (&'a str, &'a str) {
     let plugin_name = match plugin_name {
         "typescript" if is_eslint_rule_adapted_to_typescript(rule_name) => "eslint",
+        "@1js" if rule_name == "no-restricted-syntax" => "eslint",
+        "@1js" | "import-js"
+            if matches!(rule_name, "no-relative-packages" | "dynamic-import-chunkname") =>
+        {
+            "import"
+        }
         _ => plugin_name,
     };
 
@@ -662,6 +680,13 @@ pub fn normalize_rule_name(name: &str) -> String {
 
 pub(super) fn unalias_plugin_name(plugin_name: &str, rule_name: &str) -> (String, String) {
     let normalized = super::plugins::normalize_plugin_name(plugin_name);
+    match (normalized.as_ref(), rule_name) {
+        ("@1js", "no-restricted-syntax") => return ("eslint".to_string(), rule_name.to_string()),
+        ("@1js" | "import-js", "no-relative-packages" | "dynamic-import-chunkname") => {
+            return ("import".to_string(), rule_name.to_string());
+        }
+        _ => {}
+    }
     let plugin_name = match normalized.as_ref() {
         // e.g. "@next/google-font-display", "@next/next/google-font-display"
         "@next" | "@next/next" => "nextjs".to_string(),
