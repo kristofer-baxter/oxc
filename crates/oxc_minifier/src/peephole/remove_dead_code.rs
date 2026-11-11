@@ -73,6 +73,13 @@ impl<'a> PeepholeOptimizations {
     #[expect(clippy::float_cmp)]
     pub fn try_fold_if(stmt: &mut Statement<'a>, ctx: &mut TraverseCtx<'a>) {
         let Statement::IfStatement(if_stmt) = stmt else { return };
+        // Annex B gives an unbraced function an implicit block. Moving it into
+        // the surrounding statement list can collide with a lexical binding.
+        if matches!(&if_stmt.consequent, Statement::FunctionDeclaration(_))
+            || matches!(&if_stmt.alternate, Some(Statement::FunctionDeclaration(_)))
+        {
+            return;
+        }
         // Descend and remove `else` blocks first.
         match &mut if_stmt.alternate {
             Some(Statement::IfStatement(_)) => {

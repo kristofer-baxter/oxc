@@ -66,14 +66,15 @@ fn annex_b_binding(
     block_scope_id: ScopeId,
     reserved: &mut FxHashSet<CompactStr>,
 ) -> Option<SymbolId> {
-    if !is_plain_function(scoping.symbol_flags(symbol_id)) {
-        return None;
-    }
     let block_scope_flags = scoping.scope_flags(block_scope_id);
     if block_scope_flags.is_var() || block_scope_flags.is_strict_mode() {
         return None;
     }
     let name = scoping.symbol_ident(symbol_id);
+    if !is_plain_function(scoping.symbol_flags(symbol_id)) {
+        reserved.insert(CompactStr::from(name.as_str()));
+        return None;
+    }
     if name == "arguments" {
         reserved.insert(CompactStr::from(name.as_str()));
         return None;
@@ -111,11 +112,16 @@ fn annex_b_binding(
     Some(binding)
 }
 
-/// A declared function that is neither async nor a generator.
+/// A declared function without a lexical variable, class, or catch binding.
 fn is_plain_function(flags: SymbolFlags) -> bool {
     flags.contains(SymbolFlags::Function)
-        && !flags
-            .intersects(SymbolFlags::FunctionExpression | SymbolFlags::AsyncOrGeneratorFunction)
+        && !flags.intersects(
+            SymbolFlags::FunctionExpression
+                | SymbolFlags::AsyncOrGeneratorFunction
+                | SymbolFlags::BlockScopedVariable
+                | SymbolFlags::Class
+                | SymbolFlags::CatchVariable,
+        )
 }
 
 fn is_parameter(nodes: &AstNodes<'_>, node_id: NodeId) -> bool {

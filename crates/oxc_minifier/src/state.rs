@@ -201,6 +201,15 @@ fn annex_b_observable_bindings(program: &Program<'_>, scoping: &Scoping) -> FxHa
                 && !self.scoping.scope_flags(scope_id).is_var()
                 && !self.scoping.scope_flags(scope_id).is_strict_mode()
             {
+                if let Some(binding) = self.scoping.get_binding(scope_id, id.name)
+                    && self.scoping.symbol_flags(binding).intersects(
+                        SymbolFlags::BlockScopedVariable
+                            | SymbolFlags::Class
+                            | SymbolFlags::CatchVariable,
+                    )
+                {
+                    self.bindings.insert(binding);
+                }
                 for ancestor in self.scoping.scope_ancestors(scope_id).skip(1) {
                     if let Some(binding) = self.scoping.get_binding(ancestor, id.name) {
                         self.bindings.insert(binding);
@@ -239,9 +248,10 @@ impl<'a> MinifierState<'a> {
             let liveness =
                 symbols.ensure_liveness(|| SymbolLiveness::new(source_type, scoping, allocator));
             for &binding in &hidden_writes {
-                if scoping
-                    .symbol_flags(binding)
-                    .intersects(SymbolFlags::BlockScopedVariable | SymbolFlags::Class)
+                let flags = scoping.symbol_flags(binding);
+                if flags.intersects(SymbolFlags::BlockScopedVariable | SymbolFlags::Class)
+                    || (flags.contains(SymbolFlags::CatchVariable)
+                        && !flags.contains(SymbolFlags::FunctionScopedVariable))
                 {
                     liveness.mark_implicitly_observable(binding);
                 }

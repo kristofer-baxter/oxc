@@ -253,16 +253,40 @@ fn annex_b_copies_and_barriers_survive_compression_and_mangling() {
         "function run(){var value='outer',count=1;{let value='block';{let other=1;function value(){}console.log(other)}console.log(value)}console.log(typeof value,typeof count)}run();",
         "function run(){var value='outer',count=1;{let value='block';{function value(){}}}console.log(typeof value,typeof count)}run();",
         "function run(){var value='outer',count=1;{class value{};{function value(){}}}console.log(typeof value,typeof count)}run();",
+        "function run(){var value='outer',count=1;{let value=1;if(1)function value(){};console.log(value)}console.log(typeof value,typeof count)}run();",
+        "function run(){var count=1;{let value=1;if(1)function value(){};console.log(value)}console.log(typeof value,typeof count)}run();",
+        "function run(){var value='outer',count=1;{const value=1;if(1)function value(){};console.log(value)}console.log(typeof value,typeof count)}run();",
+        "function run(){var value='outer',count=1;{class value{read(){return 1}}if(1)function value(){};console.log(new value().read())}console.log(typeof value,typeof count)}run();",
+        "function run(){var value='outer',count=1;{let value=1;if(1)function value(){}}console.log(typeof value,typeof count)}run();",
+        "function run(){var value='outer',count=1;{class value{};if(1)function value(){}}console.log(typeof value,typeof count)}run();",
+        "function run(){var value='outer',count=1;try{throw'catch'}catch(value){if(1)function value(){};console.log(value)}console.log(typeof value,typeof count)}run();",
+        "function run(){var value='outer',count=1;try{throw{value:'catch'}}catch({value}){if(1)function value(){};console.log(value)}console.log(typeof value,typeof count)}run();",
+        "function run(){var value='outer',count=1;try{throw{value:'catch'}}catch({value}){if(1)function value(){}}console.log(typeof value,typeof count)}run();",
     ] {
         let execute = |code: &str| {
             let output = Command::new("node")
                 .args(["--input-type=commonjs", "--eval", code])
                 .output()
                 .expect("Node.js is required to verify Annex B catch bindings");
-            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            assert!(
+                output.status.success(),
+                "code:\n{code}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
             output.stdout
         };
         let expected = execute(source);
+        for keep_names in [false, true] {
+            for compress in [None, Some(CompressOptions::smallest())] {
+                let minified =
+                    minify_with_compression(source, SourceType::script(), keep_names, compress);
+                assert_eq!(
+                    execute(&minified),
+                    expected,
+                    "keep_names={keep_names}, source={source}\n{minified}"
+                );
+            }
+        }
         for source_type in [SourceType::script(), SourceType::cjs()] {
             let allocator = Allocator::default();
             let parsed = Parser::new(&allocator, source, source_type).parse();
@@ -284,17 +308,6 @@ fn annex_b_copies_and_barriers_survive_compression_and_mangling() {
                     },
                 );
                 assert_eq!(execute(&minified), expected, "source={source}\n{minified}");
-            }
-        }
-        for keep_names in [false, true] {
-            for compress in [None, Some(CompressOptions::smallest())] {
-                let minified =
-                    minify_with_compression(source, SourceType::script(), keep_names, compress);
-                assert_eq!(
-                    execute(&minified),
-                    expected,
-                    "keep_names={keep_names}, source={source}\n{minified}"
-                );
             }
         }
     }
