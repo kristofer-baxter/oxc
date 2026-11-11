@@ -188,7 +188,13 @@ declare_oxc_lint!(
 impl Rule for NoRelativePackages {
     fn from_configuration(value: Value) -> Result<Self, serde_json::error::Error> {
         let config = DefaultRuleConfig::<NoRelativePackagesConfig>::from_value(value)?.into_inner();
-        let ignore_regexes = config.ignore.iter().filter_map(|pat| Regex::new(pat).ok()).collect();
+        let mut ignore_regexes = Vec::with_capacity(config.ignore.len());
+        for pat in &config.ignore {
+            let re = Regex::new(pat).map_err(|err| {
+                serde::de::Error::custom(format!("Invalid `ignore` regex `{pat}`: {err}"))
+            })?;
+            ignore_regexes.push(re);
+        }
         Ok(Self(Box::new(NoRelativePackagesState { config, ignore_regexes })))
     }
 

@@ -1975,13 +1975,18 @@ fn parse_attr_predicate(inner: &str) -> Option<AttrPredicate> {
 
     let matcher = match op {
         "=" => {
-            if let Some(re) = parse_regex_literal(rhs) {
-                AttrMatcher::Regex(re)
+            if rhs.starts_with('/') {
+                AttrMatcher::Regex(parse_regex_literal(rhs)?)
             } else {
-                AttrMatcher::Equals(parse_attr_literal(rhs))
+                AttrMatcher::Equals(parse_attr_literal(rhs)?)
             }
         }
-        "!=" => AttrMatcher::NotEquals(parse_attr_literal(rhs)),
+        "!=" => {
+            if rhs.starts_with('/') {
+                return None;
+            }
+            AttrMatcher::NotEquals(parse_attr_literal(rhs)?)
+        }
         "<" => AttrMatcher::LessThan(rhs.parse::<f64>().ok()?),
         "<=" => AttrMatcher::LessEqual(rhs.parse::<f64>().ok()?),
         ">" => AttrMatcher::GreaterThan(rhs.parse::<f64>().ok()?),
@@ -2013,41 +2018,57 @@ fn parse_regex_literal(rhs: &str) -> Option<Regex> {
     let close_idx = close_slash?;
     let pattern = &rest[..close_idx];
     let flags = &rest[close_idx + 1..];
+    let mut case_insensitive = false;
+    let mut multi_line = false;
+    let mut dot_matches_new_line = false;
+    let mut unicode = false;
+    for flag in flags.chars() {
+        match flag {
+            'i' if !case_insensitive => case_insensitive = true,
+            'm' if !multi_line => multi_line = true,
+            's' if !dot_matches_new_line => dot_matches_new_line = true,
+            'u' if !unicode => unicode = true,
+            _ => return None,
+        }
+    }
     RegexBuilder::new(pattern)
-        .case_insensitive(flags.contains('i'))
-        .multi_line(flags.contains('m'))
-        .dot_matches_new_line(flags.contains('s'))
+        .case_insensitive(case_insensitive)
+        .multi_line(multi_line)
+        .dot_matches_new_line(dot_matches_new_line)
         .build()
         .ok()
 }
 
-fn parse_attr_literal(rhs: &str) -> AttrLiteral {
-    if (rhs.starts_with('\'') && rhs.ends_with('\''))
-        || (rhs.starts_with('"') && rhs.ends_with('"'))
-    {
+fn parse_attr_literal(rhs: &str) -> Option<AttrLiteral> {
+    if rhs.starts_with('\'') || rhs.starts_with('"') {
+        let quote = rhs.chars().next()?;
+        if rhs.len() < 2 || !rhs.ends_with(quote) {
+            return None;
+        }
         let inner = &rhs[1..rhs.len() - 1];
         let mut unescaped = String::with_capacity(inner.len());
         let mut chars = inner.chars();
         while let Some(ch) = chars.next() {
-            if ch == '\\'
-                && let Some(next) = chars.next()
-            {
-                unescaped.push(next);
+            if ch == '\\' {
+                unescaped.push(chars.next()?);
             } else {
                 unescaped.push(ch);
             }
         }
-        return AttrLiteral::Str(unescaped);
+        return Some(AttrLiteral::Str(unescaped));
     }
     match rhs {
-        "true" => AttrLiteral::Bool(true),
-        "false" => AttrLiteral::Bool(false),
-        "null" => AttrLiteral::Null,
+        "true" => Some(AttrLiteral::Bool(true)),
+        "false" => Some(AttrLiteral::Bool(false)),
+        "null" => Some(AttrLiteral::Null),
         _ => {
             if let Ok(n) = rhs.parse::<f64>() {
-                AttrLiteral::Number(n)
+                Some(AttrLiteral::Number(n))
+            } else if rhs.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '$'))
+            {
+                Some(AttrLiteral::Str(rhs.to_string()))
             } else {
-                AttrLiteral::Str(rhs.to_string())
+                None
             }
         }
     }
@@ -2203,4 +2224,10 @@ fn test_has_pseudo_and_rejects_unsupported_selector() {
     let err =
         NoRestrictedSyntax::from_configuration(json!(["CallExpression:unknownPseudo(Identifier)"]));
     assert!(err.is_err(), "unsupported selector syntax must fail closed in from_configuration");
+
+    let bad_regex = NoRestrictedSyntax::from_configuration(json!(["Identifier[name=/(/]"]));
+    assert!(bad_regex.is_err(), "malformed regex literal in selector must fail closed");
+
+    let bad_flags = NoRestrictedSyntax::from_configuration(json!(["Identifier[name=/foo/xyz]"]));
+    assert!(bad_flags.is_err(), "unsupported regex flags in selector must fail closed");
 }

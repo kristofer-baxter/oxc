@@ -137,12 +137,20 @@ impl Rule for DynamicImportChunkname {
             DefaultRuleConfig::<DynamicImportChunknameConfig>::from_value(value)?.into_inner();
         let chunk_substr_format =
             format!("webpackChunkName: [\"']{}[\"'],? ", config.webpack_chunkname_format);
-        let chunk_substr_regex =
-            if config.webpack_chunkname_format == DEFAULT_WEBPACK_CHUNKNAME_FORMAT {
-                None
-            } else {
-                Regex::new(&chunk_substr_format).ok()
-            };
+        let chunk_substr_regex = if config.webpack_chunkname_format
+            == DEFAULT_WEBPACK_CHUNKNAME_FORMAT
+        {
+            None
+        } else {
+            let compiled_pattern =
+                format!("webpackChunkName: [\"'](?:{})[\"'],? ", config.webpack_chunkname_format);
+            Some(Regex::new(&compiled_pattern).map_err(|err| {
+                serde::de::Error::custom(format!(
+                    "Invalid `webpackChunknameFormat` regex `{}`: {err}",
+                    config.webpack_chunkname_format
+                ))
+            })?)
+        };
         Ok(Self(Box::new(DynamicImportChunknameState {
             config,
             chunk_substr_format,
@@ -351,4 +359,22 @@ fn test() {
     Tester::new(DynamicImportChunkname::NAME, DynamicImportChunkname::PLUGIN, pass, fail)
         .expect_fix(fix)
         .test_and_snapshot();
+}
+
+#[test]
+fn test_invalid_chunkname_format_rejected_and_alternation_grouped() {
+    use serde_json::json;
+
+    let bad =
+        DynamicImportChunkname::from_configuration(json!([{ "webpackChunknameFormat": "(" }]));
+    assert!(bad.is_err(), "invalid webpackChunknameFormat regex must fail closed");
+
+    let grouped = DynamicImportChunkname::from_configuration(json!([{
+        "webpackChunknameFormat": "alpha|beta"
+    }]))
+    .expect("valid alternation format should compile");
+    let re = grouped.chunk_regex();
+    assert!(re.is_match(" webpackChunkName: \"alpha\" "));
+    assert!(re.is_match(" webpackChunkName: \"beta\" "));
+    assert!(!re.is_match(" webpackChunkName: \"beta-unquoted"));
 }
