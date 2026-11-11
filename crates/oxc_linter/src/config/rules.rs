@@ -146,11 +146,24 @@ impl OxlintRules {
                 let severity = rule_config.severity;
 
                 if LintPlugins::try_from(plugin_name).is_ok() {
-                    let rule = rules_map.get(&plugin_name).copied().or_else(|| {
-                        all_rules
-                            .iter()
-                            .find(|r| r.name() == rule_name && r.plugin_name() == plugin_name)
-                    });
+                    let is_aliased_import_rule =
+                        matches!(rule_config.plugin_name.as_str(), "@1js" | "import-js")
+                            && plugin_name == "import";
+                    let rule = rules_map
+                        .get(&plugin_name)
+                        .copied()
+                        .or_else(|| {
+                            all_rules
+                                .iter()
+                                .find(|r| r.name() == rule_name && r.plugin_name() == plugin_name)
+                        })
+                        .or_else(|| {
+                            is_aliased_import_rule.then(|| {
+                                RULES.iter().find(|r| {
+                                    r.name() == rule_name && r.plugin_name() == plugin_name
+                                })
+                            })?
+                        });
                     if let Some(rule) = rule {
                         // If the user provided a non-empty options array for a rule that does not
                         // declare a `config =` type in its declaration, treat this as an invalid

@@ -45,7 +45,6 @@ fn no_relative_packages_diagnostic(
 struct NamedPackage {
     name: String,
     directory: PathBuf,
-    manifest_mtime: Option<std::time::SystemTime>,
 }
 
 #[derive(Deserialize)]
@@ -53,22 +52,22 @@ struct PackageJsonName {
     name: Option<String>,
 }
 
+type ManifestChecks = Arc<[(PathBuf, Option<std::time::SystemTime>)]>;
+
 #[derive(Clone)]
 struct CachedPackageEntry {
     package: Option<Arc<NamedPackage>>,
-    local_pkg_mtime: Option<std::time::SystemTime>,
+    manifest_checks: ManifestChecks,
 }
 
 fn file_mtime(path: &Path) -> Option<std::time::SystemTime> {
     fs::metadata(path).ok()?.modified().ok()
 }
 
-fn read_package_name(pkg_json_path: &Path) -> Option<(String, Option<std::time::SystemTime>)> {
-    let mtime = file_mtime(pkg_json_path);
+fn read_package_name(pkg_json_path: &Path) -> Option<String> {
     let bytes = fs::read(pkg_json_path).ok()?;
     let parsed: PackageJsonName = serde_json::from_slice(&bytes).ok()?;
-    let name = parsed.name.filter(|name| !name.is_empty())?;
-    Some((name, mtime))
+    parsed.name.filter(|name| !name.is_empty())
 }
 
 #[derive(Debug, Default, Clone)]
@@ -129,57 +128,57 @@ impl NoRelativePackagesState {
         Self { config, ignore_regexes, package_cache, resolver }
     }
 
-    fn is_cached_entry_fresh(dir: &Path, entry: &CachedPackageEntry) -> bool {
-        let local_pkg = dir.join("package.json");
-        if file_mtime(&local_pkg) != entry.local_pkg_mtime {
-            return false;
-        }
-        if let Some(pkg) = &entry.package {
-            let manifest_path = pkg.directory.join("package.json");
-            if file_mtime(&manifest_path) != pkg.manifest_mtime {
-                return false;
-            }
-        }
-        true
+    fn is_cached_entry_fresh(entry: &CachedPackageEntry) -> bool {
+        entry
+            .manifest_checks
+            .iter()
+            .all(|(manifest_path, expected_mtime)| file_mtime(manifest_path) == *expected_mtime)
     }
 
     fn find_named_package(&self, start_dir: &Path) -> Option<Arc<NamedPackage>> {
         let cache = self.package_cache.pin();
         if let Some(cached) = cache.get(start_dir)
-            && Self::is_cached_entry_fresh(start_dir, cached)
+            && Self::is_cached_entry_fresh(cached)
         {
             return cached.package.clone();
         }
 
         let mut visited: SmallVec<[(PathBuf, Option<std::time::SystemTime>); 8]> = SmallVec::new();
+        let mut tail_checks: Option<ManifestChecks> = None;
         let mut current = Some(start_dir);
         let mut found = None;
 
         while let Some(dir) = current {
             if let Some(cached) = cache.get(dir)
-                && Self::is_cached_entry_fresh(dir, cached)
+                && Self::is_cached_entry_fresh(cached)
             {
                 found.clone_from(&cached.package);
+                tail_checks = Some(Arc::clone(&cached.manifest_checks));
                 break;
             }
             let pkg_json_path = dir.join("package.json");
             let local_mtime = file_mtime(&pkg_json_path);
             visited.push((dir.to_path_buf(), local_mtime));
             if local_mtime.is_some()
-                && let Some((name, manifest_mtime)) = read_package_name(&pkg_json_path)
+                && let Some(name) = read_package_name(&pkg_json_path)
             {
-                found = Some(Arc::new(NamedPackage {
-                    name,
-                    directory: dir.to_path_buf(),
-                    manifest_mtime,
-                }));
+                found = Some(Arc::new(NamedPackage { name, directory: dir.to_path_buf() }));
                 break;
             }
             current = dir.parent();
         }
 
-        for (dir, local_pkg_mtime) in visited {
-            cache.insert(dir, CachedPackageEntry { package: found.clone(), local_pkg_mtime });
+        for idx in 0..visited.len() {
+            let dir = visited[idx].0.clone();
+            let mut checks: Vec<(PathBuf, Option<std::time::SystemTime>)> =
+                visited[idx..].iter().map(|(d, mtime)| (d.join("package.json"), *mtime)).collect();
+            if let Some(tail) = &tail_checks {
+                checks.extend(tail.iter().cloned());
+            }
+            cache.insert(
+                dir,
+                CachedPackageEntry { package: found.clone(), manifest_checks: checks.into() },
+            );
         }
 
         found
@@ -234,7 +233,7 @@ declare_oxc_lint!(
     NoRelativePackages,
     import,
     restriction,
-    fix,
+    conditional_fix_suggestion,
     config = NoRelativePackagesConfig,
     version = "1.93.0",
     short_description = "Forbid importing packages through relative paths.",
@@ -347,10 +346,19 @@ impl NoRelativePackages {
             );
             let replacement = serde_json::to_string(&proper_import)
                 .unwrap_or_else(|_| format!("\"{proper_import}\""));
-            ctx.diagnostic_with_fix(
-                no_relative_packages_diagnostic(span, &proper_import, import_path),
-                |fixer| fixer.replace(span, replacement),
-            );
+            let is_verified_safe = self
+                .0
+                .resolver
+                .resolve(context_dir, &proper_import)
+                .is_ok_and(|res| res.full_path() == resolved_import.as_ref());
+            let diagnostic = no_relative_packages_diagnostic(span, &proper_import, import_path);
+            if is_verified_safe {
+                ctx.diagnostic_with_fix(diagnostic, |fixer| fixer.replace(span, replacement));
+            } else {
+                ctx.diagnostic_with_suggestion(diagnostic, |fixer| {
+                    fixer.replace(span, replacement)
+                });
+            }
         }
     }
 }
@@ -476,7 +484,6 @@ fn test_compute_proper_import_directory_index() {
     let pkg = NamedPackage {
         name: "package-named".to_string(),
         directory: PathBuf::from("/workspace/packages/pkg"),
-        manifest_mtime: None,
     };
     let context_dir = Path::new("/workspace/packages/app");
     let resolved_dir_index = Path::new("/workspace/packages/pkg/src/index.js");
@@ -506,4 +513,33 @@ fn test_compute_proper_import_directory_index() {
         ),
         "package-named/src/pkg"
     );
+}
+
+#[test]
+fn test_intermediate_manifest_creation_invalidates_package_cache() {
+    let root_dir = std::env::temp_dir().join(format!(
+        "oxc_no_relative_packages_test_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let app_dir = root_dir.join("packages").join("app");
+    let src_dir = app_dir.join("src");
+    fs::create_dir_all(&src_dir).unwrap();
+    fs::write(root_dir.join("package.json"), r#"{"name": "monorepo-root"}"#).unwrap();
+
+    let state = NoRelativePackagesState::default();
+    let first = state.find_named_package(&src_dir).expect("should find root package");
+    assert_eq!(first.name, "monorepo-root");
+
+    // Creating an intermediate package.json under `packages/app` must invalidate the cached
+    // lookup for `packages/app/src` even though neither `src/package.json` nor `root/package.json` changed.
+    fs::write(app_dir.join("package.json"), r#"{"name": "nested-app"}"#).unwrap();
+    let second =
+        state.find_named_package(&src_dir).expect("should find newly created nested package");
+    assert_eq!(second.name, "nested-app");
+
+    let _ = fs::remove_dir_all(&root_dir);
 }
