@@ -117,6 +117,7 @@ struct CompoundSelector {
     type_constraint: NodeTypeConstraint,
     matches_alternatives: Vec<Vec<SelectorChain>>,
     not_alternatives: Vec<SelectorChain>,
+    has_alternatives: Vec<Vec<SelectorChain>>,
     attributes: Vec<AttrPredicate>,
 }
 
@@ -167,6 +168,11 @@ impl CompoundSelector {
                 return false;
             }
         }
+        for group in &self.has_alternatives {
+            if !group.iter().any(|alt| alt.matches_within(node, ctx)) {
+                return false;
+            }
+        }
         true
     }
 }
@@ -192,6 +198,107 @@ impl SelectorChain {
             return true;
         }
         Self::match_ancestors(&self.ancestors, node, ctx)
+    }
+
+    fn matches_within<'a>(&self, root: &AstNode<'a>, ctx: &LintContext<'a>) -> bool {
+        let nodes = ctx.nodes();
+        let root_id = root.id();
+        let root_span = root.kind().span();
+        for candidate in nodes {
+            if candidate.id() == root_id {
+                continue;
+            }
+            let cand_span = candidate.kind().span();
+            if cand_span.start < root_span.start || cand_span.end > root_span.end {
+                continue;
+            }
+            if !Self::is_descendant_of(candidate, root_id, nodes) {
+                continue;
+            }
+            if !self.head.matches_node(candidate, ctx) {
+                continue;
+            }
+            if self.ancestors.is_empty()
+                || Self::match_ancestors_bounded(&self.ancestors, candidate, root_id, ctx)
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn is_descendant_of(
+        candidate: &AstNode<'_>,
+        root_id: oxc_syntax::node::NodeId,
+        nodes: &oxc_semantic::AstNodes<'_>,
+    ) -> bool {
+        let mut parent_id = nodes.parent_id(candidate.id());
+        let mut prev_id = candidate.id();
+        while parent_id != prev_id {
+            if parent_id == root_id {
+                return true;
+            }
+            prev_id = parent_id;
+            parent_id = nodes.parent_id(parent_id);
+        }
+        false
+    }
+
+    fn match_ancestors_bounded<'a>(
+        remaining: &[(Combinator, CompoundSelector)],
+        current: &AstNode<'a>,
+        root_id: oxc_syntax::node::NodeId,
+        ctx: &LintContext<'a>,
+    ) -> bool {
+        let Some(((combinator, selector), rest)) = remaining.split_first() else {
+            return true;
+        };
+        let nodes = ctx.nodes();
+        match combinator {
+            Combinator::Child => {
+                let mut parent_id = nodes.parent_id(current.id());
+                while parent_id != current.id() {
+                    let parent = nodes.get_node(parent_id);
+                    if matches!(
+                        parent.kind(),
+                        AstKind::ParenthesizedExpression(_) | AstKind::ChainExpression(_)
+                    ) {
+                        let next_id = nodes.parent_id(parent_id);
+                        if next_id == parent_id {
+                            return false;
+                        }
+                        parent_id = next_id;
+                        continue;
+                    }
+                    if parent_id != root_id && !Self::is_descendant_of(parent, root_id, nodes) {
+                        return false;
+                    }
+                    return selector.matches_node(parent, ctx)
+                        && (rest.is_empty()
+                            || Self::match_ancestors_bounded(rest, parent, root_id, ctx));
+                }
+                false
+            }
+            Combinator::Descendant => {
+                let mut parent_id = nodes.parent_id(current.id());
+                let mut prev_id = current.id();
+                while parent_id != prev_id {
+                    let parent = nodes.get_node(parent_id);
+                    if selector.matches_node(parent, ctx)
+                        && (rest.is_empty()
+                            || Self::match_ancestors_bounded(rest, parent, root_id, ctx))
+                    {
+                        return true;
+                    }
+                    if parent_id == root_id {
+                        break;
+                    }
+                    prev_id = parent_id;
+                    parent_id = nodes.parent_id(parent_id);
+                }
+                false
+            }
+        }
     }
 
     fn match_ancestors<'a>(
@@ -310,23 +417,25 @@ declare_oxc_lint!(
 impl Rule for NoRestrictedSyntax {
     fn from_configuration(value: Value) -> Result<Self, serde_json::error::Error> {
         let mut raw_items = Vec::new();
-        if let Value::Array(arr) = value {
-            for elem in arr {
-                match elem {
-                    Value::Array(nested) => {
-                        for inner in nested {
-                            if let Ok(item) = serde_json::from_value::<RestrictedSyntaxItem>(inner)
-                            {
-                                raw_items.push(item);
+        match value {
+            Value::Null => {}
+            Value::Array(arr) => {
+                for elem in arr {
+                    match elem {
+                        Value::Array(nested) => {
+                            for inner in nested {
+                                raw_items
+                                    .push(serde_json::from_value::<RestrictedSyntaxItem>(inner)?);
                             }
                         }
-                    }
-                    other => {
-                        if let Ok(item) = serde_json::from_value::<RestrictedSyntaxItem>(other) {
-                            raw_items.push(item);
+                        other => {
+                            raw_items.push(serde_json::from_value::<RestrictedSyntaxItem>(other)?);
                         }
                     }
                 }
+            }
+            other => {
+                raw_items.push(serde_json::from_value::<RestrictedSyntaxItem>(other)?);
             }
         }
 
@@ -338,21 +447,24 @@ impl Rule for NoRestrictedSyntax {
             };
             let message =
                 custom_message.unwrap_or_else(|| format!("Using '{raw_selector}' is not allowed."));
-            if let Some(chains) = parse_selector_list(&raw_selector) {
-                let pattern_idx = rule.patterns.len();
-                for (chain_idx, chain) in chains.iter().enumerate() {
-                    if let Some(types) = chain.target_types() {
-                        for ty in &types {
-                            rule.target_types.set(ty);
-                            rule.by_type[ty as usize].push((pattern_idx, chain_idx));
-                        }
-                    } else {
-                        rule.has_unbounded_selector = true;
-                        rule.unbounded_chains.push((pattern_idx, chain_idx));
+            let chains = parse_selector_list(&raw_selector).ok_or_else(|| {
+                serde::de::Error::custom(format!(
+                    "Invalid or unsupported ESQuery selector `{raw_selector}`"
+                ))
+            })?;
+            let pattern_idx = rule.patterns.len();
+            for (chain_idx, chain) in chains.iter().enumerate() {
+                if let Some(types) = chain.target_types() {
+                    for ty in &types {
+                        rule.target_types.set(ty);
+                        rule.by_type[ty as usize].push((pattern_idx, chain_idx));
                     }
+                } else {
+                    rule.has_unbounded_selector = true;
+                    rule.unbounded_chains.push((pattern_idx, chain_idx));
                 }
-                rule.patterns.push(CompiledPattern { chains, message });
             }
+            rule.patterns.push(CompiledPattern { chains, message });
         }
 
         Ok(Self(Box::new(rule)))
@@ -1695,6 +1807,13 @@ fn parse_selector_chain(input: &str) -> Option<SelectorChain> {
     Some(SelectorChain { head, ancestors })
 }
 
+#[derive(Debug, Clone, Copy)]
+enum PseudoKind {
+    Matches,
+    Not,
+    Has,
+}
+
 fn parse_compound_selector(input: &str) -> Option<CompoundSelector> {
     let input = input.trim();
     if input.is_empty() {
@@ -1711,18 +1830,21 @@ fn parse_compound_selector(input: &str) -> Option<CompoundSelector> {
 
     let mut matches_alternatives = Vec::new();
     let mut not_alternatives = Vec::new();
+    let mut has_alternatives = Vec::new();
     let mut attributes = Vec::new();
 
     while pos < bytes.len() {
         match bytes[pos] {
             b':' => {
                 let rest = &input[pos + 1..];
-                let (is_matches, after_name) = if let Some(s) = rest.strip_prefix("matches(") {
-                    (true, s)
+                let (pseudo_kind, after_name) = if let Some(s) = rest.strip_prefix("matches(") {
+                    (PseudoKind::Matches, s)
                 } else if let Some(s) = rest.strip_prefix("is(") {
-                    (true, s)
+                    (PseudoKind::Matches, s)
                 } else if let Some(s) = rest.strip_prefix("not(") {
-                    (false, s)
+                    (PseudoKind::Not, s)
+                } else if let Some(s) = rest.strip_prefix("has(") {
+                    (PseudoKind::Has, s)
                 } else {
                     return None;
                 };
@@ -1731,10 +1853,10 @@ fn parse_compound_selector(input: &str) -> Option<CompoundSelector> {
                 let close_offset = find_matching_delim(&input[open_paren_end..], '(', ')')?;
                 let inner = &input[open_paren_end..open_paren_end + close_offset];
                 let chains = parse_selector_list(inner)?;
-                if is_matches {
-                    matches_alternatives.push(chains);
-                } else {
-                    not_alternatives.extend(chains);
+                match pseudo_kind {
+                    PseudoKind::Matches => matches_alternatives.push(chains),
+                    PseudoKind::Not => not_alternatives.extend(chains),
+                    PseudoKind::Has => has_alternatives.push(chains),
                 }
                 pos = open_paren_end + close_offset + 1;
             }
@@ -1752,7 +1874,13 @@ fn parse_compound_selector(input: &str) -> Option<CompoundSelector> {
         }
     }
 
-    Some(CompoundSelector { type_constraint, matches_alternatives, not_alternatives, attributes })
+    Some(CompoundSelector {
+        type_constraint,
+        matches_alternatives,
+        not_alternatives,
+        has_alternatives,
+        attributes,
+    })
 }
 
 fn find_matching_delim(input: &str, open: char, close: char) -> Option<usize> {
@@ -2060,4 +2188,19 @@ fn test() {
 
     Tester::new(NoRestrictedSyntax::NAME, NoRestrictedSyntax::PLUGIN, pass, fail)
         .test_and_snapshot();
+}
+
+#[test]
+fn test_has_pseudo_and_rejects_unsupported_selector() {
+    use serde_json::json;
+
+    let rule = NoRestrictedSyntax::from_configuration(json!([
+        "CallExpression:has(Identifier[name='eval'])"
+    ]))
+    .expect(":has() selector should compile");
+    assert_eq!(rule.0.patterns.len(), 1);
+
+    let err =
+        NoRestrictedSyntax::from_configuration(json!(["CallExpression:unknownPseudo(Identifier)"]));
+    assert!(err.is_err(), "unsupported selector syntax must fail closed in from_configuration");
 }

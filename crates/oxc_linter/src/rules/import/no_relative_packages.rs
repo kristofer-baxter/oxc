@@ -316,6 +316,7 @@ fn compute_proper_import(
 
     let mut result = import_pkg.name.clone();
 
+    let mut dir_parts: Vec<&str> = Vec::new();
     if let Ok(proper_path) = resolved_import.strip_prefix(import_root)
         && let Some(proper_dir) = proper_path.parent()
     {
@@ -324,13 +325,24 @@ fn compute_proper_import(
                 && let Some(part_str) = part.to_str()
                 && !part_str.is_empty()
             {
-                result.push('/');
-                result.push_str(part_str);
+                dir_parts.push(part_str);
             }
         }
     }
 
-    if import_base_name != import_root_base_name
+    let resolved_file_stem = resolved_import.file_stem().and_then(OsStr::to_str).unwrap_or("");
+    let is_directory_index_import = resolved_file_stem == "index"
+        && import_base_name != "index"
+        && !import_base_name.starts_with("index.")
+        && dir_parts.last().copied() == Some(import_base_name);
+
+    for part_str in &dir_parts {
+        result.push('/');
+        result.push_str(part_str);
+    }
+
+    if !is_directory_index_import
+        && import_base_name != import_root_base_name
         && !import_base_name.is_empty()
         && import_base_name != "."
         && import_base_name != ".."
@@ -375,4 +387,18 @@ fn test() {
         .change_rule_path("index.js")
         .with_import_plugin(true)
         .test_and_snapshot();
+}
+
+#[test]
+fn test_compute_proper_import_directory_index() {
+    let pkg = NamedPackage {
+        name: "package-named".to_string(),
+        directory: PathBuf::from("/workspace/packages/pkg"),
+    };
+    let resolved_dir_index = Path::new("/workspace/packages/pkg/src/index.js");
+    assert_eq!(compute_proper_import(&pkg, "../pkg/src", resolved_dir_index), "package-named/src");
+    assert_eq!(
+        compute_proper_import(&pkg, "../pkg/src/index.js", resolved_dir_index),
+        "package-named/src/index.js"
+    );
 }
