@@ -146,9 +146,8 @@ impl OxlintRules {
                 let severity = rule_config.severity;
 
                 if LintPlugins::try_from(plugin_name).is_ok() {
-                    let is_aliased_import_rule =
-                        matches!(rule_config.plugin_name.as_str(), "@1js" | "import-js")
-                            && plugin_name == "import";
+                    let is_native_aliased_import_rule = plugin_name == "import"
+                        && matches!(rule_name, "no-relative-packages" | "dynamic-import-chunkname");
                     let rule = rules_map
                         .get(&plugin_name)
                         .copied()
@@ -158,7 +157,7 @@ impl OxlintRules {
                                 .find(|r| r.name() == rule_name && r.plugin_name() == plugin_name)
                         })
                         .or_else(|| {
-                            is_aliased_import_rule.then(|| {
+                            is_native_aliased_import_rule.then(|| {
                                 RULES.iter().find(|r| {
                                     r.name() == rule_name && r.plugin_name() == plugin_name
                                 })

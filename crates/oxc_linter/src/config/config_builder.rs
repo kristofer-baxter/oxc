@@ -964,6 +964,36 @@ mod test {
                 .any(|(r, _)| r.plugin_name() == "import" && r.name() == "no-relative-packages"),
             "Explicit import-js/no-relative-packages alias filter should enable the rule"
         );
+
+        let oxlintrc: Oxlintrc = serde_json::from_value(serde_json::json!({
+            "rules": {
+                "import-js/no-relative-packages": "error",
+                "@1js/dynamic-import-chunkname": "warn"
+            }
+        }))
+        .unwrap();
+        let from_rc = ConfigStoreBuilder::from_oxlintrc(
+            false,
+            oxlintrc,
+            None,
+            &mut external_plugin_store,
+            None,
+        )
+        .unwrap()
+        .build(&mut external_plugin_store)
+        .unwrap();
+        assert!(
+            from_rc
+                .rules()
+                .iter()
+                .any(|(r, _)| r.plugin_name() == "import" && r.name() == "no-relative-packages"),
+            ".oxlintrc import-js/no-relative-packages should load even when import plugin is not in plugins[]"
+        );
+        assert!(
+            from_rc.rules().iter().any(|(r, _)| r.plugin_name() == "import"
+                && r.name() == "dynamic-import-chunkname"),
+            ".oxlintrc @1js/dynamic-import-chunkname should load even when import plugin is not in plugins[]"
+        );
     }
 
     #[test]
