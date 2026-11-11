@@ -9,7 +9,8 @@ use oxc_ast::{
         ImportOrExportKind, JSXAttributeItem, JSXAttributeName, JSXAttributeValue, JSXChild,
         JSXElementName, JSXMemberExpressionObject, MethodDefinitionKind, ModuleExportName,
         ObjectPropertyKind, PropertyKey, PropertyKind, SimpleAssignmentTarget, Statement,
-        SwitchCase, TSEnumMember, TSModuleReference, TemplateElement, VariableDeclarator,
+        SwitchCase, TSEnumMember, TSImportTypeQualifier, TSModuleReference, TSTypeName,
+        TemplateElement, VariableDeclarator,
     },
     ast_kind::{AST_TYPE_MAX, AstType},
 };
@@ -134,8 +135,7 @@ fn is_estree_transparent_wrapper(kind: AstKind<'_>) -> bool {
         | AstKind::FormalParameters(_)
         | AstKind::CatchParameter(_)
         | AstKind::Elision(_)
-        | AstKind::WithClause(_)
-        | AstKind::TSImportTypeQualifiedName(_) => true,
+        | AstKind::WithClause(_) => true,
         AstKind::FormalParameter(param) => !param.has_modifier() && param.initializer.is_none(),
         _ => false,
     }
@@ -2252,7 +2252,51 @@ fn get_ast_kind_prop<'a>(kind: AstKind<'a>, segment: &str) -> Option<PropValue<'
             "declare" => Some(PropValue::Bool(decl.declare)),
             _ => None,
         },
+        AstKind::TSTypeReference(r) => match segment {
+            "typeName" => Some(match &r.type_name {
+                TSTypeName::IdentifierReference(id) => {
+                    PropValue::AstKind(AstKind::IdentifierReference(id))
+                }
+                TSTypeName::QualifiedName(q) => PropValue::AstKind(AstKind::TSQualifiedName(q)),
+                TSTypeName::ThisExpression(t) => PropValue::AstKind(AstKind::ThisExpression(t)),
+            }),
+            _ => None,
+        },
         AstKind::TSQualifiedName(q) => match segment {
+            "left" => Some(match &q.left {
+                TSTypeName::IdentifierReference(id) => {
+                    PropValue::AstKind(AstKind::IdentifierReference(id))
+                }
+                TSTypeName::QualifiedName(inner) => {
+                    PropValue::AstKind(AstKind::TSQualifiedName(inner))
+                }
+                TSTypeName::ThisExpression(t) => PropValue::AstKind(AstKind::ThisExpression(t)),
+            }),
+            "right" => Some(PropValue::AstKind(AstKind::IdentifierName(&q.right))),
+            _ => None,
+        },
+        AstKind::TSImportType(imp) => match segment {
+            "source" => Some(PropValue::AstKind(AstKind::StringLiteral(&imp.source))),
+            "qualifier" => Some(match &imp.qualifier {
+                Some(TSImportTypeQualifier::Identifier(id)) => {
+                    PropValue::AstKind(AstKind::IdentifierName(id))
+                }
+                Some(TSImportTypeQualifier::QualifiedName(q)) => {
+                    PropValue::AstKind(AstKind::TSImportTypeQualifiedName(q))
+                }
+                None => PropValue::Null,
+            }),
+            _ => None,
+        },
+        AstKind::TSImportTypeQualifiedName(q) => match segment {
+            "left" => Some(match &q.left {
+                TSImportTypeQualifier::Identifier(id) => {
+                    PropValue::AstKind(AstKind::IdentifierName(id))
+                }
+                TSImportTypeQualifier::QualifiedName(inner) => {
+                    PropValue::AstKind(AstKind::TSImportTypeQualifiedName(inner))
+                }
+            }),
             "right" => Some(PropValue::AstKind(AstKind::IdentifierName(&q.right))),
             _ => None,
         },
@@ -2700,7 +2744,7 @@ fn parse_node_type_constraint(type_name: &str) -> Option<NodeTypeConstraint> {
         "TSObjectKeyword" => &[AstType::TSObjectKeyword],
         "TSBigIntKeyword" => &[AstType::TSBigIntKeyword],
         "TSTypeReference" => &[AstType::TSTypeReference],
-        "TSQualifiedName" => &[AstType::TSQualifiedName],
+        "TSQualifiedName" => &[AstType::TSQualifiedName, AstType::TSImportTypeQualifiedName],
         "TSTypeParameterInstantiation" => &[AstType::TSTypeParameterInstantiation],
         "TSTypeParameter" => &[AstType::TSTypeParameter],
         "TSTypeParameterDeclaration" => &[AstType::TSTypeParameterDeclaration],
@@ -3128,6 +3172,8 @@ fn is_supported_attr_segment(segment: &str) -> bool {
             | "const"
             | "initializer"
             | "sourceType"
+            | "typeName"
+            | "qualifier"
     )
 }
 
@@ -3464,6 +3510,11 @@ fn test_estree_normalization_and_deduplication() {
         (r"function f() { return 1; }", Some(json!(["FunctionDeclaration > BlockStatement"]))),
         (r"foo(eval('x'));", Some(json!(["CallExpression:has(Identifier[name='eval'])"]))),
         (r"type T = string | number;", Some(json!(["*[type='TSUnionType']"]))),
+        (r"type T = Foo.Bar;", Some(json!(["TSQualifiedName[left.name='Foo']"]))),
+        (
+            r#"type T = import("./module").a.b;"#,
+            Some(json!(["TSQualifiedName[left.name='a'][right.name='b']"])),
+        ),
     ];
 
     Tester::new(NoRestrictedSyntax::NAME, NoRestrictedSyntax::PLUGIN, pass, fail).test();
