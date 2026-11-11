@@ -234,6 +234,39 @@ fn annex_b_aliases_keep_resolved_reference_membership_consistent() {
 }
 
 #[test]
+fn annex_b_aliases_cross_simple_catch_bindings() {
+    for source in [
+        "function run(){var value='outer',count=1;try{throw'catch'}catch(value){{let other=1;function value(){}console.log(other)}}console.log(typeof value,typeof count)}run();",
+        "function run(){var value='outer';try{throw'catch'}catch(value){{let other=1;function value(){}console.log(other)}console.log(value)}console.log(typeof value)}run();",
+        "function run(){var value='outer',count=1;try{throw'catch'}catch(value){try{throw'nested'}catch(value){{let other=1;function value(){}console.log(other)}}console.log(value)}console.log(typeof value,typeof count)}run();",
+        "function run(){var value='outer',count=1;try{throw{value:'catch'}}catch({value}){{let other=1;function value(){}console.log(other)}console.log(value)}console.log(typeof value,typeof count)}run();",
+        "function run(){var value='outer',count=1;{let value=globalThis.first;globalThis.read=()=>value;value=globalThis.second;{let other=1;function value(){}console.log(other)}console.log(value)}console.log(typeof value,typeof count)}run();",
+        "function run(value){var count=1;{let other=1;function value(){}console.log(other)}console.log(typeof value,typeof count)}run('outer');",
+    ] {
+        let execute = |code: &str| {
+            let output = Command::new("node")
+                .args(["--input-type=commonjs", "--eval", code])
+                .output()
+                .expect("Node.js is required to verify Annex B catch bindings");
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            output.stdout
+        };
+        let expected = execute(source);
+        for keep_names in [false, true] {
+            for compress in [None, Some(CompressOptions::smallest())] {
+                let minified =
+                    minify_with_compression(source, SourceType::script(), keep_names, compress);
+                assert_eq!(
+                    execute(&minified),
+                    expected,
+                    "keep_names={keep_names}, source={source}\n{minified}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn substituted_iife_arguments_preserve_tdz_exceptions() {
     for source in [
         "function use(value) {} use((x => x)(void later)); let later = 1;",

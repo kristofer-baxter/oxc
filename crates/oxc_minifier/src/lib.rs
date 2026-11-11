@@ -192,7 +192,10 @@ impl<'a> Minifier {
                 }
                 let mut semantic = builder.build(program).semantic;
                 let mut options = options;
-                let aliased = annex_b_alias::alias_annex_b_block_functions(&mut semantic);
+                let aliased = annex_b_alias::alias_annex_b_block_functions(
+                    &mut semantic,
+                    &mut options.reserved,
+                );
                 if options.keep_names.function {
                     options.reserved.extend(aliased);
                     reserve_function_names(&semantic, &mut options.reserved);

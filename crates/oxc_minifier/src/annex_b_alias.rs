@@ -12,6 +12,8 @@
 //!
 //! `keep_names` keeps a symbol by its first declaration, which is no longer
 //! the function after aliasing, so the caller reserves the returned names.
+//! Names that block an Annex B copy are always reserved so mangling cannot
+//! introduce the copy by separating a function from its lexical barrier.
 
 use oxc_ast::AstKind;
 use oxc_semantic::{AstNodes, Scoping, Semantic};
@@ -21,8 +23,12 @@ use oxc_syntax::{
     scope::ScopeId,
     symbol::{SymbolFlags, SymbolId},
 };
+use rustc_hash::FxHashSet;
 
-pub fn alias_annex_b_block_functions(semantic: &mut Semantic<'_>) -> std::vec::Vec<CompactStr> {
+pub fn alias_annex_b_block_functions(
+    semantic: &mut Semantic<'_>,
+    reserved: &mut FxHashSet<CompactStr>,
+) -> std::vec::Vec<CompactStr> {
     let mut names = std::vec![];
     if semantic.source_type().is_strict() {
         return names;
@@ -31,7 +37,8 @@ pub fn alias_annex_b_block_functions(semantic: &mut Semantic<'_>) -> std::vec::V
     let aliases: std::vec::Vec<_> = scoping
         .symbol_ids()
         .filter_map(|block_function| {
-            annex_b_binding(scoping, nodes, block_function).map(|binding| (block_function, binding))
+            annex_b_binding(scoping, nodes, block_function, reserved)
+                .map(|binding| (block_function, binding))
         })
         .collect();
     for (block_function, binding) in aliases {
@@ -48,6 +55,7 @@ fn annex_b_binding(
     scoping: &Scoping,
     nodes: &AstNodes<'_>,
     symbol_id: SymbolId,
+    reserved: &mut FxHashSet<CompactStr>,
 ) -> Option<SymbolId> {
     if !is_plain_function(scoping.symbol_flags(symbol_id)) {
         return None;
@@ -59,21 +67,26 @@ fn annex_b_binding(
     }
     let name = scoping.symbol_ident(symbol_id);
     if name == "arguments" {
+        reserved.insert(CompactStr::from(name.as_str()));
         return None;
     }
-    // Annex B skips the function when a binding of its name (a lexical one or
-    // a catch parameter) sits between its block and the var scope. An
-    // enclosing block's plain function of that name does not stop it.
+    // Intervening lexical bindings block the Annex B copy. Plain functions and
+    // simple catch parameters do not; destructured catch parameters remain lexical.
     let mut var_scope_id: Option<ScopeId> = None;
     for scope_id in scoping.scope_ancestors(block_scope_id).skip(1) {
         if scoping.scope_flags(scope_id).is_var() {
             var_scope_id = Some(scope_id);
             break;
         }
-        if let Some(enclosing) = scoping.get_binding(scope_id, name)
-            && !is_plain_function(scoping.symbol_flags(enclosing))
-        {
-            return None;
+        if let Some(enclosing) = scoping.get_binding(scope_id, name) {
+            let flags = scoping.symbol_flags(enclosing);
+            if !is_plain_function(flags)
+                && !flags.contains(SymbolFlags::CatchVariable | SymbolFlags::FunctionScopedVariable)
+            {
+                // Keep both names so renaming cannot introduce a previously blocked copy.
+                reserved.insert(CompactStr::from(name.as_str()));
+                return None;
+            }
         }
     }
     let binding = scoping.get_binding(var_scope_id?, name)?;
@@ -84,6 +97,7 @@ fn annex_b_binding(
         || !binding_flags.intersects(SymbolFlags::Function | SymbolFlags::FunctionScopedVariable)
         || scoping.symbol_declarations(binding).any(|node_id| is_parameter(nodes, node_id))
     {
+        reserved.insert(CompactStr::from(name.as_str()));
         return None;
     }
     Some(binding)
