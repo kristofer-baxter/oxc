@@ -276,7 +276,7 @@ fn test_template_literal_drop_walks_removed_element_refs() {
     let options = CompressOptions::smallest();
     test_options(
         "function f() { let p = 'metric'; let t = { [`${p}_x`]: 0, [`${p}_y`]: 0 }; void t; return 1; } g(f());",
-        "function f() { return 1; } g(f());",
+        "g(1);",
         &options,
     );
 }
@@ -299,7 +299,7 @@ fn test_array_spread_drop_walks_argument_refs() {
     let options = CompressOptions::smallest();
     test_options(
         "function f() { let p = 'metric'; [...[p, , , p]]; return 1; } g(f());",
-        "function f() { return 1; } g(f());",
+        "g(1);",
         &options,
     );
 }
@@ -530,7 +530,7 @@ fn test_fold_call_expression() {
 
     test("var foo = () => 1; foo(), foo()", "var foo = () => 1");
     test_same("var foo = () => { bar() }; foo(), foo()");
-    test_same("const a = (x) => x, b = () => a(1);");
+    test("const a = (x) => x, b = () => a(1);", "const a = (x) => x, b = () => 1;");
 }
 
 #[test]
@@ -544,7 +544,7 @@ fn test_fold_iife() {
     test("(() => { return a() })()", "a();");
     test("(a => {})()", "");
     test_same("((a = foo()) => {})()");
-    test_same("(a => { a() })()");
+    test("(a => { a() })()", "(void 0)();");
     test("((...a) => {})()", "");
     test_same("((...a) => { a() })()");
     test("(() => { let b = a; b() })()", "a();");
@@ -571,23 +571,23 @@ fn test_fold_iife() {
     );
     test_same("(() => { 'use cache'; return a() })()");
 
-    test_same("var a = (function () { b() })()");
+    test("var a = (function () { b() })()", "var a = (b(), void 0);");
     test_same("var a = (function () { return b() })()");
     test_same("var a = (function () { return this })()");
     test_same("var a = (function () { return arguments })()");
     test_same("var a = (function () { return new.target })()");
-    test_same("var a = (function () { return !0 })()");
-    test_same("a((function () { return !0 })());");
+    test("var a = (function () { return !0 })()", "var a = !0;");
+    test("a((function () { return !0 })());", "a(!0);");
     test("(function() {})()", "");
     test("(function*() {})()", "");
     test("(async function() {})()", "");
-    test_same("(function() { a() })()");
+    test("(function() { a() })()", "a();");
     test_same("(function*() { a() })()");
     test_same("(async function() { a() })()");
 
     test("(() => x)()", "x;");
     test("(() => { return x })()", "x;");
-    test_same("(function () { return x })()");
+    test("(function () { return x })()", "x;");
 
     test("(() => o.f)()()", "(0, o.f)()");
     test("(() => { return o.f })()()", "(0, o.f)()");
@@ -670,10 +670,10 @@ fn test_remove_side_effect_free_iife() {
     let remove = CompressOptions { unused: CompressOptionsUnused::Remove, ..default_options() };
     test_options("var unused = (function () { function test() {} return test })()", "", &remove);
 
-    // Negative cases — the call has real side effects and must be kept.
-    test_same("(function () { sideEffect() })()"); // global call in body
-    test_same("(function () { return sideEffect() })()"); // global call in return
-    test_same("(function () { globalRead })()"); // global read can throw ReferenceError
+    // Inlining preserves calls and observable global reads.
+    test("(function () { sideEffect() })()", "sideEffect();");
+    test("(function () { return sideEffect() })()", "sideEffect();");
+    test("(function () { globalRead })()", "globalRead;");
     test_same("(function () { throw 1 })()"); // throws
     test_same("(function () { for (;;) sideEffect() })()"); // loop body
     test_same("(function (a) { return a })(sideEffect())"); // side-effect-bearing argument
@@ -1112,10 +1112,10 @@ fn test_drop_write_only_property_assignments_by_default() {
     // Headline: one `displayName` write must not keep an entire module alive.
     // (The `(function(){...})()` wrapper itself survives only because plain-
     // function IIFE inlining is a separate, pre-existing limitation —
-    // `substitute_iife_call` unwraps arrow bodies only.)
+    // Both regular and arrow IIFEs preserve the required module load.)
     test_smallest(
         "(function() { var r = require('react'); var o = function(e, t) { return r.create(e, t); }; o.displayName = 'X'; })();",
-        "(function() { require('react'); })();",
+        "require('react');",
     );
     test_smallest(
         "(() => { var r = require('react'); var o = function(e, t) { return r.create(e, t); }; o.displayName = 'X'; })();",

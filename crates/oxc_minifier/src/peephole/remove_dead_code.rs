@@ -2,7 +2,10 @@ use crate::generated::ancestor::Ancestor;
 use oxc_allocator::{ArenaVec, TakeIn};
 use oxc_ast::ast::*;
 use oxc_ast_visit::VisitJs;
-use oxc_ecmascript::{constant_evaluation::ConstantEvaluation, side_effects::MayHaveSideEffects};
+use oxc_ecmascript::{
+    constant_evaluation::{ConstantEvaluation, ConstantValue},
+    side_effects::MayHaveSideEffects,
+};
 use oxc_span::GetSpan;
 
 use crate::{TraverseCtx, keep_var::KeepVar, symbol_metadata::FunctionSummary};
@@ -70,6 +73,13 @@ impl<'a> PeepholeOptimizations {
     #[expect(clippy::float_cmp)]
     pub fn try_fold_if(stmt: &mut Statement<'a>, ctx: &mut TraverseCtx<'a>) {
         let Statement::IfStatement(if_stmt) = stmt else { return };
+        // Annex B gives an unbraced function an implicit block. Moving it into
+        // the surrounding statement list can collide with a lexical binding.
+        if matches!(&if_stmt.consequent, Statement::FunctionDeclaration(_))
+            || matches!(&if_stmt.alternate, Some(Statement::FunctionDeclaration(_)))
+        {
+            return;
+        }
         // Descend and remove `else` blocks first.
         match &mut if_stmt.alternate {
             Some(Statement::IfStatement(_)) => {
@@ -119,7 +129,7 @@ impl<'a> PeepholeOptimizations {
                 keep_var.visit_statement(&if_stmt.consequent);
             }
             let var_stmt = keep_var
-                .get_variable_declaration_statement(&ctx.ast)
+                .get_variable_declaration_statement(ctx)
                 .and_then(|stmt| Self::remove_unused_variable_declaration(stmt, ctx));
             let has_var_stmt = var_stmt.is_some();
             if let Some(var_stmt) = var_stmt {
@@ -187,6 +197,96 @@ impl<'a> PeepholeOptimizations {
         )
     }
 
+    /// `for (init; test; update) break;` → `init, test`
+    ///
+    /// The body leaves the loop before the update runs, so only the
+    /// initializer and one test evaluation remain. Unreachable statements after
+    /// the `break` keep their hoisted `var` names; bodies with function
+    /// declarations, whose Annex B hoisting is not tracked here, are left alone,
+    /// and so is a loop whose test or initializer reads a script global, an
+    /// undeclared global, or a lexical binding that may be in its temporal dead
+    /// zone.
+    pub fn try_fold_for_with_immediate_break(stmt: &mut Statement<'a>, ctx: &mut TraverseCtx<'a>) {
+        let Statement::ForStatement(for_stmt) = stmt else { return };
+        let rest = match &for_stmt.body {
+            Statement::BreakStatement(b) if b.label.is_none() => &[][..],
+            Statement::BlockStatement(block) => match block.body.split_first() {
+                Some((Statement::BreakStatement(b), rest)) if b.label.is_none() => rest,
+                _ => return,
+            },
+            _ => return,
+        };
+        if matches!(&for_stmt.init, Some(ForStatementInit::VariableDeclaration(d)) if !d.kind.is_var())
+        {
+            return;
+        }
+        // A test or initializer left standing alone would be dropped later even
+        // if it reads a global that an earlier script made an accessor, or a
+        // lexical binding still in its temporal dead zone.
+        let anchor = for_stmt.span.start;
+        let init_expressions: Vec<&Expression<'a>> = match &for_stmt.init {
+            Some(ForStatementInit::VariableDeclaration(decl)) => {
+                decl.declarations.iter().filter_map(|d| d.init.as_ref()).collect()
+            }
+            Some(init) => init.as_expression().into_iter().collect(),
+            None => vec![],
+        };
+        if for_stmt
+            .test
+            .iter()
+            .chain(init_expressions)
+            .any(|e| Self::discards_observable_read(e, anchor, ctx))
+        {
+            return;
+        }
+        let mut detector = FunctionDeclarationDetector { found: false };
+        for statement in rest {
+            oxc_ast_visit::Visit::visit_statement(&mut detector, statement);
+        }
+        if detector.found {
+            return;
+        }
+        let mut keep_var = KeepVar::new();
+        for statement in rest {
+            keep_var.visit_statement(statement);
+        }
+        ctx.replace_statement_with(stmt, |stmt, ctx| {
+            let Statement::ForStatement(for_stmt) = stmt else { unreachable!() };
+            let scope_id = for_stmt.scope_id();
+            let ForStatement { span, init, test, update, body, .. } = for_stmt.unbox();
+            ctx.drop_statement(&body);
+            if let Some(update) = update {
+                ctx.drop_expression(&update);
+            }
+            let mut statements = ArenaVec::new_in(ctx);
+            let mut expressions = ArenaVec::new_in(ctx);
+            match init {
+                Some(ForStatementInit::VariableDeclaration(decl)) => {
+                    statements.push(Statement::VariableDeclaration(decl));
+                }
+                Some(init) => expressions.push(init.into_expression()),
+                None => {}
+            }
+            expressions.extend(test);
+            if !expressions.is_empty() {
+                let expression = if expressions.len() == 1 {
+                    expressions.pop().unwrap()
+                } else {
+                    Expression::new_sequence_expression(span, expressions, ctx)
+                };
+                statements.push(Statement::new_expression_statement(span, expression, ctx));
+            }
+            if let Some(var_stmt) = keep_var.get_variable_declaration_statement(ctx) {
+                statements.push(var_stmt);
+            }
+            match statements.len() {
+                0 => Statement::new_empty_statement(span, ctx),
+                1 => statements.pop().unwrap(),
+                _ => Statement::new_block_statement_with_scope_id(span, statements, scope_id, ctx),
+            }
+        });
+    }
+
     pub fn try_fold_for(stmt: &mut Statement<'a>, ctx: &mut TraverseCtx<'a>) {
         let Statement::ForStatement(for_stmt) = stmt else { return };
         if let Some(init) = &mut for_stmt.init
@@ -229,9 +329,7 @@ impl<'a> PeepholeOptimizations {
                         }
                         let mut statements =
                             ArenaVec::from_array_in([Statement::VariableDeclaration(decl)], ctx);
-                        if let Some(var_stmt) =
-                            keep_var.get_variable_declaration_statement(&ctx.ast)
-                        {
+                        if let Some(var_stmt) = keep_var.get_variable_declaration_statement(ctx) {
                             statements.push(var_stmt);
                         }
                         // The initializer still runs, including destructuring effects and TDZ
@@ -244,7 +342,7 @@ impl<'a> PeepholeOptimizations {
                 Some(ForStatementInit::VariableDeclaration(_)) => {
                     let mut keep_var = KeepVar::new();
                     keep_var.visit_statement(&for_stmt.body);
-                    let mut var_decl = keep_var.get_variable_declaration(&ctx.ast);
+                    let mut var_decl = keep_var.get_variable_declaration(ctx);
                     let init_is_var = matches!(
                         &for_stmt.init,
                         Some(ForStatementInit::VariableDeclaration(var_init)) if var_init.kind.is_var()
@@ -275,7 +373,7 @@ impl<'a> PeepholeOptimizations {
                 None => {
                     let mut keep_var = KeepVar::new();
                     keep_var.visit_statement(&for_stmt.body);
-                    let new_stmt = keep_var.get_variable_declaration(&ctx.ast).map_or_else(
+                    let new_stmt = keep_var.get_variable_declaration(ctx).map_or_else(
                         || Statement::new_empty_statement(for_stmt.span, ctx),
                         Statement::VariableDeclaration,
                     );
@@ -322,7 +420,7 @@ impl<'a> PeepholeOptimizations {
         }
         let mut var = KeepVar::new();
         var.visit_statement(&s.body);
-        let var_decl = var.get_variable_declaration_statement(&ctx.ast);
+        let var_decl = var.get_variable_declaration_statement(ctx);
         let new_stmt = var_decl.unwrap_or_else(|| Statement::new_empty_statement(s.span, ctx));
         ctx.replace_statement(stmt, new_stmt);
     }
@@ -397,12 +495,256 @@ impl<'a> PeepholeOptimizations {
                 ctx,
             );
             ctx.replace_statement(stmt, new_stmt);
-        } else if let Some(last_case) = switch_stmt.cases.last_mut()
+            return;
+        }
+        if let Some(last_case) = switch_stmt.cases.last_mut()
             && let Some(Statement::BreakStatement(last_break)) = last_case.consequent.last()
             && last_break.label.is_none()
         {
             let dropped = last_case.consequent.pop().unwrap();
             ctx.drop_statement(&dropped);
+        }
+        if !ctx.is_tree_shake_only() {
+            Self::try_merge_or_unwrap_switch(stmt, ctx);
+        }
+    }
+
+    fn statements_contain_unlabeled_break(stmts: &[Statement<'a>]) -> bool {
+        stmts.iter().any(Self::statement_contains_unlabeled_break)
+    }
+
+    fn statement_contains_unlabeled_break(stmt: &Statement<'a>) -> bool {
+        match stmt {
+            Statement::BreakStatement(b) => b.label.is_none(),
+            Statement::BlockStatement(b) => Self::statements_contain_unlabeled_break(&b.body),
+            Statement::IfStatement(i) => {
+                Self::statement_contains_unlabeled_break(&i.consequent)
+                    || i.alternate.as_ref().is_some_and(Self::statement_contains_unlabeled_break)
+            }
+            Statement::TryStatement(t) => {
+                Self::statements_contain_unlabeled_break(&t.block.body)
+                    || t.handler
+                        .as_ref()
+                        .is_some_and(|h| Self::statements_contain_unlabeled_break(&h.body.body))
+                    || t.finalizer
+                        .as_ref()
+                        .is_some_and(|f| Self::statements_contain_unlabeled_break(&f.body))
+            }
+            Statement::LabeledStatement(l) => Self::statement_contains_unlabeled_break(&l.body),
+            Statement::WithStatement(w) => Self::statement_contains_unlabeled_break(&w.body),
+            _ => false,
+        }
+    }
+
+    #[expect(clippy::float_cmp, reason = "switch cases use exact JavaScript number equality")]
+    fn switch_values_strictly_equal(a: &ConstantValue<'a>, b: &ConstantValue<'a>) -> bool {
+        match (a, b) {
+            (ConstantValue::Number(na), ConstantValue::Number(nb)) => {
+                !na.is_nan() && !nb.is_nan() && na == nb
+            }
+            _ => a == b,
+        }
+    }
+
+    #[expect(clippy::float_cmp, reason = "switch cases use exact JavaScript number equality")]
+    fn switch_values_may_collide(a: &ConstantValue<'a>, b: &ConstantValue<'a>) -> bool {
+        #[cfg(test)]
+        tests::COLLISION_COMPARISONS.with(|count| count.set(count.get() + 1));
+        match (a, b) {
+            (ConstantValue::Number(na), ConstantValue::Number(nb)) => {
+                na == nb || (na.is_nan() && nb.is_nan())
+            }
+            _ => a == b,
+        }
+    }
+
+    fn switch_body_without_trailing_break<'s>(stmts: &'s [Statement<'a>]) -> &'s [Statement<'a>] {
+        if let Some((Statement::BreakStatement(b), prefix)) = stmts.split_last()
+            && b.label.is_none()
+        {
+            prefix
+        } else {
+            stmts
+        }
+    }
+
+    fn try_merge_or_unwrap_switch(stmt: &mut Statement<'a>, ctx: &mut TraverseCtx<'a>) {
+        use crate::is_terminated::IsTerminated;
+        use oxc_span::ContentEq;
+
+        let Statement::SwitchStatement(switch_stmt) = stmt else { return };
+        if switch_stmt
+            .cases
+            .iter()
+            .any(|case| case.consequent.iter().any(Self::statement_cares_about_scope))
+        {
+            return;
+        }
+
+        // Unwrap a single matching case (`switch (1) { case 1: body }` or `switch (x) { default: body }`)
+        // when the body has no unlabeled `break`.
+        if switch_stmt.cases.len() == 1
+            && !Self::statements_contain_unlabeled_break(&switch_stmt.cases[0].consequent)
+        {
+            let matches_always = match &switch_stmt.cases[0].test {
+                None => true,
+                Some(test) => {
+                    !test.may_have_side_effects(ctx)
+                        && !Self::discards_observable_read(test, switch_stmt.span.start, ctx)
+                        && !switch_stmt.discriminant.may_have_side_effects(ctx)
+                        && switch_stmt
+                            .discriminant
+                            .evaluate_value(ctx)
+                            .zip(test.evaluate_value(ctx))
+                            .is_some_and(|(d, t)| Self::switch_values_strictly_equal(&d, &t))
+                }
+            };
+            if matches_always {
+                let span = switch_stmt.span;
+                let disc = switch_stmt.discriminant.take_in(ctx);
+                let mut case = switch_stmt.cases.pop().unwrap();
+                if let Some(test) = case.test.take() {
+                    ctx.drop_expression(&test);
+                }
+                let mut body = case.consequent;
+                if disc.may_have_side_effects(ctx)
+                    || Self::discards_observable_read(&disc, span.start, ctx)
+                {
+                    body.insert(0, Statement::new_expression_statement(span, disc, ctx));
+                } else {
+                    ctx.drop_expression(&disc);
+                }
+                let new_stmt = Statement::new_block_statement_with_scope_id(
+                    span,
+                    body,
+                    ctx.create_child_scope_of_current(oxc_syntax::scope::ScopeFlags::empty()),
+                    ctx,
+                );
+                ctx.replace_statement(stmt, new_stmt);
+                return;
+            }
+        }
+
+        // Merge non-adjacent terminated groups with identical bodies when all case tests
+        // are side-effect-free constants (so reordering case labels cannot change behavior).
+        let Statement::SwitchStatement(switch_stmt) = stmt else { return };
+        if switch_stmt.cases.len() > 1
+            && switch_stmt.cases.iter().all(|c| {
+                c.test.as_ref().is_none_or(|t| {
+                    !t.may_have_side_effects(ctx)
+                        && !Self::discards_observable_read(t, switch_stmt.span.start, ctx)
+                        && t.evaluate_value(ctx).is_some()
+                })
+            })
+        {
+            // Partition cases into fallthrough groups `[start..=end]`.
+            let mut groups: Vec<(usize, usize, bool)> = Vec::new();
+            let mut group_start = 0;
+            for idx in 0..switch_stmt.cases.len() {
+                let is_last = idx + 1 == switch_stmt.cases.len();
+                if !switch_stmt.cases[idx].consequent.is_empty() || is_last {
+                    let terminated = is_last || switch_stmt.cases[idx].consequent.is_terminated();
+                    groups.push((group_start, idx, terminated));
+                    group_start = idx + 1;
+                }
+            }
+            if groups.len() > 1 && groups.iter().all(|&(_, _, terminated)| terminated) {
+                let mut merge_pair = None;
+                'outer: for g1 in 0..groups.len() {
+                    let (_, end1, _) = groups[g1];
+                    let body1 = Self::switch_body_without_trailing_break(
+                        &switch_stmt.cases[end1].consequent,
+                    );
+                    if body1.is_empty() || Self::statements_contain_unlabeled_break(body1) {
+                        continue;
+                    }
+                    for g2 in (g1 + 1)..groups.len() {
+                        let (start1, _, _) = groups[g1];
+                        let (start2, end2, _) = groups[g2];
+                        let body2 = Self::switch_body_without_trailing_break(
+                            &switch_stmt.cases[end2].consequent,
+                        );
+                        if body1.len() != body2.len()
+                            || !body1.iter().zip(body2).all(|(a, b)| a.content_eq(b))
+                        {
+                            continue;
+                        }
+                        let can_move_across = if g2 == g1 + 1 {
+                            true
+                        } else {
+                            let range1 = &switch_stmt.cases[start1..=end1];
+                            let between = &switch_stmt.cases[(end1 + 1)..start2];
+                            range1.iter().all(|c1| {
+                                let Some(v1) = c1.test.as_ref().and_then(|t| t.evaluate_value(ctx))
+                                else {
+                                    return false;
+                                };
+                                between.iter().all(|c2| {
+                                    let Some(v2) =
+                                        c2.test.as_ref().and_then(|t| t.evaluate_value(ctx))
+                                    else {
+                                        return false;
+                                    };
+                                    !Self::switch_values_may_collide(&v1, &v2)
+                                })
+                            })
+                        };
+                        if !can_move_across {
+                            // Later groups cross the same collision or default case.
+                            break;
+                        }
+                        merge_pair = Some((g1, g2));
+                        break 'outer;
+                    }
+                }
+                if let Some((g1, g2)) = merge_pair {
+                    let (start1, end1, _) = groups[g1];
+                    let (start2, _, _) = groups[g2];
+                    for dropped in switch_stmt.cases[end1].consequent.drain(..) {
+                        ctx.drop_statement(&dropped);
+                    }
+                    let moved: Vec<_> = switch_stmt.cases.drain(start1..=end1).collect();
+                    let insert_at = start2 - moved.len();
+                    for (offset, c) in moved.into_iter().enumerate() {
+                        switch_stmt.cases.insert(insert_at + offset, c);
+                    }
+                    ctx.notice_change();
+                }
+            }
+
+            // If all cases now fall through into the final case and include `default:`,
+            // and the final body has no unlabeled `break`, the switch always runs that body.
+            let len = switch_stmt.cases.len();
+            if len > 1
+                && switch_stmt.cases[..len - 1].iter().all(|c| c.consequent.is_empty())
+                && switch_stmt.cases.iter().any(SwitchCase::is_default_case)
+                && !Self::statements_contain_unlabeled_break(&switch_stmt.cases[len - 1].consequent)
+            {
+                let span = switch_stmt.span;
+                let disc = switch_stmt.discriminant.take_in(ctx);
+                let mut last_case = switch_stmt.cases.pop().unwrap();
+                if let Some(test) = last_case.test.take() {
+                    ctx.drop_expression(&test);
+                }
+                let mut body = last_case.consequent;
+                for c in switch_stmt.cases.drain(..) {
+                    ctx.drop_switch_case(&c);
+                }
+                if disc.may_have_side_effects(ctx)
+                    || Self::discards_observable_read(&disc, span.start, ctx)
+                {
+                    body.insert(0, Statement::new_expression_statement(span, disc, ctx));
+                } else {
+                    ctx.drop_expression(&disc);
+                }
+                let new_stmt = Statement::new_block_statement_with_scope_id(
+                    span,
+                    body,
+                    ctx.create_child_scope_of_current(oxc_syntax::scope::ScopeFlags::empty()),
+                    ctx,
+                );
+                ctx.replace_statement(stmt, new_stmt);
+            }
         }
     }
 
@@ -438,7 +780,7 @@ impl<'a> PeepholeOptimizations {
                 for dropped in handler.body.body.take_in(ctx) {
                     ctx.drop_statement(&dropped);
                 }
-                if let Some(var_decl) = var.get_variable_declaration_statement(&ctx.ast) {
+                if let Some(var_decl) = var.get_variable_declaration_statement(ctx) {
                     handler.body.body.push(var_decl);
                 }
             }
@@ -541,9 +883,9 @@ impl<'a> PeepholeOptimizations {
                         &f.params,
                         f.r#async,
                         f.generator,
-                        body.statements.iter().any(|stmt| stmt.may_have_side_effects(ctx)),
                         body.is_empty(),
                         ctx,
+                        |ctx| body.statements.iter().any(|stmt| stmt.may_have_side_effects(ctx)),
                     );
                 }
             }
@@ -557,18 +899,20 @@ impl<'a> PeepholeOptimizations {
                                     &a.params,
                                     a.r#async,
                                     false,
-                                    a.get_expression().map_or_else(
-                                        || {
-                                            a.get_function_body().is_none_or(|body| {
-                                                body.statements
-                                                    .iter()
-                                                    .any(|stmt| stmt.may_have_side_effects(ctx))
-                                            })
-                                        },
-                                        |expression| expression.may_have_side_effects(ctx),
-                                    ),
                                     a.body.is_empty(),
                                     ctx,
+                                    |ctx| {
+                                        a.get_expression().map_or_else(
+                                            || {
+                                                a.get_function_body().is_none_or(|body| {
+                                                    body.statements
+                                                        .iter()
+                                                        .any(|stmt| stmt.may_have_side_effects(ctx))
+                                                })
+                                            },
+                                            |expression| expression.may_have_side_effects(ctx),
+                                        )
+                                    },
                                 );
                             }
                             Some(Expression::FunctionExpression(f)) => {
@@ -578,11 +922,13 @@ impl<'a> PeepholeOptimizations {
                                         &f.params,
                                         f.r#async,
                                         f.generator,
-                                        body.statements
-                                            .iter()
-                                            .any(|stmt| stmt.may_have_side_effects(ctx)),
                                         body.is_empty(),
                                         ctx,
+                                        |ctx| {
+                                            body.statements
+                                                .iter()
+                                                .any(|stmt| stmt.may_have_side_effects(ctx))
+                                        },
                                     );
                                 }
                             }
@@ -600,11 +946,41 @@ impl<'a> PeepholeOptimizations {
         params: &FormalParameters<'a>,
         r#async: bool,
         generator: bool,
-        body_has_side_effects: bool,
         returns_undefined: bool,
         ctx: &mut TraverseCtx<'a>,
+        body_has_side_effects: impl FnOnce(&TraverseCtx<'a>) -> bool,
     ) {
         if r#async || generator {
+            return;
+        }
+        let Some(symbol_id) = id.and_then(|id| id.symbol_id.get()) else { return };
+        let binding_scope_id = ctx.scoping().symbol_scope_id(symbol_id);
+        let binding_scope_flags = ctx.scoping().scope_flags(binding_scope_id);
+        if !ctx.scoping().symbol_redeclarations(symbol_id).is_empty()
+            || ctx.state.hidden_writes.contains(&symbol_id)
+            || binding_scope_flags.contains_direct_eval()
+            || (ctx.source_type().is_script() && binding_scope_id == ctx.scoping().root_scope_id())
+        {
+            if ctx.state.symbols.clear_function_summary(symbol_id) {
+                ctx.state.mark_symbol_scopes_dirty(
+                    symbol_id,
+                    ctx.scoping.scoping(),
+                    ctx.state.pass_index > 0,
+                );
+            }
+            return;
+        }
+        if ctx.scoping().symbol_is_unused(symbol_id)
+            || !ctx.scoping().get_resolved_references(symbol_id).all(|r| r.flags().is_read_only())
+        {
+            return;
+        }
+        let summary = if returns_undefined {
+            FunctionSummary::SideEffectFreeReturnsUndefined
+        } else {
+            FunctionSummary::SideEffectFree
+        };
+        if ctx.state.symbols.function_summary(symbol_id) == summary {
             return;
         }
         // Destructuring can throw. Default initializers run for missing or `undefined`
@@ -621,37 +997,14 @@ impl<'a> PeepholeOptimizations {
         {
             return;
         }
-        if body_has_side_effects {
+        if body_has_side_effects(ctx) {
             return;
         }
-        let Some(symbol_id) = id.and_then(|id| id.symbol_id.get()) else { return };
-        let binding_scope_id = ctx.scoping().symbol_scope_id(symbol_id);
-        let binding_scope_flags = ctx.scoping().scope_flags(binding_scope_id);
-        // Redeclarations are span-only in semantic and create no references,
-        // so the read-only-reference check below cannot see them. A different
-        // declaration of the same symbol may be impure and win at runtime.
-        if !ctx.scoping().symbol_redeclarations(symbol_id).is_empty() {
-            ctx.state.symbols.clear_function_summary(symbol_id);
-            return;
-        }
-        // Direct eval and Script global properties can replace the binding
-        // without producing a resolved write reference. Discard any summary
-        // from an earlier pass; removing the last eval may make the binding
-        // safe later, while Script roots are rejected again on every pass.
-        if binding_scope_flags.contains_direct_eval()
-            || (ctx.source_type().is_script() && binding_scope_id == ctx.scoping().root_scope_id())
-        {
-            ctx.state.symbols.clear_function_summary(symbol_id);
-            return;
-        }
-        if ctx.scoping().get_resolved_references(symbol_id).all(|r| r.flags().is_read_only()) {
-            ctx.state.symbols.set_function_summary(
+        if ctx.state.symbols.set_function_summary(symbol_id, summary) {
+            ctx.state.mark_symbol_scopes_dirty(
                 symbol_id,
-                if returns_undefined {
-                    FunctionSummary::SideEffectFreeReturnsUndefined
-                } else {
-                    FunctionSummary::SideEffectFree
-                },
+                ctx.scoping.scoping(),
+                ctx.state.pass_index > 0,
             );
         }
     }
@@ -660,18 +1013,85 @@ impl<'a> PeepholeOptimizations {
         let Expression::CallExpression(e) = expr else { return };
         if let Expression::Identifier(ident) = &e.callee {
             let reference_id = ident.reference_id();
-            if let Some(symbol_id) = ctx.scoping().get_reference(reference_id).symbol_id()
-                && ctx.state.symbols.function_summary(symbol_id).returns_undefined()
-            {
-                let mut exprs = Self::fold_arguments_into_needed_expressions(&mut e.arguments, ctx);
-                if exprs.is_empty() {
-                    let new_expr = Expression::new_void_0(e.span, ctx);
-                    ctx.replace_expression(expr, new_expr);
-                    return;
+            let reference = ctx.scoping().get_reference(reference_id);
+            if let Some(symbol_id) = reference.symbol_id() {
+                if !ctx.is_tree_shake_only()
+                    && !e.optional
+                    && let Some((decl_end, tdz_end, trivial)) =
+                        ctx.state.symbols.trivial_functions.get(&symbol_id).cloned()
+                    && ctx.inlining_visible_to_reference(
+                        decl_end,
+                        tdz_end,
+                        symbol_id,
+                        reference_id,
+                        ident.span.start,
+                    )
+                {
+                    match trivial {
+                        crate::symbol_state::TrivialFunction::ZeroParamConstant(val)
+                            if e.arguments.is_empty() =>
+                        {
+                            let new_expr = ctx.value_to_expr(e.span, val);
+                            ctx.replace_expression(expr, new_expr);
+                            return;
+                        }
+                        crate::symbol_state::TrivialFunction::OneParamConstant(val)
+                            if e.arguments.len() <= 1
+                                && e.arguments.first().is_none_or(|a| {
+                                    a.as_expression().is_some_and(|arg_expr| {
+                                        !arg_expr.may_have_side_effects(ctx)
+                                            && !Self::discards_observable_read(
+                                                arg_expr,
+                                                e.span.start,
+                                                ctx,
+                                            )
+                                    })
+                                }) =>
+                        {
+                            let new_expr = ctx.value_to_expr(e.span, val);
+                            ctx.replace_expression(expr, new_expr);
+                            return;
+                        }
+                        crate::symbol_state::TrivialFunction::Identity1Param
+                            if e.arguments.len() <= 1
+                                && e.arguments.first().is_none_or(|a| !a.is_spread()) =>
+                        {
+                            if e.arguments.is_empty() {
+                                let new_expr = Expression::new_void_0(e.span, ctx);
+                                ctx.replace_expression(expr, new_expr);
+                                return;
+                            }
+                            let arg_expr = e.arguments[0].to_expression();
+                            let allow_anon_fn = matches!(
+                                ctx.parent(),
+                                Ancestor::CallExpressionCallee(_)
+                                    | Ancestor::CallExpressionArguments(_)
+                            );
+                            if (allow_anon_fn || !Self::may_yield_anonymous_function(arg_expr))
+                                && !Self::discards_observable_read(arg_expr, e.span.start, ctx)
+                            {
+                                let arg = e.arguments.pop().unwrap().into_expression();
+                                let new_expr =
+                                    Self::preserve_indirect_access_if_needed(e.span, arg, ctx);
+                                ctx.replace_expression(expr, new_expr);
+                                return;
+                            }
+                        }
+                        _ => {}
+                    }
                 }
-                exprs.push(Expression::new_void_0(e.span, ctx));
-                let new_expr = Expression::new_sequence_expression(e.span, exprs, ctx);
-                ctx.replace_expression(expr, new_expr);
+                if ctx.state.symbols.function_summary(symbol_id).returns_undefined() {
+                    let mut exprs =
+                        Self::fold_arguments_into_needed_expressions(&mut e.arguments, ctx);
+                    if exprs.is_empty() {
+                        let new_expr = Expression::new_void_0(e.span, ctx);
+                        ctx.replace_expression(expr, new_expr);
+                        return;
+                    }
+                    exprs.push(Expression::new_void_0(e.span, ctx));
+                    let new_expr = Expression::new_sequence_expression(e.span, exprs, ctx);
+                    ctx.replace_expression(expr, new_expr);
+                }
             }
         }
     }
@@ -773,5 +1193,62 @@ impl<'a> PeepholeOptimizations {
         if e.elements.is_empty() {
             args.drain(..);
         }
+    }
+}
+
+/// Finds function declarations, including Annex B block-level ones.
+struct FunctionDeclarationDetector {
+    found: bool,
+}
+
+impl<'a> oxc_ast_visit::Visit<'a> for FunctionDeclarationDetector {
+    fn visit_function(&mut self, it: &Function<'a>, _: oxc_syntax::scope::ScopeFlags) {
+        if it.is_declaration() {
+            self.found = true;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+    use std::fmt::Write;
+
+    use oxc_allocator::Allocator;
+    use oxc_parser::Parser;
+    use oxc_span::SourceType;
+
+    use crate::{CompressOptions, Minifier, MinifierOptions};
+
+    thread_local! {
+        pub(super) static COLLISION_COMPARISONS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    #[test]
+    fn distinct_switch_bodies_do_not_scan_case_collisions() {
+        let mut source = String::from("switch (value) {");
+        for index in 0..100 {
+            write!(source, "case {index}: handler{index}(); break;")
+                .expect("writing to a String cannot fail");
+        }
+        source.push('}');
+        let allocator = Allocator::default();
+        let parsed = Parser::new(&allocator, &source, SourceType::mjs()).parse();
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let mut program = parsed.program;
+        COLLISION_COMPARISONS.with(|count| count.set(0));
+        Minifier::new(MinifierOptions {
+            compress: Some(CompressOptions::smallest()),
+            mangle: None,
+            ..MinifierOptions::default()
+        })
+        .minify(&allocator, &mut program);
+        COLLISION_COMPARISONS.with(|count| {
+            assert_eq!(
+                count.get(),
+                0,
+                "different bodies cannot merge regardless of case collisions"
+            );
+        });
     }
 }

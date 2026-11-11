@@ -48,6 +48,19 @@ let output = Codegen::new()
 println!("{}", output.code);
 ```
 
+### Property allowlists
+
+Use `ManglePropertiesOptions::from_names(["_field", "_cache"])` to select exact
+property names. The allowlist intersects the `include` regex; `reserved`, `exclude`,
+nonempty `exclude_prefixes`, numeric names, and hard-reserved names still take
+precedence over both generated and pinned mappings.
+
+This constructor enables `reserve_string_words`: ASCII identifier words in
+ordinary strings, directives, and template quasis reserve original names and
+generated targets. Explicit `@__KEY__` annotations remain mangling candidates.
+Collect every program with the same `PropertyMangler` before calling `assign()`
+when properties cross bundle boundaries.
+
 ## Testing Infrastructure
 
 - `just minsize` - Track compression benchmarks

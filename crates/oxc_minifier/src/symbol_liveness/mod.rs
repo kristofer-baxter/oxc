@@ -125,7 +125,8 @@ impl<'a> SymbolLiveness<'a> {
     /// creates it when it finds a `using` binding or a parameter exposed
     /// through mapped arguments. A Script source always has the state because
     /// later scripts observe its root bindings regardless of the `unused`
-    /// option.
+    /// option, and so does a CommonJS source with a root binding that the
+    /// wrapper's mapped `arguments` observes.
     pub fn new_if_enabled(
         source_type: SourceType,
         options: &CompressOptions,
@@ -133,7 +134,11 @@ impl<'a> SymbolLiveness<'a> {
         allocator: &'a Allocator,
     ) -> Option<Self> {
         let recursive_functions_enabled = options.unused != CompressOptionsUnused::Keep;
-        if !source_type.is_module() && !source_type.is_script() && !recursive_functions_enabled {
+        if !source_type.is_module()
+            && !source_type.is_script()
+            && !recursive_functions_enabled
+            && crate::state::commonjs_wrapper_bindings(source_type, scoping).next().is_none()
+        {
             return None;
         }
         Some(Self::new(source_type, scoping, allocator))
@@ -141,13 +146,21 @@ impl<'a> SymbolLiveness<'a> {
 
     /// Seed implicit observability from scoping; the function graph is created
     /// lazily at first registration.
-    fn new(source_type: SourceType, scoping: &Scoping, allocator: &'a Allocator) -> Self {
+    pub(crate) fn new(
+        source_type: SourceType,
+        scoping: &Scoping,
+        allocator: &'a Allocator,
+    ) -> Self {
         let symbols_len = scoping.symbols_len();
         let mut implicitly_observable = BitSet::new_in(symbols_len, allocator);
         if source_type.is_script() {
             for &symbol_id in scoping.get_bindings(scoping.root_scope_id()).values() {
                 implicitly_observable.set_bit(symbol_id.index());
             }
+        }
+        // The CommonJS wrapper's mapped `arguments` observes these bindings.
+        for symbol_id in crate::state::commonjs_wrapper_bindings(source_type, scoping) {
+            implicitly_observable.set_bit(symbol_id.index());
         }
         Self { implicitly_observable, recursive_functions: None }
     }
@@ -162,7 +175,7 @@ impl<'a> SymbolLiveness<'a> {
         self.recursive_functions.as_ref().is_some_and(|graph| graph.is_dead(symbol_id))
     }
 
-    fn mark_implicitly_observable(&mut self, symbol_id: SymbolId) {
+    pub(crate) fn mark_implicitly_observable(&mut self, symbol_id: SymbolId) {
         self.implicitly_observable.set_bit(symbol_id.index());
     }
 
@@ -311,17 +324,23 @@ impl<'a> FunctionGraph<'a> {
                 let reference = scoping.get_reference(reference_id);
                 let Some(owner) = self.owner(scoping, reference.scope_id()) else {
                     self.scratch.mark_live(target);
+                    if has_registered_function_owner {
+                        break;
+                    }
                     continue;
                 };
 
                 has_registered_function_owner = true;
+                if self.scratch.live.contains(bit) {
+                    break;
+                }
                 if implicitly_observable.contains(owner.index()) {
                     // A reference owned by a permanently live function keeps
                     // its target live unconditionally. Avoid storing and
                     // sorting the common implicitly observable owner case; the
                     // result is the same.
                     self.scratch.mark_live(target);
-                    continue;
+                    break;
                 }
                 if self.candidates.contains(owner.index()) {
                     self.scratch.owned_references.push((owner, target));
@@ -329,6 +348,7 @@ impl<'a> FunctionGraph<'a> {
                     // A registered non-candidate owner keeps the target live
                     // only while its body can still execute.
                     self.scratch.mark_live(target);
+                    break;
                 }
             }
             if !has_registered_function_owner && !self.dead.contains(bit) {
@@ -461,7 +481,7 @@ impl<'a> GraphScratch<'a> {
 
 /// Normalize hook: record parameters exposed through mapped arguments and
 /// register function declarations as potential graph candidates.
-pub fn register_function(function: &Function<'_>, ctx: &mut TraverseCtx<'_>) {
+pub fn register_function<'a>(function: &Function<'a>, ctx: &mut TraverseCtx<'a>) {
     let recursive_functions_enabled = ctx.options().unused != CompressOptionsUnused::Keep;
     let source_type = ctx.source_type();
     let allocator = ctx.allocator();
@@ -490,9 +510,9 @@ pub fn register_function(function: &Function<'_>, ctx: &mut TraverseCtx<'_>) {
 /// Normalize hook: record resource bindings observed later by explicit
 /// resource management. Disposal reads the bound value through runtime state,
 /// not through a resolved identifier reference in the AST.
-pub fn register_using_declaration(
-    declaration: &VariableDeclaration<'_>,
-    ctx: &mut TraverseCtx<'_>,
+pub fn register_using_declaration<'a>(
+    declaration: &VariableDeclaration<'a>,
+    ctx: &mut TraverseCtx<'a>,
 ) {
     if !declaration.kind.is_using() {
         return;

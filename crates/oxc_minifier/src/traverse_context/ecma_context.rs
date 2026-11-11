@@ -12,13 +12,16 @@ use oxc_ecmascript::{
 };
 use oxc_semantic::{IsGlobalReference, SymbolId};
 use oxc_str::format_str;
-use oxc_syntax::{reference::ReferenceId, scope::ScopeFlags};
+use oxc_syntax::{
+    reference::ReferenceId,
+    scope::{ScopeFlags, ScopeId},
+};
 
 use crate::{
     generated::ancestor::Ancestor,
     options::CompressOptions,
     state::MinifierState,
-    symbol_value::{FreshValueKind, ReferenceCounts, SymbolValue},
+    symbol_value::{FreshValueKind, SymbolValue},
 };
 
 use oxc_ast_visit::Visit;
@@ -31,7 +34,7 @@ pub fn is_exact_int64(num: f64) -> bool {
 
 impl<'a> GlobalContext<'a> for TraverseCtx<'a, MinifierState<'a>> {
     fn is_global_reference(&self, ident: &IdentifierReference<'_>) -> bool {
-        ident.is_global_reference(self.scoping())
+        TraverseCtx::is_global_reference(self, ident)
     }
 
     fn get_constant_value_for_reference_id(
@@ -192,20 +195,158 @@ impl<'a> TraverseCtx<'a, MinifierState<'a>> {
         self.state.should_track_member_write_effects()
     }
 
-    pub fn is_global_reference(&self, ident: &IdentifierReference<'a>) -> bool {
-        ident.is_global_reference(self.scoping())
+    /// Whether `ident` reads the global object's binding. An unresolved
+    /// `undefined`, `NaN`, or `Infinity` under a sloppy direct `eval` does not
+    /// count, because the `eval` can declare the name with `var` at run time:
+    /// `function f(s) { eval(s); return -Infinity }` returns `-2` for
+    /// `f("var Infinity = 2")`, so the read must not fold to a constant.
+    pub fn is_global_reference(&self, ident: &IdentifierReference<'_>) -> bool {
+        let scoping = self.scoping();
+        ident.is_global_reference(scoping)
+            && !(matches!(ident.name.as_str(), "undefined" | "NaN" | "Infinity")
+                && self.sloppy_direct_eval_in_scope(
+                    scoping.get_reference(ident.reference_id()).scope_id(),
+                ))
+    }
+
+    /// Whether a sloppy direct `eval` or `with` in `scope_id` or an enclosing
+    /// scope can declare or intercept a binding that a read in `scope_id`
+    /// resolves to. Semantic analysis marks every ancestor of an `eval` call
+    /// with `DirectEval`.
+    fn sloppy_direct_eval_in_scope(&self, scope_id: ScopeId) -> bool {
+        let scoping = self.scoping();
+        scoping.scope_ancestors(scope_id).any(|id| {
+            let flags = scoping.scope_flags(id);
+            flags.contains(ScopeFlags::With)
+                || (flags.contains_direct_eval() && !flags.is_strict_mode())
+        })
     }
 
     fn tracked_constant_for_reference_id(
         &self,
         reference_id: ReferenceId,
     ) -> Option<&ConstantValue<'a>> {
-        self.scoping()
-            .get_reference(reference_id)
-            .symbol_id()
-            .and_then(|symbol_id| self.state.symbols.value(symbol_id))
+        let symbol_id = self.scoping().get_reference(reference_id).symbol_id()?;
+        self.state
+            .symbols
+            .value(symbol_id)
             .filter(|sv| !sv.references.has_writes())
+            .filter(|sv| self.constant_visible_to_reference(sv, symbol_id, reference_id))
             .and_then(|sv| sv.initialized_constant.as_ref())
+    }
+
+    /// Whether a `with` body lies between a reference and its binding's scope,
+    /// so the `with` object can shadow the binding at run time.
+    fn reference_inside_with(&self, symbol_id: SymbolId, reference_id: ReferenceId) -> bool {
+        let scoping = self.scoping();
+        let declaring_scope = scoping.symbol_scope_id(symbol_id);
+        scoping
+            .scope_ancestors(scoping.get_reference(reference_id).scope_id())
+            .take_while(|&scope_id| scope_id != declaring_scope)
+            .any(|scope_id| scoping.scope_flags(scope_id).contains(ScopeFlags::With))
+    }
+
+    /// Whether a read of `symbol_id` through `reference_id`, inside the node
+    /// being visited, runs after the binding is initialized and may therefore
+    /// observe its tracked constant.
+    ///
+    /// Reads in the declaring function body are visited after the declarator
+    /// only when they follow it in source order, so they always qualify. A read
+    /// inside a closure qualifies when its outermost closure (the function
+    /// nested directly in the declaring function body) is created after the
+    /// declarator: it starts after the declarator ends and is not a function
+    /// declaration hoisted into the declaring scope. Otherwise the closure may
+    /// run during the temporal dead zone, where the read throws. A read inside a
+    /// `with` body never qualifies, since the `with` object can shadow it.
+    pub fn constant_visible_to_reference(
+        &self,
+        sv: &SymbolValue<'a>,
+        symbol_id: SymbolId,
+        reference_id: ReferenceId,
+    ) -> bool {
+        self.tdz_visible_to_reference(sv.tdz_declared_end, symbol_id, reference_id)
+    }
+
+    pub fn tdz_visible_to_reference(
+        &self,
+        tdz_declared_end: Option<u32>,
+        symbol_id: SymbolId,
+        reference_id: ReferenceId,
+    ) -> bool {
+        if self.reference_inside_with(symbol_id, reference_id) {
+            return false;
+        }
+        let Some(declared_end) = tdz_declared_end else {
+            return true;
+        };
+        self.inlining_visible_to_reference(
+            declared_end,
+            Some(declared_end),
+            symbol_id,
+            reference_id,
+            u32::MAX,
+        )
+    }
+
+    pub fn inlining_visible_to_reference(
+        &self,
+        decl_end: u32,
+        tdz_declared_end: Option<u32>,
+        symbol_id: SymbolId,
+        reference_id: ReferenceId,
+        ref_span_start: u32,
+    ) -> bool {
+        if self.reference_inside_with(symbol_id, reference_id) {
+            return false;
+        }
+        let scoping = self.scoping();
+        let declaring_scope = scoping.symbol_scope_id(symbol_id);
+        let mut outermost_closure = None;
+        let mut reached_declaring_scope = false;
+        for scope_id in scoping.scope_ancestors(scoping.get_reference(reference_id).scope_id()) {
+            if scope_id == declaring_scope {
+                reached_declaring_scope = true;
+                break;
+            }
+            if scoping.scope_flags(scope_id).is_function() {
+                outermost_closure = Some(scope_id);
+            }
+        }
+        if !reached_declaring_scope {
+            return false;
+        }
+        let Some(closure_scope) = outermost_closure else {
+            return ref_span_start >= decl_end;
+        };
+        for ancestor in self.ancestors() {
+            let (scope, start, hoisted) = match ancestor {
+                Ancestor::FunctionBody(f) => (
+                    f.scope_id().get(),
+                    f.span().start,
+                    matches!(f.r#type(), FunctionType::FunctionDeclaration),
+                ),
+                Ancestor::FunctionParams(f) => (
+                    f.scope_id().get(),
+                    f.span().start,
+                    matches!(f.r#type(), FunctionType::FunctionDeclaration),
+                ),
+                Ancestor::ArrowFunctionExpressionBody(f) => {
+                    (f.scope_id().get(), f.span().start, false)
+                }
+                Ancestor::ArrowFunctionExpressionParams(f) => {
+                    (f.scope_id().get(), f.span().start, false)
+                }
+                _ => continue,
+            };
+            if scope != Some(closure_scope) {
+                continue;
+            }
+            if hoisted && scoping.scope_parent_id(closure_scope) == Some(declaring_scope) {
+                return tdz_declared_end.is_none();
+            }
+            return start >= decl_end;
+        }
+        false
     }
 
     pub fn eval_binary(&self, e: &BinaryExpression<'a>) -> Option<Expression<'a>> {
@@ -219,7 +360,7 @@ impl<'a> TraverseCtx<'a, MinifierState<'a>> {
             // other `eval_binary_operation` callers fold bitwise operators
             // only, whose results are always finite, so the guard lives here.
             if let ConstantValue::Number(n) = &v
-                && self.non_finite_global_shadowed(*n)
+                && self.non_finite_global_shadowed(*n, self.scoping.current_scope_id())
             {
                 return None;
             }
@@ -240,7 +381,7 @@ impl<'a> TraverseCtx<'a, MinifierState<'a>> {
     /// that a binding in the current scope chain captures: in
     /// `function f() { let NaN = 1; return 0 / 0; }`, folding the division
     /// to a NaN literal makes `f` return `1`.
-    fn non_finite_global_shadowed(&self, n: f64) -> bool {
+    fn non_finite_global_shadowed(&self, n: f64, scope_id: ScopeId) -> bool {
         let name = if n.is_nan() {
             "NaN"
         } else if n.is_infinite() {
@@ -248,7 +389,10 @@ impl<'a> TraverseCtx<'a, MinifierState<'a>> {
         } else {
             return false;
         };
-        self.scoping().find_binding(self.scoping.current_scope_id(), name.into()).is_some()
+        let scoping = self.scoping();
+        // A sloppy direct `eval` can declare the name with `var` at run time.
+        scoping.find_binding(scope_id, name.into()).is_some()
+            || self.sloppy_direct_eval_in_scope(scope_id)
     }
 
     /// `NaN` → `0 / 0`, `Infinity` → `1 / 0`, `-Infinity` → `-1 / 0`: the
@@ -266,9 +410,20 @@ impl<'a> TraverseCtx<'a, MinifierState<'a>> {
     }
 
     pub fn value_to_expr(&self, span: Span, value: ConstantValue<'a>) -> Expression<'a> {
+        self.value_to_expr_in_scope(span, value, self.scoping.current_scope_id())
+    }
+
+    /// `value_to_expr` for an expression placed in `scope_id` rather than the
+    /// scope being visited, as when a visitor substitutes into a nested body.
+    pub fn value_to_expr_in_scope(
+        &self,
+        span: Span,
+        value: ConstantValue<'a>,
+        scope_id: ScopeId,
+    ) -> Expression<'a> {
         match value {
             ConstantValue::Number(n) => {
-                if !n.is_finite() && self.non_finite_global_shadowed(n) {
+                if !n.is_finite() && self.non_finite_global_shadowed(n, scope_id) {
                     return self.non_finite_to_division_expr(span, n);
                 }
                 let number_base =
@@ -298,7 +453,7 @@ impl<'a> TraverseCtx<'a, MinifierState<'a>> {
 
     #[inline]
     pub fn is_identifier_undefined(&self, ident: &IdentifierReference) -> bool {
-        if ident.name == "undefined" && ident.is_global_reference(self.scoping()) {
+        if ident.name == "undefined" && self.is_global_reference(ident) {
             return true;
         }
         false
@@ -312,10 +467,7 @@ impl<'a> TraverseCtx<'a, MinifierState<'a>> {
         falsy_init: bool,
         implicit_undefined_source: bool,
     ) -> &mut SymbolValue<'a> {
-        let mut references = ReferenceCounts::default();
-        for reference in self.scoping().get_resolved_references(symbol_id) {
-            references.record(reference.flags());
-        }
+        let references = self.state.symbols.reference_counts(symbol_id, self.scoping.scoping());
 
         let scope_id = self.scoping().symbol_scope_id(symbol_id);
         let scope_flags = self.scoping().scope_flags(scope_id);
@@ -323,13 +475,17 @@ impl<'a> TraverseCtx<'a, MinifierState<'a>> {
         // consume the first declaration's facts before a later declaration of
         // the same symbol is visited. Disable every declaration-derived fact
         // from the outset instead of trying to repair an already-consumed value.
+        // A sloppy block function of the same name is another declaration whose
+        // assignment semantic analysis records on its own symbol, and a CommonJS
+        // wrapper parameter is a declaration absent from the AST.
         let has_multiple_value_declarations = self
             .scoping()
             .symbol_redeclarations(symbol_id)
             .iter()
             .filter(|declaration| declaration.flags.is_value())
             .nth(1)
-            .is_some();
+            .is_some()
+            || self.state.hidden_writes.contains(&symbol_id);
 
         // `constant` is the value-context value, `None` when withheld (e.g. a hoisted
         // `var` past a dirty prelude). Capture before it's moved just below.
@@ -368,8 +524,19 @@ impl<'a> TraverseCtx<'a, MinifierState<'a>> {
             references,
             kind: if has_multiple_value_declarations { FreshValueKind::None } else { kind },
             boolean_falsy,
+            tdz_declared_end: None,
         };
         self.state.symbols.init_value(symbol_id, symbol_value)
+    }
+
+    #[inline]
+    pub fn refresh_symbol_value_digest(&mut self, symbol_id: SymbolId) {
+        if let Some(sv) = self.state.symbols.value(symbol_id) {
+            let digest = crate::symbol_value::SymbolValueDigest::of(sv);
+            if self.state.symbols.update_digest(symbol_id, digest) && self.state.pass_index > 0 {
+                self.state.mark_symbol_scopes_dirty_current_pass(symbol_id, self.scoping.scoping());
+            }
+        }
     }
 
     /// If two expressions are equal.
@@ -445,6 +612,21 @@ impl<'a> TraverseCtx<'a, MinifierState<'a>> {
     /// the typed helper keeps dropped-subtree bookkeeping, the slot update,
     /// and the pass revisit request together.
     #[inline]
+    pub fn drop_expression_non_cascading(&mut self, expr: &Expression<'a>) {
+        self.dropped_subtree_collector().visit_expression(expr);
+        self.state.record_non_cascading_ast_change();
+    }
+
+    pub fn replace_expression_non_cascading(
+        &mut self,
+        slot: &mut Expression<'a>,
+        new: Expression<'a>,
+    ) {
+        self.dropped_subtree_collector().visit_expression(slot);
+        *slot = new;
+        self.state.record_non_cascading_ast_change();
+    }
+
     pub fn replace_expression(&mut self, slot: &mut Expression<'a>, new: Expression<'a>) {
         self.dropped_subtree_collector().visit_expression(slot);
         *slot = new;

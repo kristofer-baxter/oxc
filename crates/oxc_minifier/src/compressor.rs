@@ -48,13 +48,8 @@ impl<'a> Compressor<'a> {
         options: CompressOptions,
     ) -> u8 {
         let max_iterations = options.max_iterations;
-        let state = MinifierState::new(
-            program.source_type,
-            options,
-            CompressionMode::Full,
-            &scoping,
-            self.allocator,
-        );
+        let state =
+            MinifierState::new(program, options, CompressionMode::Full, &scoping, self.allocator);
         let mut ctx = ReusableTraverseCtx::new(state, scoping, self.allocator);
         let normalize_options = NormalizeOptions {
             convert_while_to_fors: true,
@@ -86,7 +81,7 @@ impl<'a> Compressor<'a> {
     ) -> u8 {
         let max_iterations = options.max_iterations;
         let state = MinifierState::new(
-            program.source_type,
+            program,
             options,
             CompressionMode::TreeShakeOnly,
             &scoping,

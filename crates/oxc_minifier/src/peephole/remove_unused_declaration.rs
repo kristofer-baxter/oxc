@@ -120,7 +120,16 @@ impl<'a> PeepholeOptimizations {
             BindingPattern::BindingIdentifier(ident) => {
                 if let Some(symbol_id) = ident.symbol_id.get() {
                     let is_unused = Self::symbol_is_unused_by_count(symbol_id, ctx)
-                        || Self::self_recursive_function_declarator_is_unused(decl, symbol_id, ctx);
+                        || Self::self_recursive_function_declarator_is_unused(decl, symbol_id, ctx)
+                        || (ctx.state.symbols.enum_iife_symbols.contains(&symbol_id)
+                            && decl.init.is_some()
+                            && ctx.state.symbols.verified_enum_iifes.get(&symbol_id).is_some_and(
+                                |&(self_iife_ref, self_write_ref)| {
+                                    ctx.scoping().get_resolved_reference_ids(symbol_id).iter().all(
+                                        |&r| Some(r) == self_iife_ref || Some(r) == self_write_ref,
+                                    )
+                                },
+                            ));
                     return is_unused && !Self::class_initializer_name_needs_to_be_kept(decl, ctx);
                 }
                 false
@@ -205,7 +214,9 @@ impl<'a> PeepholeOptimizations {
         if Self::is_script_root_scope(ctx) || ctx.current_scope_flags().contains_direct_eval() {
             return;
         }
-        if !Self::symbol_is_unused_by_count(symbol_id, ctx) {
+        if !Self::symbol_is_unused_by_count(symbol_id, ctx)
+            && !Self::self_recursive_class_declaration_is_unused(c, symbol_id, ctx)
+        {
             return;
         }
         if let Some(changed) = Self::remove_unused_class(c, ctx).map(|exprs| {
@@ -218,6 +229,46 @@ impl<'a> PeepholeOptimizations {
         }) {
             ctx.replace_statement(stmt, changed);
         }
+    }
+
+    fn self_recursive_class_declaration_is_unused(
+        c: &Class<'a>,
+        symbol_id: SymbolId,
+        ctx: &TraverseCtx<'a>,
+    ) -> bool {
+        if ctx.state.symbols.is_implicitly_observable(symbol_id)
+            || !c.decorators.is_empty()
+            || c.heritage.is_some()
+        {
+            return false;
+        }
+        let Some(class_scope_id) = c.scope_id.get() else { return false };
+        let elements_safe = c.body.body.iter().all(|el| match el {
+            ClassElement::MethodDefinition(m) => !m.computed && m.decorators.is_empty(),
+            ClassElement::PropertyDefinition(p) => {
+                !p.computed
+                    && p.decorators.is_empty()
+                    && (!p.r#static
+                        || p.value.as_ref().is_none_or(|v| {
+                            matches!(
+                                v.without_parentheses(),
+                                Expression::Identifier(id)
+                                    if ctx.scoping().get_reference(id.reference_id()).symbol_id()
+                                        == Some(symbol_id)
+                            )
+                        }))
+            }
+            ClassElement::TSIndexSignature(_) => true,
+            _ => false,
+        });
+        if !elements_safe {
+            return false;
+        }
+        ctx.scoping().get_resolved_references(symbol_id).all(|reference| {
+            ctx.scoping()
+                .scope_ancestors(reference.scope_id())
+                .any(|scope_id| scope_id == class_scope_id)
+        })
     }
 
     /// Whether bindings in the current scope are visible to later scripts.

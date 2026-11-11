@@ -302,11 +302,7 @@ mod terser_tests {
                     return "FAIL";
                 }());
             "#,
-            r#"
-                (function() {
-                    return console.log("PASS"), "FAIL";
-                })();
-            "#,
+            r#"console.log("PASS");"#,
             &["debug"],
         );
     }
@@ -323,11 +319,7 @@ mod terser_tests {
                     return "FAIL";
                 }());
             "#,
-            r#"
-                (function() {
-                    return console.log("PASS"), "FAIL";
-                })();
-            "#,
+            r#"console.log("PASS");"#,
             &["debug"],
         );
     }

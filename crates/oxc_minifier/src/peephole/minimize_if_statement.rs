@@ -117,7 +117,7 @@ impl<'a> PeepholeOptimizations {
             ctx.replace_expression_with(&mut if_stmt.test, |a, ctx| {
                 Self::join_with_left_associative_op(test.span(), LogicalOperator::And, a, test, ctx)
             });
-            ctx.replace_statement(&mut if_stmt.consequent, consequent);
+            if_stmt.consequent = consequent;
         }
 
         Self::wrap_to_avoid_ambiguous_else(if_stmt, ctx);

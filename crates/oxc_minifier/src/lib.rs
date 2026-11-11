@@ -46,6 +46,7 @@
 //!
 //! See the [crate documentation](https://github.com/oxc-project/oxc/tree/main/crates/oxc_minifier) for more details.
 
+mod annex_b_alias;
 mod compression_pass;
 mod compressor;
 pub(crate) mod generated;
@@ -85,6 +86,11 @@ pub(crate) use crate::generated::traverse::Traverse;
 pub(crate) use crate::traverse_context::MinifierTraverseCtx as TraverseCtx;
 pub(crate) use crate::traverse_context::ReusableMinifierTraverseCtx as ReusableTraverseCtx;
 pub use crate::{compressor::Compressor, options::*};
+
+/// Whether property folding must account for possible writes to `Object.prototype`.
+pub fn program_may_mutate_object_prototype(program: &Program<'_>) -> bool {
+    peephole::PeepholeOptimizations::program_may_mutate_object_prototype(program)
+}
 
 #[derive(Debug, Clone)]
 pub struct MinifierOptions {
@@ -185,6 +191,31 @@ impl<'a> Minifier {
                     builder = builder.with_stats(stats);
                 }
                 let mut semantic = builder.build(program).semantic;
+                let mut options = options;
+                let aliased = annex_b_alias::alias_annex_b_block_functions(
+                    &mut semantic,
+                    &mut options.reserved,
+                );
+                if options.keep_names.function {
+                    options.reserved.extend(aliased);
+                    reserve_function_names(&semantic, &mut options.reserved);
+                }
+                reserve_with_shadowed_bindings(semantic.scoping(), &mut options.reserved);
+                // A root binding that redeclares a CommonJS wrapper parameter is
+                // mapped to the wrapper's `arguments`, which renaming would break.
+                if program.source_type.is_commonjs() {
+                    let scoping = semantic.scoping();
+                    options.reserved.extend(
+                        state::COMMONJS_WRAPPER_PARAMETERS
+                            .into_iter()
+                            .filter(|name| {
+                                scoping
+                                    .get_binding(scoping.root_scope_id(), (*name).into())
+                                    .is_some()
+                            })
+                            .map(CompactStr::from),
+                    );
+                }
                 let class_private_mappings = Mangler::default()
                     .with_options(options)
                     .build_with_semantic(&mut semantic, program);
@@ -192,5 +223,129 @@ impl<'a> Minifier {
             })
             .map_or((None, None), |(scoping, mappings)| (Some(scoping), Some(mappings)));
         MinifierReturn { scoping, class_private_mappings, property_mangle_cache, iterations }
+    }
+}
+
+/// Reserve bindings whose resolved references cross a `with` statement scope so
+/// the mangler does not rename an identifier that a `with` object may intercept.
+fn reserve_with_shadowed_bindings(
+    scoping: &Scoping,
+    reserved: &mut rustc_hash::FxHashSet<CompactStr>,
+) {
+    use oxc_syntax::scope::ScopeFlags;
+    if !scoping
+        .scope_descendants_from_root()
+        .any(|scope_id| scoping.scope_flags(scope_id).contains(ScopeFlags::With))
+    {
+        return;
+    }
+    for symbol_id in scoping.symbol_ids() {
+        let decl_scope = scoping.symbol_scope_id(symbol_id);
+        let crosses_with = scoping.get_resolved_references(symbol_id).any(|reference| {
+            scoping
+                .scope_ancestors(reference.scope_id())
+                .take_while(|&scope_id| scope_id != decl_scope)
+                .any(|scope_id| scoping.scope_flags(scope_id).contains(ScopeFlags::With))
+        });
+        if crosses_with {
+            reserved.insert(CompactStr::from(scoping.symbol_name(symbol_id)));
+        }
+    }
+}
+
+/// Reserve function names, including inferred names from parameter defaults.
+fn reserve_function_names(
+    semantic: &oxc_semantic::Semantic<'_>,
+    reserved: &mut rustc_hash::FxHashSet<CompactStr>,
+) {
+    use oxc_ast::{AstKind, ast::*};
+    use oxc_syntax::symbol::SymbolId;
+
+    fn is_anonymous_fn(expr: &Expression<'_>) -> bool {
+        expr.is_anonymous_function_definition()
+            && !matches!(expr.without_parentheses(), Expression::ClassExpression(_))
+    }
+
+    fn find_assign_pattern_for_symbol<'a>(
+        pattern: &'a BindingPattern<'a>,
+        symbol_id: SymbolId,
+    ) -> Option<&'a AssignmentPattern<'a>> {
+        match pattern {
+            BindingPattern::BindingIdentifier(_) => None,
+            BindingPattern::ObjectPattern(obj) => obj
+                .properties
+                .iter()
+                .find_map(|p| find_assign_pattern_for_symbol(&p.value, symbol_id)),
+            BindingPattern::ArrayPattern(arr) => arr
+                .elements
+                .iter()
+                .flatten()
+                .find_map(|el| find_assign_pattern_for_symbol(el, symbol_id)),
+            BindingPattern::AssignmentPattern(assign) => {
+                if matches!(&assign.left, BindingPattern::BindingIdentifier(id) if id.symbol_id() == symbol_id)
+                {
+                    return Some(assign);
+                }
+                find_assign_pattern_for_symbol(&assign.left, symbol_id)
+            }
+        }
+    }
+
+    let scoping = semantic.scoping();
+    let ast_nodes = semantic.nodes();
+
+    for symbol_id in scoping.symbol_ids() {
+        let decl_node = ast_nodes.get_node(scoping.symbol_declaration(symbol_id));
+        let mut is_fn_name_symbol = match decl_node.kind() {
+            AstKind::Function(function) => {
+                function.id.as_ref().is_some_and(|id| id.symbol_id() == symbol_id)
+            }
+            AstKind::VariableDeclarator(decl) => {
+                if let BindingPattern::BindingIdentifier(id) = &decl.id
+                    && id.symbol_id() == symbol_id
+                {
+                    decl.init.as_ref().is_some_and(is_anonymous_fn)
+                } else {
+                    find_assign_pattern_for_symbol(&decl.id, symbol_id)
+                        .is_some_and(|assign| is_anonymous_fn(&assign.right))
+                }
+            }
+            AstKind::FormalParameter(param) => {
+                if let BindingPattern::BindingIdentifier(id) = &param.pattern
+                    && id.symbol_id() == symbol_id
+                {
+                    param.initializer.as_ref().is_some_and(|init| is_anonymous_fn(init))
+                } else {
+                    find_assign_pattern_for_symbol(&param.pattern, symbol_id)
+                        .is_some_and(|assign| is_anonymous_fn(&assign.right))
+                }
+            }
+            _ => false,
+        };
+        if !is_fn_name_symbol {
+            is_fn_name_symbol =
+                scoping.get_resolved_reference_ids(symbol_id).iter().any(|&ref_id| {
+                    let node_id = scoping.get_reference(ref_id).node_id();
+                    let parent_id = ast_nodes.parent_id(node_id);
+                    match ast_nodes.kind(parent_id) {
+                        AstKind::AssignmentExpression(assign) => {
+                            matches!(&assign.left, AssignmentTarget::AssignmentTargetIdentifier(id) if id.reference_id() == ref_id)
+                                && is_anonymous_fn(&assign.right)
+                        }
+                        AstKind::AssignmentTargetWithDefault(assign) => {
+                            matches!(&assign.binding, AssignmentTarget::AssignmentTargetIdentifier(id) if id.reference_id() == ref_id)
+                                && is_anonymous_fn(&assign.init)
+                        }
+                        AstKind::AssignmentTargetPropertyIdentifier(ident) => {
+                            ident.binding.reference_id() == ref_id
+                                && ident.init.as_ref().is_some_and(is_anonymous_fn)
+                        }
+                        _ => false,
+                    }
+                });
+        }
+        if is_fn_name_symbol {
+            reserved.insert(CompactStr::from(scoping.symbol_name(symbol_id)));
+        }
     }
 }

@@ -34,6 +34,14 @@ use super::PeepholeOptimizations;
 /// <https://github.com/google/closure-compiler/blob/v20240609/src/com/google/javascript/jscomp/PeepholeSubstituteAlternateSyntax.java>
 impl<'a> PeepholeOptimizations {
     pub fn substitute_object_property(prop: &mut ObjectProperty<'a>, ctx: &mut TraverseCtx<'a>) {
+        // `{ __proto__ }` defines an own property, but once the binding is
+        // renamed it prints as `{ __proto__: e }`, which sets the prototype.
+        if prop.shorthand && prop.key.is_specific_id("__proto__") {
+            prop.computed = true;
+            prop.key = PropertyKey::new_string_literal(prop.key.span(), "__proto__", None, ctx);
+            prop.shorthand = false;
+            ctx.notice_change();
+        }
         // <https://tc39.es/ecma262/2024/multipage/ecmascript-language-expressions.html#sec-runtime-semantics-propertydefinitionevaluation>
         if !prop.method
             && let PropertyKey::StringLiteral(str) = &prop.key
@@ -1074,7 +1082,7 @@ impl<'a> PeepholeOptimizations {
             return;
         }
         if let Some(old) = stmt.argument.take() {
-            ctx.drop_expression(&old);
+            ctx.drop_expression_non_cascading(&old);
         }
     }
 
@@ -1570,7 +1578,7 @@ impl<'a> PeepholeOptimizations {
             && !ctx.scoping().scope_flags(func.scope_id()).contains_direct_eval()
         {
             func.id = None;
-            ctx.notice_change();
+            ctx.state.record_non_cascading_ast_change();
         }
     }
 
@@ -1588,7 +1596,7 @@ impl<'a> PeepholeOptimizations {
             && !ctx.scoping().scope_flags(class.scope_id()).contains_direct_eval()
         {
             class.id = None;
-            ctx.notice_change();
+            ctx.state.record_non_cascading_ast_change();
         }
     }
 
@@ -1618,7 +1626,19 @@ impl<'a> PeepholeOptimizations {
         );
         let new_value =
             Expression::new_unary_expression(lit.span, UnaryOperator::LogicalNot, num, ctx);
-        ctx.replace_expression(expr, new_value);
+        *expr = new_value;
+        if matches!(
+            ctx.parent(),
+            Ancestor::VariableDeclaratorInit(_)
+                | Ancestor::AssignmentExpressionRight(_)
+                | Ancestor::ObjectPropertyValue(_)
+                | Ancestor::ReturnStatementArgument(_)
+                | Ancestor::CallExpressionArguments(_)
+        ) {
+            ctx.state.record_non_cascading_ast_change();
+        } else {
+            ctx.state.record_ast_change();
+        }
     }
 
     /// Flatten the spread of constant array literals inside array expressions:

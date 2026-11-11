@@ -73,7 +73,6 @@ impl ReferenceCounts {
         self.reads > 1
     }
 
-    #[inline]
     pub fn has_only_member_write_target_reads(self) -> bool {
         self.writes == 0 && self.reads == self.member_write_target_reads
     }
@@ -115,6 +114,14 @@ pub struct SymbolValue<'a> {
     /// indistinguishable inside `if (x)` / `x ? …` / `!x`, so such reads fold to
     /// `false` there. See `minimize_expression_in_boolean_context` / #14001.
     pub boolean_falsy: bool,
+
+    /// End offset of a lexical (`let`/`const`) declarator whose closure reads
+    /// might run while the binding is still in its temporal dead zone. Such a
+    /// read must throw a `ReferenceError`, so it sees `initialized_constant`
+    /// only when its outermost closure is created after this offset (see
+    /// `TraverseCtx::constant_visible_to_reference`). `None` when every read
+    /// provably runs after initialization.
+    pub tdz_declared_end: Option<u32>,
 }
 
 impl SymbolValue<'_> {
@@ -143,5 +150,39 @@ impl SymbolValue<'_> {
                 ConstantValue::String(s) => s.as_str().is_some_and(|s| s.len() <= 3),
                 ConstantValue::Boolean(_) | ConstantValue::Undefined | ConstantValue::Null => true,
             }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SymbolValueDigest {
+    constant_hash: u64,
+    tdz_declared_end: Option<u32>,
+    kind: u8,
+    flags: u8,
+}
+
+impl SymbolValueDigest {
+    pub fn of(sv: &SymbolValue<'_>) -> Self {
+        use std::hash::{Hash, Hasher};
+        let constant_hash = match &sv.initialized_constant {
+            None => 0,
+            Some(cv) => {
+                let mut h = rustc_hash::FxHasher::default();
+                std::mem::discriminant(cv).hash(&mut h);
+                match cv {
+                    ConstantValue::Number(n) => n.to_bits().hash(&mut h),
+                    ConstantValue::BigInt(b) => b.hash(&mut h),
+                    ConstantValue::String(s) => s.hash(&mut h),
+                    ConstantValue::Boolean(b) => b.hash(&mut h),
+                    ConstantValue::Undefined | ConstantValue::Null => {}
+                }
+                h.finish().max(1)
+            }
+        };
+        let kind = sv.kind as u8;
+        let flags = u8::from(sv.allow_constant_inlining)
+            | (u8::from(sv.implicit_undefined) << 1)
+            | (u8::from(sv.boolean_falsy) << 2);
+        Self { constant_hash, tdz_declared_end: sv.tdz_declared_end, kind, flags }
     }
 }

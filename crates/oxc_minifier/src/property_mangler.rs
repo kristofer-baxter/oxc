@@ -47,6 +47,20 @@ impl ManglePropertyCache {
         Ok(())
     }
 
+    /// Add a cache entry from string slices.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `target` is not an `IdentifierName` or is a hard-reserved property
+    /// name.
+    pub fn insert_str(
+        &mut self,
+        original: &str,
+        target: Option<&str>,
+    ) -> Result<(), InvalidManglePropertyCacheTarget> {
+        self.insert(CompactStr::new(original), target.map(CompactStr::new))
+    }
+
     /// Return the pinned target or reservation for an original property name.
     pub fn get(&self, original: &str) -> Option<&Option<CompactStr>> {
         self.0.get(original)
@@ -107,10 +121,16 @@ pub type PropertyMapping<'a> = ArenaIdentHashMap<'a, Ident<'a>>;
 pub struct ManglePropertiesOptions {
     /// Property names must match this expression to be mangled.
     pub include: lazy_regex::Regex,
+    /// Optional exact allowlist of property names eligible for mangling.
+    pub include_names: Option<FxHashSet<CompactStr>>,
     /// Matching property names are excluded after `include` is evaluated.
     pub exclude: Option<lazy_regex::Regex>,
+    /// Dynamic property-key prefixes that must remain unmangled.
+    pub exclude_prefixes: Vec<CompactStr>,
     /// Exact property names that must remain unchanged.
     pub reserved: FxHashSet<CompactStr>,
+    /// Reserve ASCII identifier-like words occurring in non-annotated strings and templates.
+    pub reserve_string_words: bool,
     /// Also mangle quoted property occurrences.
     pub mangle_quoted: bool,
     /// Generate readable property names instead of base54 names.
@@ -123,12 +143,38 @@ impl ManglePropertiesOptions {
     pub fn new(include: lazy_regex::Regex) -> Self {
         Self {
             include,
+            include_names: None,
             exclude: None,
+            exclude_prefixes: Vec::new(),
             reserved: FxHashSet::default(),
+            reserve_string_words: false,
             mangle_quoted: false,
             debug: false,
             cache: ManglePropertyCache::default(),
         }
+    }
+
+    /// Create options from an exact allowlist, reserving words in non-annotated strings.
+    ///
+    /// The default [`Self::include`] matches every name, including empty and multiline names.
+    /// Overrides, exclusions, reservations, numeric names, and hard-reserved names take
+    /// precedence, including over pinned cache entries.
+    pub fn from_names(names: impl IntoIterator<Item = impl AsRef<str>>) -> Self {
+        let mut options = Self::new(lazy_regex::Regex::clone(lazy_regex::regex!("(?s:.*)")));
+        options.include_names =
+            Some(names.into_iter().map(|s| CompactStr::new(s.as_ref())).collect());
+        options.reserve_string_words = true;
+        options
+    }
+
+    /// Reserve an exact property name so it is never mangled or generated as a target.
+    pub fn reserve_name(&mut self, name: &str) {
+        self.reserved.insert(CompactStr::new(name));
+    }
+
+    /// Add a dynamic property-key prefix that must remain unmangled.
+    pub fn exclude_prefix(&mut self, prefix: &str) {
+        self.exclude_prefixes.push(CompactStr::new(prefix));
     }
 
     /// Compile an `include` pattern using Rust's regex syntax.
@@ -223,8 +269,13 @@ fn is_eligible(options: &ManglePropertiesOptions, name: &str) -> bool {
     if is_hard_reserved(name)
         || is_canonical_numeric_string(name)
         || options.reserved.contains(name)
+        || options.include_names.as_ref().is_some_and(|names| !names.contains(name))
         || !options.include.is_match(name)
         || options.exclude.as_ref().is_some_and(|regex| regex.is_match(name))
+        || options
+            .exclude_prefixes
+            .iter()
+            .any(|prefix| !prefix.is_empty() && name.starts_with(prefix.as_str()))
     {
         return false;
     }
@@ -260,18 +311,49 @@ impl<'o, 'a> PropertyCollector<'o, 'a> {
         self.state.occupied.insert(name);
     }
 
+    fn occupy_string_words(&mut self, bytes: &'a [u8]) {
+        if !self.options.reserve_string_words {
+            return;
+        }
+        let mut i = 0;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if b.is_ascii_alphabetic() || b == b'_' || b == b'$' {
+                let start = i;
+                i += 1;
+                while i < bytes.len()
+                    && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] == b'$')
+                {
+                    i += 1;
+                }
+                let word = std::str::from_utf8(&bytes[start..i])
+                    .expect("identifier words contain only ASCII");
+                self.occupy(Ident::from(word));
+            } else {
+                i += 1;
+            }
+        }
+    }
+
     fn special_literal(&self, span: Span) -> bool {
         self.key_annotated.contains(&span.start)
     }
 
-    fn observe_literal(&mut self, span: Span, name: Ident<'a>) {
-        if self.special_literal(span) {
-            self.candidate(name);
-        } else {
-            // Compression can propagate or fold an arbitrary string into a property key after
-            // property names have already been assigned. Keep every literal spelling out of the
-            // generated namespace so that later materialization cannot merge distinct keys.
-            self.occupy(name);
+    fn observe_literal(&mut self, span: Span, value: JSStr<'a>) {
+        let annotated = self.special_literal(span);
+        if let Some(name) = value.as_str() {
+            let name = Ident::from(name);
+            if annotated {
+                self.candidate(name);
+            } else {
+                // Compression can propagate or fold an arbitrary string into a property key
+                // after names have been assigned. Keep its spelling out of the generated
+                // namespace so that later materialization cannot merge distinct keys.
+                self.occupy(name);
+            }
+        }
+        if !annotated {
+            self.occupy_string_words(value.as_bytes());
         }
     }
 
@@ -332,6 +414,7 @@ impl<'a> Visit<'a> for PropertyCollector<'_, 'a> {
         if let Some(name) = directive.expression.value.as_str() {
             self.occupy(Ident::from(name));
         }
+        self.occupy_string_words(directive.expression.value.as_bytes());
     }
 
     fn visit_ts_type(&mut self, _ty: &TSType<'a>) {}
@@ -389,17 +472,23 @@ impl<'a> Visit<'a> for PropertyCollector<'_, 'a> {
     }
 
     fn visit_string_literal(&mut self, literal: &StringLiteral<'a>) {
-        if let Some(name) = literal.value.as_str() {
-            self.observe_literal(literal.span, Ident::from(name));
-        }
+        self.observe_literal(literal.span, literal.value);
     }
 
     fn visit_template_literal(&mut self, template: &TemplateLiteral<'a>) {
         if template.expressions.is_empty()
             && let [quasi] = template.quasis.as_slice()
-            && let Some(cooked) = quasi.value.cooked.and_then(JSStr::as_str)
+            && let Some(cooked) = quasi.value.cooked
         {
-            self.observe_literal(template.span, Ident::from(cooked));
+            self.observe_literal(template.span, cooked);
+        } else if self.options.reserve_string_words {
+            for quasi in &template.quasis {
+                let bytes = match quasi.value.cooked {
+                    Some(cooked) => cooked.as_bytes(),
+                    None => quasi.value.raw.as_str().as_bytes(),
+                };
+                self.occupy_string_words(bytes);
+            }
         }
         walk::walk_template_literal(self, template);
     }
@@ -434,8 +523,14 @@ fn assign<'a>(
     allocator: &'a Allocator,
 ) -> (PropertyMapping<'a>, ManglePropertyCache) {
     // Eligibility depends only on the name, so evaluate it once after collection.
-    let mut names: Vec<_> =
-        state.frequencies.iter().filter(|(name, _)| is_eligible(options, name.as_str())).collect();
+    let mut names: Vec<_> = state
+        .frequencies
+        .iter()
+        .filter(|(name, _)| {
+            is_eligible(options, name.as_str())
+                && (!options.reserve_string_words || !state.occupied.contains(*name))
+        })
+        .collect();
     names.sort_unstable_by(|(name_a, count_a), (name_b, count_b)| {
         count_b.cmp(count_a).then_with(|| name_a.as_str().cmp(name_b.as_str()))
     });

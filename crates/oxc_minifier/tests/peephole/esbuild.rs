@@ -1301,7 +1301,7 @@ fn test_flatten_values() {
     test("(function() {})()", "");
     test("(function*() {})()", "");
     test("(async function() {})()", "");
-    test("(function() { a() })()", "(function() { a();})();");
+    test("(function() { a() })()", "a();");
     test("(function*() { a() })()", "(function* () { a();})();");
     test("(async function() { a() })()", "(async function() { a();})();");
     test("(() => x)()", "x;");
@@ -2409,8 +2409,8 @@ fn prune_empty_case_before_default() {
         "switch (x) { case 0: foo(); break; case y: default: bar();}",
     );
 
-    // Empty default not at end should be preserved
-    test("switch (x) { default: case 1: bar() }", "switch (x) { default: case 1: bar();}");
+    // Both branches execute the same body.
+    test("switch (x) { default: case 1: bar() }", "x, bar();");
 
     // String literals should also be removed
     test("switch (x) { case 'a': case 'b': default: bar() }", "x, bar();");

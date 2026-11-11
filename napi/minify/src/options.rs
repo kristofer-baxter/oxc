@@ -353,7 +353,6 @@ impl TryFrom<&ManglePropertiesOptions> for oxc_minifier::ManglePropertiesOptions
         }
 
         Ok(Self {
-            include,
             exclude,
             reserved: options.reserved.as_ref().map_or_else(Default::default, |names| {
                 names.iter().map(|name| CompactStr::from(name.as_str())).collect()
@@ -361,6 +360,7 @@ impl TryFrom<&ManglePropertiesOptions> for oxc_minifier::ManglePropertiesOptions
             mangle_quoted: options.quoted.unwrap_or(false),
             debug: options.debug.unwrap_or(false),
             cache,
+            ..Self::new(include)
         })
     }
 }

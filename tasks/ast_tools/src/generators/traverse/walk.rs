@@ -168,6 +168,9 @@ fn generate_walk_for_struct(
     let mut fields_code = quote!();
     let mut scope_entered = false;
     let mut scope_exited = false;
+    let incremental_function =
+        !config.has_state && matches!(struct_def.name(), "Function" | "ArrowFunctionExpression");
+    let mut function_prefix = None;
 
     for (i, (field_index, field)) in visited_fields.iter().enumerate() {
         // Scope entry before this field
@@ -196,6 +199,12 @@ fn generate_walk_for_struct(
 
         let field_type = field.type_def(schema);
         let is_option = field_type.is_option();
+        if incremental_function && field.name() == "params" {
+            function_prefix = Some(std::mem::take(&mut fields_code));
+        }
+        if !config.has_state && struct_def.name() == "Program" && field.name() == "body" {
+            fields_code.extend(quote! { ctx.state.enter_root_scope(current_scope_id); });
+        }
 
         // Ancestor stack handling + field walk code
         // For the first field: push_stack before the field walk (outside any Option guard)
@@ -225,6 +234,17 @@ fn generate_walk_for_struct(
         }
     }
 
+    if let Some(prefix) = function_prefix {
+        fields_code = quote! {
+            #prefix
+            if !ctx.state.should_skip_function_scope(current_scope_id) {
+                ctx.state.enter_function_scope(current_scope_id);
+                #fields_code
+                ctx.state.exit_function_scope();
+            }
+        };
+    }
+
     // Pop stack after all fields
     if !visited_fields.is_empty() {
         fields_code.extend(quote! { ctx.pop_stack(pop_token); });
@@ -242,6 +262,11 @@ fn generate_walk_for_struct(
     } else {
         quote!()
     };
+    let after_exit = if !config.has_state && struct_def.name() == "Program" {
+        quote! { ctx.state.exit_root_scope(); }
+    } else {
+        quote!()
+    };
 
     quote! {
         ///@@line_break
@@ -254,6 +279,7 @@ fn generate_walk_for_struct(
             #fields_code
             #exit_scope_after
             traverser.#exit_fn_name(&mut *node, ctx);
+            #after_exit
         }
     }
 }
@@ -578,6 +604,125 @@ fn generate_walk_for_enum(enum_def: &EnumDef, schema: &Schema, config: &WalkConf
         });
     }
 
+    let (before_enter, exit) = if !config.has_state && enum_def.name() == "Expression" {
+        (
+            quote! {
+                let own_dirty_at_entry = ctx.state.is_current_body_own_dirty();
+                if !own_dirty_at_entry && matches!(
+                    &*node,
+                    Expression::NullLiteral(_)
+                        | Expression::NumericLiteral(_)
+                        | Expression::BigIntLiteral(_)
+                        | Expression::RegExpLiteral(_)
+                        | Expression::StringLiteral(_)
+                        | Expression::Identifier(_)
+                        | Expression::Super(_)
+                        | Expression::ThisExpression(_)
+                ) {
+                    return;
+                }
+                let saved_changes = ctx.state.cascading_change_counter;
+            },
+            quote! {
+                let is_fn_or_iife = matches!(
+                    &*node,
+                    Expression::BooleanLiteral(_)
+                        | Expression::FunctionExpression(_)
+                        | Expression::ArrowFunctionExpression(_)
+                        | Expression::ClassExpression(_)
+                ) || matches!(
+                    &*node,
+                    Expression::CallExpression(c)
+                        if matches!(c.callee, Expression::FunctionExpression(_) | Expression::ArrowFunctionExpression(_))
+                );
+                if own_dirty_at_entry || is_fn_or_iife
+                    || ctx.state.cascading_change_counter != saved_changes
+                    || ctx.state.is_current_body_own_dirty()
+                {
+                    traverser.#exit_fn_name(&mut *node, ctx);
+                }
+            },
+        )
+    } else if !config.has_state && enum_def.name() == "Statement" {
+        (
+            quote! {
+                if ctx.state.pass_index > 0
+                        && !ctx.state.dirty_all_scopes
+                        && let Statement::FunctionDeclaration(f) = &*node
+                        && let Some(scope_id) = f.scope_id.get()
+                        && ctx.state.should_skip_function_scope(scope_id)
+                        && let Some(symbol_id) = f.id.as_ref().and_then(|id| id.symbol_id.get())
+                        && ctx.state.symbols.has_cached_ref_counts(symbol_id)
+                        && !ctx.scoping().symbol_is_unused(symbol_id)
+                        && !ctx.state.symbols.function_is_dead(symbol_id)
+                    {
+                        traverser.#enter_fn_name(&mut *node, ctx);
+                        if !ctx.is_tree_shake_only()
+                            && let Statement::FunctionDeclaration(f) = &*node
+                        {
+                            crate::peephole::PeepholeOptimizations::init_function_declaration_symbol_value(
+                                f.id.as_ref(), ctx,
+                            );
+                        }
+                        return;
+                }
+                let own_dirty_at_entry = ctx.state.is_current_body_own_dirty();
+                if !own_dirty_at_entry {
+                    match &*node {
+                        Statement::EmptyStatement(_)
+                        | Statement::BreakStatement(_)
+                        | Statement::ContinueStatement(_) => return,
+                        Statement::FunctionDeclaration(f) => {
+                            if let Some(scope_id) = f.scope_id.get()
+                                && ctx.state.should_skip_function_scope(scope_id)
+                            {
+                                traverser.#enter_fn_name(&mut *node, ctx);
+                                if !ctx.is_tree_shake_only()
+                                    && let Statement::FunctionDeclaration(f) = &*node
+                                {
+                                    crate::peephole::PeepholeOptimizations::init_function_declaration_symbol_value(
+                                        f.id.as_ref(), ctx,
+                                    );
+                                }
+                                return;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let was_body_var_decl =
+                    crate::peephole::PeepholeOptimizations::is_body_variable_declaration(&*node);
+                let saved_changes = ctx.state.cascading_change_counter;
+            },
+            quote! {
+                if own_dirty_at_entry
+                    || ctx.state.cascading_change_counter != saved_changes
+                    || ctx.state.is_current_body_own_dirty()
+                {
+                    traverser.#exit_fn_name(&mut *node, ctx);
+                } else {
+                    if !ctx.is_tree_shake_only() {
+                        match &*node {
+                            Statement::FunctionDeclaration(f) => {
+                                crate::peephole::PeepholeOptimizations::init_function_declaration_symbol_value(
+                                    f.id.as_ref(), ctx,
+                                );
+                            }
+                            Statement::ClassDeclaration(c) => {
+                                crate::peephole::PeepholeOptimizations::init_class_declaration_symbol_value(c, ctx);
+                            }
+                            _ => {}
+                        }
+                    }
+                    crate::peephole::PeepholeOptimizations::update_body_prelude_after_statement(
+                        &*node, was_body_var_decl, ctx,
+                    );
+                }
+            },
+        )
+    } else {
+        (quote!(), quote! { traverser.#exit_fn_name(&mut *node, ctx); })
+    };
     quote! {
         ///@@line_break
         unsafe fn #walk_fn_name<#walk_generics>(
@@ -585,11 +730,12 @@ fn generate_walk_for_enum(enum_def: &EnumDef, schema: &Schema, config: &WalkConf
             node: *mut #enum_ty,
             ctx: &mut #ctx_ty,
         ) {
+            #before_enter
             traverser.#enter_fn_name(&mut *node, ctx);
             match &mut *node {
                 #match_arms
             }
-            traverser.#exit_fn_name(&mut *node, ctx);
+            #exit
         }
     }
 }

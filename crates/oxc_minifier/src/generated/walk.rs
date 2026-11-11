@@ -66,6 +66,7 @@ unsafe fn walk_program<'a, Tr: Traverse<'a>>(
     {
         walk_directive(traverser, item as *mut _, ctx);
     }
+    ctx.state.enter_root_scope(current_scope_id);
     ctx.retag_stack(AncestorType::ProgramBody);
     walk_statements(
         traverser,
@@ -77,6 +78,7 @@ unsafe fn walk_program<'a, Tr: Traverse<'a>>(
     ctx.set_current_hoist_scope_id(previous_hoist_scope_id);
     ctx.set_current_block_scope_id(previous_block_scope_id);
     traverser.exit_program(&mut *node, ctx);
+    ctx.state.exit_root_scope();
 }
 
 unsafe fn walk_expression<'a, Tr: Traverse<'a>>(
@@ -84,6 +86,23 @@ unsafe fn walk_expression<'a, Tr: Traverse<'a>>(
     node: *mut Expression<'a>,
     ctx: &mut TraverseCtx<'a>,
 ) {
+    let own_dirty_at_entry = ctx.state.is_current_body_own_dirty();
+    if !own_dirty_at_entry
+        && matches!(
+            &*node,
+            Expression::NullLiteral(_)
+                | Expression::NumericLiteral(_)
+                | Expression::BigIntLiteral(_)
+                | Expression::RegExpLiteral(_)
+                | Expression::StringLiteral(_)
+                | Expression::Identifier(_)
+                | Expression::Super(_)
+                | Expression::ThisExpression(_)
+        )
+    {
+        return;
+    }
+    let saved_changes = ctx.state.cascading_change_counter;
     traverser.enter_expression(&mut *node, ctx);
     match &mut *node {
         Expression::BooleanLiteral(node) => {
@@ -201,7 +220,23 @@ unsafe fn walk_expression<'a, Tr: Traverse<'a>>(
             walk_member_expression(traverser, node as *mut _, ctx)
         }
     }
-    traverser.exit_expression(&mut *node, ctx);
+    let is_fn_or_iife = matches!(
+        &*node,
+        Expression::BooleanLiteral(_)
+            | Expression::FunctionExpression(_)
+            | Expression::ArrowFunctionExpression(_)
+            | Expression::ClassExpression(_)
+    ) || matches!(
+        & * node, Expression::CallExpression(c) if matches!(c.callee,
+        Expression::FunctionExpression(_) | Expression::ArrowFunctionExpression(_))
+    );
+    if own_dirty_at_entry
+        || is_fn_or_iife
+        || ctx.state.cascading_change_counter != saved_changes
+        || ctx.state.is_current_body_own_dirty()
+    {
+        traverser.exit_expression(&mut *node, ctx);
+    }
 }
 
 unsafe fn walk_identifier_name<'a, Tr: Traverse<'a>>(
@@ -1314,6 +1349,55 @@ unsafe fn walk_statement<'a, Tr: Traverse<'a>>(
     node: *mut Statement<'a>,
     ctx: &mut TraverseCtx<'a>,
 ) {
+    if ctx.state.pass_index > 0
+        && !ctx.state.dirty_all_scopes
+        && let Statement::FunctionDeclaration(f) = &*node
+        && let Some(scope_id) = f.scope_id.get()
+        && ctx.state.should_skip_function_scope(scope_id)
+        && let Some(symbol_id) = f.id.as_ref().and_then(|id| id.symbol_id.get())
+        && ctx.state.symbols.has_cached_ref_counts(symbol_id)
+        && !ctx.scoping().symbol_is_unused(symbol_id)
+        && !ctx.state.symbols.function_is_dead(symbol_id)
+    {
+        traverser.enter_statement(&mut *node, ctx);
+        if !ctx.is_tree_shake_only()
+            && let Statement::FunctionDeclaration(f) = &*node
+        {
+            crate::peephole::PeepholeOptimizations::init_function_declaration_symbol_value(
+                f.id.as_ref(),
+                ctx,
+            );
+        }
+        return;
+    }
+    let own_dirty_at_entry = ctx.state.is_current_body_own_dirty();
+    if !own_dirty_at_entry {
+        match &*node {
+            Statement::EmptyStatement(_)
+            | Statement::BreakStatement(_)
+            | Statement::ContinueStatement(_) => return,
+            Statement::FunctionDeclaration(f) => {
+                if let Some(scope_id) = f.scope_id.get()
+                    && ctx.state.should_skip_function_scope(scope_id)
+                {
+                    traverser.enter_statement(&mut *node, ctx);
+                    if !ctx.is_tree_shake_only()
+                        && let Statement::FunctionDeclaration(f) = &*node
+                    {
+                        crate::peephole::PeepholeOptimizations::init_function_declaration_symbol_value(
+                            f.id.as_ref(),
+                            ctx,
+                        );
+                    }
+                    return;
+                }
+            }
+            _ => {}
+        }
+    }
+    let was_body_var_decl =
+        crate::peephole::PeepholeOptimizations::is_body_variable_declaration(&*node);
+    let saved_changes = ctx.state.cascading_change_counter;
     traverser.enter_statement(&mut *node, ctx);
     match &mut *node {
         Statement::BlockStatement(node) => {
@@ -1391,7 +1475,34 @@ unsafe fn walk_statement<'a, Tr: Traverse<'a>>(
             walk_module_declaration(traverser, node as *mut _, ctx)
         }
     }
-    traverser.exit_statement(&mut *node, ctx);
+    if own_dirty_at_entry
+        || ctx.state.cascading_change_counter != saved_changes
+        || ctx.state.is_current_body_own_dirty()
+    {
+        traverser.exit_statement(&mut *node, ctx);
+    } else {
+        if !ctx.is_tree_shake_only() {
+            match &*node {
+                Statement::FunctionDeclaration(f) => {
+                    crate::peephole::PeepholeOptimizations::init_function_declaration_symbol_value(
+                        f.id.as_ref(),
+                        ctx,
+                    );
+                }
+                Statement::ClassDeclaration(c) => {
+                    crate::peephole::PeepholeOptimizations::init_class_declaration_symbol_value(
+                        c, ctx,
+                    );
+                }
+                _ => {}
+            }
+        }
+        crate::peephole::PeepholeOptimizations::update_body_prelude_after_statement(
+            &*node,
+            was_body_var_decl,
+            ctx,
+        );
+    }
 }
 
 unsafe fn walk_directive<'a, Tr: Traverse<'a>>(
@@ -2299,24 +2410,28 @@ unsafe fn walk_function<'a, Tr: Traverse<'a>>(
         ctx.retag_stack(AncestorType::FunctionThisParam);
         walk_ts_this_parameter(traverser, (&mut **field) as *mut _, ctx);
     }
-    ctx.retag_stack(AncestorType::FunctionParams);
-    walk_formal_parameters(
-        traverser,
-        (&mut **((node as *mut u8).add(ancestor::OFFSET_FUNCTION_PARAMS)
-            as *mut ArenaBox<FormalParameters>)) as *mut _,
-        ctx,
-    );
-    if let Some(field) = &mut *((node as *mut u8).add(ancestor::OFFSET_FUNCTION_RETURN_TYPE)
-        as *mut Option<ArenaBox<TSTypeAnnotation>>)
-    {
-        ctx.retag_stack(AncestorType::FunctionReturnType);
-        walk_ts_type_annotation(traverser, (&mut **field) as *mut _, ctx);
-    }
-    if let Some(field) = &mut *((node as *mut u8).add(ancestor::OFFSET_FUNCTION_BODY)
-        as *mut Option<ArenaBox<FunctionBody>>)
-    {
-        ctx.retag_stack(AncestorType::FunctionBody);
-        walk_function_body(traverser, (&mut **field) as *mut _, ctx);
+    if !ctx.state.should_skip_function_scope(current_scope_id) {
+        ctx.state.enter_function_scope(current_scope_id);
+        ctx.retag_stack(AncestorType::FunctionParams);
+        walk_formal_parameters(
+            traverser,
+            (&mut **((node as *mut u8).add(ancestor::OFFSET_FUNCTION_PARAMS)
+                as *mut ArenaBox<FormalParameters>)) as *mut _,
+            ctx,
+        );
+        if let Some(field) = &mut *((node as *mut u8).add(ancestor::OFFSET_FUNCTION_RETURN_TYPE)
+            as *mut Option<ArenaBox<TSTypeAnnotation>>)
+        {
+            ctx.retag_stack(AncestorType::FunctionReturnType);
+            walk_ts_type_annotation(traverser, (&mut **field) as *mut _, ctx);
+        }
+        if let Some(field) = &mut *((node as *mut u8).add(ancestor::OFFSET_FUNCTION_BODY)
+            as *mut Option<ArenaBox<FunctionBody>>)
+        {
+            ctx.retag_stack(AncestorType::FunctionBody);
+            walk_function_body(traverser, (&mut **field) as *mut _, ctx);
+        }
+        ctx.state.exit_function_scope();
     }
     ctx.pop_stack(pop_token);
     ctx.set_current_scope_id(previous_scope_id);
@@ -2529,27 +2644,31 @@ unsafe fn walk_arrow_function_expression<'a, Tr: Traverse<'a>>(
     {
         walk_ts_type_parameter_declaration(traverser, (&mut **field) as *mut _, ctx);
     }
-    ctx.retag_stack(AncestorType::ArrowFunctionExpressionParams);
-    walk_formal_parameters(
-        traverser,
-        (&mut **((node as *mut u8).add(ancestor::OFFSET_ARROW_FUNCTION_EXPRESSION_PARAMS)
-            as *mut ArenaBox<FormalParameters>)) as *mut _,
-        ctx,
-    );
-    if let Some(field) = &mut *((node as *mut u8)
-        .add(ancestor::OFFSET_ARROW_FUNCTION_EXPRESSION_RETURN_TYPE)
-        as *mut Option<ArenaBox<TSTypeAnnotation>>)
-    {
-        ctx.retag_stack(AncestorType::ArrowFunctionExpressionReturnType);
-        walk_ts_type_annotation(traverser, (&mut **field) as *mut _, ctx);
+    if !ctx.state.should_skip_function_scope(current_scope_id) {
+        ctx.state.enter_function_scope(current_scope_id);
+        ctx.retag_stack(AncestorType::ArrowFunctionExpressionParams);
+        walk_formal_parameters(
+            traverser,
+            (&mut **((node as *mut u8).add(ancestor::OFFSET_ARROW_FUNCTION_EXPRESSION_PARAMS)
+                as *mut ArenaBox<FormalParameters>)) as *mut _,
+            ctx,
+        );
+        if let Some(field) = &mut *((node as *mut u8)
+            .add(ancestor::OFFSET_ARROW_FUNCTION_EXPRESSION_RETURN_TYPE)
+            as *mut Option<ArenaBox<TSTypeAnnotation>>)
+        {
+            ctx.retag_stack(AncestorType::ArrowFunctionExpressionReturnType);
+            walk_ts_type_annotation(traverser, (&mut **field) as *mut _, ctx);
+        }
+        ctx.retag_stack(AncestorType::ArrowFunctionExpressionBody);
+        walk_arrow_function_body(
+            traverser,
+            (node as *mut u8).add(ancestor::OFFSET_ARROW_FUNCTION_EXPRESSION_BODY)
+                as *mut ArrowFunctionBody,
+            ctx,
+        );
+        ctx.state.exit_function_scope();
     }
-    ctx.retag_stack(AncestorType::ArrowFunctionExpressionBody);
-    walk_arrow_function_body(
-        traverser,
-        (node as *mut u8).add(ancestor::OFFSET_ARROW_FUNCTION_EXPRESSION_BODY)
-            as *mut ArrowFunctionBody,
-        ctx,
-    );
     ctx.pop_stack(pop_token);
     ctx.set_current_scope_id(previous_scope_id);
     ctx.set_current_hoist_scope_id(previous_hoist_scope_id);

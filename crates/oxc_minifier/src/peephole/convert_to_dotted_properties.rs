@@ -30,7 +30,7 @@ impl<'a> PeepholeOptimizations {
                     span, object, property, optional, ctx,
                 )
             });
-            ctx.notice_change();
+            ctx.state.record_non_cascading_ast_change();
             return;
         }
         let v = value;
@@ -40,7 +40,7 @@ impl<'a> PeepholeOptimizations {
         if let Some(n) = TraverseCtx::string_to_equivalent_number_value(v) {
             let new_expr =
                 Expression::new_numeric_literal(s.span, n, None, NumberBase::Decimal, ctx);
-            ctx.replace_expression(&mut e.expression, new_expr);
+            ctx.replace_expression_non_cascading(&mut e.expression, new_expr);
         }
     }
 }

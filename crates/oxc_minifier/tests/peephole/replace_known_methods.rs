@@ -233,10 +233,7 @@ fn test_fold_string_replace_all_empty_search_utf16() {
     test(r"x = '😀'.replaceAll('', '😁')", r"x = '😁\uD83D😁\uDE00😁'");
     test("x = '😀'.replaceAll('', '')", "x = '😀'");
     test("x = ''.replaceAll('', '-')", "x = '-'");
-    test(
-        r"x = (() => ((p) => 'a😀z'.replaceAll('', p))('-'))()",
-        r"x = ((p) => '-a-\uD83D-\uDE00-z-')('-')",
-    );
+    test(r"x = (() => ((p) => 'a😀z'.replaceAll('', p))('-'))()", r"x = '-a-\uD83D-\uDE00-z-'");
 }
 
 #[test]

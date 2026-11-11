@@ -302,7 +302,7 @@ impl<'a> Normalize {
         ctx: &TraverseCtx<'a>,
     ) -> Option<Expression<'a>> {
         match ident.name.as_str() {
-            "undefined" if ident.is_global_reference(ctx.scoping()) => {
+            "undefined" if ctx.is_global_reference(ident) => {
                 // `delete undefined` returns `false`
                 // `delete void 0` returns `true`
                 if Self::is_unary_delete_ancestor(ctx.ancestors()) {
@@ -310,7 +310,7 @@ impl<'a> Normalize {
                 }
                 Some(Expression::new_void_0(ident.span, ctx))
             }
-            "Infinity" if ident.is_global_reference(ctx.scoping()) => {
+            "Infinity" if ctx.is_global_reference(ident) => {
                 // `delete Infinity` returns `false`
                 // `delete 1/0` returns `true`
                 if Self::is_unary_delete_ancestor(ctx.ancestors()) {
@@ -324,7 +324,7 @@ impl<'a> Normalize {
                     ctx,
                 ))
             }
-            "NaN" if ident.is_global_reference(ctx.scoping()) => {
+            "NaN" if ctx.is_global_reference(ident) => {
                 // `delete NaN` returns `false`
                 // `delete 0/0` returns `true`
                 if Self::is_unary_delete_ancestor(ctx.ancestors()) {
@@ -353,7 +353,9 @@ impl<'a> Normalize {
     fn fold_void_ident(e: &mut UnaryExpression<'a>, ctx: &mut TraverseCtx<'a>) {
         debug_assert!(e.operator.is_void());
         let Expression::Identifier(ident) = &e.argument else { return };
-        if ident.is_global_reference(ctx.scoping()) {
+        if ident.is_global_reference(ctx.scoping())
+            || PeepholeOptimizations::discards_observable_read(&e.argument, e.span.start, ctx)
+        {
             return;
         }
         // `replace_expression` walks the dropped ident into `PassChanges`, so

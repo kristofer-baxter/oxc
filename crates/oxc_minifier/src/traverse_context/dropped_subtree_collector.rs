@@ -1,5 +1,9 @@
 use oxc_ast::ast::*;
-use oxc_ast_visit::{Visit, walk::walk_call_expression};
+use oxc_ast_visit::{
+    Visit,
+    walk::{walk_arrow_function_expression, walk_call_expression, walk_function},
+};
+use oxc_syntax::scope::ScopeFlags;
 
 use crate::state::PassChanges;
 
@@ -69,5 +73,25 @@ impl<'a> Visit<'a> for DroppedSubtreeCollector<'a, '_> {
         }
         // Recurse — eval may be nested inside another call's arguments.
         walk_call_expression(self, it);
+    }
+
+    fn visit_function(&mut self, it: &Function<'a>, flags: ScopeFlags) {
+        if let Some(scope_id) = it.scope_id.get() {
+            let idx = scope_id.index();
+            if idx < self.pass_changes.dissolved_scopes.capacity() {
+                self.pass_changes.dissolved_scopes.set_bit(idx);
+            }
+        }
+        walk_function(self, it, flags);
+    }
+
+    fn visit_arrow_function_expression(&mut self, it: &ArrowFunctionExpression<'a>) {
+        if let Some(scope_id) = it.scope_id.get() {
+            let idx = scope_id.index();
+            if idx < self.pass_changes.dissolved_scopes.capacity() {
+                self.pass_changes.dissolved_scopes.set_bit(idx);
+            }
+        }
+        walk_arrow_function_expression(self, it);
     }
 }

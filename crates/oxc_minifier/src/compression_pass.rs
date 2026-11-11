@@ -207,7 +207,7 @@ fn debug_assert_no_stale_direct_eval(program: &Program<'_>, scoping: &Scoping) {
 /// against already-pruned scoping and Normalize's drops cost no extra
 /// peephole pass) and after every peephole pass — quiet ones included, where
 /// every step below is a cheap no-op.
-fn flush_pass_changes(program: &Program<'_>, ctx: &mut TraverseCtx<'_>) -> bool {
+fn flush_pass_changes<'a>(program: &Program<'a>, ctx: &mut TraverseCtx<'a>) -> bool {
     let had_removed_references = !ctx.state.pass_changes.removed_references.is_empty();
     let liveness_inputs_changed = ctx.state.pass_changes.direct_eval_dropped
         || (had_removed_references && symbol_liveness::dead_references_affect_analysis(ctx));
@@ -221,10 +221,23 @@ fn flush_pass_changes(program: &Program<'_>, ctx: &mut TraverseCtx<'_>) -> bool 
         #[cfg(debug_assertions)]
         debug_assert_no_over_prune(program, &ctx.state.pass_changes.removed_references);
 
+        let mut affected_symbols = BitSet::new_in(ctx.scoping().symbols_len(), ctx.allocator());
+        for ref_idx in ctx.state.pass_changes.removed_references.ones() {
+            let ref_id = oxc_syntax::reference::ReferenceId::from_usize(ref_idx);
+            if let Some(symbol_id) = ctx.scoping().get_reference(ref_id).symbol_id() {
+                affected_symbols.set_bit(symbol_id.index());
+            }
+        }
         // Disjoint-field borrows: `state.pass_changes` and `scoping` don't overlap.
         ctx.scoping
             .scoping_mut()
             .retain_resolved_references_excluding(&ctx.state.pass_changes.removed_references);
+        let scoping = ctx.scoping.scoping();
+        for sym_idx in affected_symbols.ones() {
+            let symbol_id = oxc_syntax::symbol::SymbolId::from_usize(sym_idx);
+            ctx.state.symbols.invalidate_symbol(symbol_id);
+            ctx.state.mark_symbol_scopes_dirty(symbol_id, scoping, false);
+        }
     }
 
     // (2) Direct-eval — gated full walk only when an eval was dropped.
@@ -276,6 +289,14 @@ fn finish_pass<'a>(
 pub fn finish_normalize_pass<'a>(program: &Program<'a>, ctx: &mut TraverseCtx<'a>) {
     let _ = ctx.state.take_revisit_requested();
     finish_pass(program, ctx, /* force_liveness_analysis */ true);
+    ctx.state.seen_scopes.clear();
+    ctx.state.next_dirty_scopes.clear();
+    ctx.state.dirty_scopes.clear();
+    ctx.state.next_own_dirty_scopes.clear();
+    ctx.state.own_dirty_scopes.clear();
+    ctx.state.pass_changes.dissolved_scopes.clear();
+    ctx.state.cascading_change_counter = 0;
+    ctx.state.child_fn_cascading_changes = 0;
     debug_assert_pass_changes_clean(ctx);
 }
 
@@ -293,8 +314,11 @@ pub fn run_peephole_pass<'a>(
     traverse_mut_with_ctx(&mut PeepholeOptimizations, program, ctx);
 
     let ctx = ctx.get_mut();
+    let eval_dropped = ctx.state.pass_changes.direct_eval_dropped;
     let revisit_requested = ctx.state.take_revisit_requested();
     let newly_dead = finish_pass(program, ctx, /* force_liveness_analysis */ false);
+    ctx.state.dirty_all_scopes = eval_dropped || newly_dead;
+    ctx.state.advance_pass();
     debug_assert!(
         !newly_dead || revisit_requested,
         "ordinary liveness progress must follow a recorded pass change"

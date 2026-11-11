@@ -64,7 +64,7 @@ fn test_drop_unreachable_switch_cases_tdz_in_case() {
     test_same("switch (1) { case 1: break; case 2: class C {} }");
     test(
         "switch (1) { case 2: let x = 1; case 1: console.log(x); }",
-        "switch (1) { case 2: let x = 1; case 1: console.log(1); }",
+        "switch (1) { case 2: let x = 1; case 1: console.log(x); }",
     );
     test_same("switch (1) { case 2: function x() {} case 1: console.log(x); }");
 }

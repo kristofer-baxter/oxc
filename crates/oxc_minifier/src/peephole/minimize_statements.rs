@@ -32,6 +32,17 @@ fn dead_drop_mutates_ast(stmt: &Statement<'_>) -> bool {
             && decl.declarations.iter().all(|d| d.init.is_none() && d.type_annotation.is_none()))
 }
 
+/// A function declaration, possibly labeled (`l: function f() {}` in sloppy
+/// mode). It is hoisted and initialized before any statement of its list runs,
+/// so it stays even where control flow cannot reach it.
+fn is_hoisted_function_declaration(stmt: &Statement<'_>) -> bool {
+    let mut stmt = stmt;
+    while let Statement::LabeledStatement(labeled) = stmt {
+        stmt = &labeled.body;
+    }
+    matches!(stmt, Statement::FunctionDeclaration(_))
+}
+
 impl<'a> PeepholeOptimizations {
     /// `mangleStmts`: <https://github.com/evanw/esbuild/blob/v0.24.2/internal/js_ast/js_parser.go#L8788>
     ///
@@ -76,7 +87,7 @@ impl<'a> PeepholeOptimizations {
             while let Some(stmt) = old_stmts.next() {
                 if is_control_flow_dead
                     && !stmt.is_module_declaration()
-                    && !matches!(stmt.as_declaration(), Some(Declaration::FunctionDeclaration(_)))
+                    && !is_hoisted_function_declaration(&stmt)
                 {
                     // Harvest any `var` bindings so they re-emit at the end of
                     // the block (see `keep_var.get_variable_declaration_statement`
@@ -111,7 +122,7 @@ impl<'a> PeepholeOptimizations {
         // in the same arena `&ctx.ast` and are no longer aliased.
         let mut old_vec = unsafe { ArenaVec::from_raw_parts_in(old_ptr, 0, old_cap, &ctx.ast) };
 
-        if let Some(stmt) = keep_var.get_variable_declaration_statement(&ctx.ast) {
+        if let Some(stmt) = keep_var.get_variable_declaration_statement(ctx) {
             match Self::remove_unused_variable_declaration(stmt, ctx) {
                 // Multiple identity-dropped `var x;`s coalesce into a single
                 // `var x, y;`. The individual drops looked byte-identical, but
@@ -286,20 +297,25 @@ impl<'a> PeepholeOptimizations {
         let VariableDeclaration { span, kind, declarations, declare, .. } = var_decl.unbox();
         for mut decl in declarations {
             if Self::should_remove_unused_declarator(&decl, kind, ctx) {
+                let is_unused_enum_iife = matches!(
+                    &decl.id,
+                    BindingPattern::BindingIdentifier(ident)
+                        if ident
+                            .symbol_id
+                            .get()
+                            .is_some_and(|sym| ctx.state.symbols.enum_iife_symbols.contains(&sym))
+                );
                 // `init` is `mut` because `remove_unused_expression` rewrites
                 // it in place (peeling pure-call wrappers, etc). It is taken
                 // out first because it may survive as an expression statement
                 // — the declarator walk below must not mark its refs dead.
                 if let Some(mut init) = decl.init.take() {
-                    if Self::remove_unused_expression(&mut init, ctx) {
+                    if is_unused_enum_iife || Self::remove_unused_expression(&mut init, ctx) {
                         ctx.drop_expression(&init);
                     } else {
                         Self::push_new_expression_stmt_to_result(init, result, ctx);
                     }
                 }
-                // Walk the rest of the dropped declarator (binding pattern +
-                // TS type annotation, which can contain references). Also
-                // records the mutation for the fixed-point loop driver.
                 ctx.drop_variable_declarator(&decl);
             } else {
                 if let Some(Statement::VariableDeclaration(prev_var_decl)) = result.last_mut()
@@ -757,8 +773,8 @@ impl<'a> PeepholeOptimizations {
                     }
 
                     // `if (a) return b; return c;` => `return a ? b : c;`
-                    ctx.notice_change();
                     let prev_stmt = result.pop().unwrap();
+                    ctx.notice_change();
                     let Statement::IfStatement(prev_if) = prev_stmt else { unreachable!() };
                     let prev_if = prev_if.unbox();
                     let Statement::ReturnStatement(mut prev_return) = prev_if.consequent else {
@@ -1332,6 +1348,19 @@ impl<'a> PeepholeOptimizations {
                     let mut new_expr = replacement.take_in(ctx);
                     // Span fix-up on the still-owned new node before the slot replacement, not the slot replacement itself.
                     *new_expr.span_mut() = target_span;
+                    match &new_expr {
+                        Expression::FunctionExpression(f) => {
+                            if let Some(scope_id) = f.scope_id.get() {
+                                ctx.state.mark_scope_own_dirty_for_next_pass(scope_id);
+                            }
+                        }
+                        Expression::ArrowFunctionExpression(f) => {
+                            if let Some(scope_id) = f.scope_id.get() {
+                                ctx.state.mark_scope_own_dirty_for_next_pass(scope_id);
+                            }
+                        }
+                        _ => {}
+                    }
                     ctx.replace_expression(target_expr, new_expr);
                     return Some(true);
                 }
@@ -1773,8 +1802,11 @@ impl<'a> PeepholeOptimizations {
                                 {
                                     return Some(changed);
                                 }
-                                // Stop now because computed keys have side effects
-                                return Some(false);
+                                // Literal string keys, including normalized `__proto__`
+                                // shorthand, cannot execute code during key coercion.
+                                if !matches!(prop.key, PropertyKey::StringLiteral(_)) {
+                                    return Some(false);
+                                }
                             }
 
                             if let Some(changed) = Self::substitute_single_use_symbol_in_expression(

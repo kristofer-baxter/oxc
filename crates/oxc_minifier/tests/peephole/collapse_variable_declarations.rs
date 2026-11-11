@@ -161,7 +161,7 @@ mod collapse_for {
         test("var a = 0; for(; c < b ; c++) foo()", "for(var a = 0; c < b ; c++) foo()");
         test(
             "var a = 0; var b = 0; for(; c < b ; c++) foo()",
-            "for(var a = 0, b = 0; c < b ; c++) foo()",
+            "for(var a = 0, b = 0; c < 0 ; c++) foo()",
         );
 
         // We don't handle labels yet.
