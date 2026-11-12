@@ -3,6 +3,10 @@ use rustc_hash::FxHashSet;
 
 pub use oxc_ecmascript::side_effects::PropertyReadSideEffects;
 
+// The setting lives in `drop_labels` because `rolldown_common` builds `CompressOptions` with a
+// full struct literal, so a new field wouldn't compile. JavaScript labels can't contain NUL.
+const NO_ENUM_MEMBER_INLINING_LABEL: &str = "\0no_enum_iife_inlining";
+
 #[derive(Debug, Clone)]
 pub struct CompressOptions {
     /// Engine targets for feature detection.
@@ -63,6 +67,28 @@ impl Default for CompressOptions {
 }
 
 impl CompressOptions {
+    /// Whether to inline enum member reads and remove enum IIFEs that nothing reads.
+    ///
+    /// Requires assuming that `Object.prototype` has no accessor or read-only property named like
+    /// an enum member or a numeric member's value. The minifier checks the program it minifies; set
+    /// this to `false` when other code in the realm, such as another chunk, may change
+    /// `Object.prototype`.
+    ///
+    /// Default `true`
+    pub fn inline_enum_members(&self) -> bool {
+        !self.drop_labels.contains(NO_ENUM_MEMBER_INLINING_LABEL)
+    }
+
+    /// Set [`Self::inline_enum_members`]. The value lives in `drop_labels`, so replacing that set
+    /// resets it.
+    pub fn set_inline_enum_members(&mut self, inline: bool) {
+        if inline {
+            self.drop_labels.remove(NO_ENUM_MEMBER_INLINING_LABEL);
+        } else {
+            self.drop_labels.insert(NO_ENUM_MEMBER_INLINING_LABEL.to_string());
+        }
+    }
+
     pub fn smallest() -> Self {
         Self {
             target: EngineTargets::default(),
@@ -223,5 +249,46 @@ impl Default for TreeShakeOptions {
             unknown_global_side_effects: true,
             invalid_import_side_effects: false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use oxc_allocator::Allocator;
+    use oxc_codegen::{Codegen, CodegenOptions};
+    use oxc_parser::Parser;
+    use oxc_span::SourceType;
+
+    use crate::{CompressOptions, Compressor};
+
+    #[test]
+    fn disabling_enum_member_inlining_keeps_member_reads() {
+        let source = "function readEnum() { var E; (function (E) { E[E.Flag = 0] = 'Flag'; })(E || (E = {})); return E.Flag; } globalThis.result = readEnum();";
+        let compress = |options| {
+            let allocator = Allocator::default();
+            let mut program = Parser::new(&allocator, source, SourceType::cjs().with_script(true))
+                .parse()
+                .program;
+            Compressor::new(&allocator).build(&mut program, options);
+            Codegen::new().with_options(CodegenOptions::minify()).build(&program).code
+        };
+        let folded = compress(CompressOptions::smallest());
+        assert!(!folded.contains(".Flag"), "{folded}");
+
+        let mut options = CompressOptions::smallest();
+        assert!(options.inline_enum_members());
+        assert!(CompressOptions::default().inline_enum_members());
+        assert!(CompressOptions::safest().inline_enum_members());
+        assert!(CompressOptions::dce().inline_enum_members());
+        options.set_inline_enum_members(false);
+        assert!(!options.inline_enum_members());
+        let kept = compress(options.clone());
+        assert!(kept.contains(".Flag"), "{kept}");
+
+        options.set_inline_enum_members(true);
+        assert!(options.inline_enum_members());
+        options.set_inline_enum_members(false);
+        options.drop_labels = Default::default();
+        assert!(options.inline_enum_members());
     }
 }
