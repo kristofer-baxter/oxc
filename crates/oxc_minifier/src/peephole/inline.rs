@@ -445,7 +445,7 @@ impl<'a> PeepholeOptimizations {
         let allow_enum_iife = if ctx.state.symbols.cached_allow_enum_iife == Some(true) {
             true
         } else {
-            let v = !ctx.options().drop_labels.contains("\0no_enum_iife_inlining")
+            let v = ctx.options().inline_enum_members()
                 && !Self::program_may_mutate_object_prototype(program);
             if v {
                 ctx.state.symbols.cached_allow_enum_iife = Some(true);
