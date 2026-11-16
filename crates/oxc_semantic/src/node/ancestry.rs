@@ -150,9 +150,15 @@ impl<'a> AncestryStack<'a> {
     }
 
     /// Pop the current node when leaving it, returning the new current [`NodeId`].
+    ///
+    /// Popping an empty stack is a no-op that returns [`NodeId::ROOT`]. `SemanticBuilder`
+    /// implements the public `Visit` trait, so safe code can call `leave_node` without a
+    /// matching `enter_node`.
     #[inline]
     pub(crate) fn pop(&mut self) -> NodeId {
-        debug_assert!(self.len > 0);
+        if self.len == 0 {
+            return NodeId::ROOT;
+        }
         let new_len = self.len - 1;
         self.len = new_len;
         // SAFETY: `self.node_ids` points to `node_ids_base + 1`, where `node_ids_base[0] == NodeId::ROOT`.
@@ -162,10 +168,12 @@ impl<'a> AncestryStack<'a> {
     }
 
     /// [`NodeId`] of the parent of the node currently being visited, or
-    /// [`NodeId::ROOT`] when the current node is the root (`Program`).
+    /// [`NodeId::ROOT`] when the current node is the root (`Program`) or the stack is empty.
     #[inline]
     pub(crate) fn parent_node_id(&self) -> NodeId {
-        debug_assert!(self.len > 0);
+        if self.len == 0 {
+            return NodeId::ROOT;
+        }
         // SAFETY: `self.len >= 1`, and `node_ids_base[0] == NodeId::ROOT`.
         // `sub(1).add((self.len - 1) as usize)` reads `node_ids_base[self.len - 1]`, which is `NodeId::ROOT`
         // when `self.len == 1` (`Program`) and the parent's `NodeId` when `self.len >= 2`.
