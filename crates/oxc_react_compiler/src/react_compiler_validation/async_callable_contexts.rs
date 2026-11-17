@@ -776,6 +776,17 @@ enum MethodOverride {
     Definite,
 }
 
+/// How a store treats the target's existing value for a named key.
+#[derive(Clone, Copy)]
+enum Write {
+    /// The store certainly happens: on one runtime object it replaces the old
+    /// value and makes the key an own property on every path.
+    Definite,
+    /// The store may not happen (a copy from a source that may be empty or
+    /// null), so it adds a possible value and proves nothing about presence.
+    Possible,
+}
+
 /// How an array mutation moves its index slots.
 #[derive(Clone, Copy)]
 enum Reorder<'a> {
@@ -1507,11 +1518,15 @@ impl CallableState {
                     positions.sort_unstable();
                     for position in positions {
                         let sources = arguments.elements[&Some(position.to_string())].clone();
-                        let weak = !self.fresh_object(args, position, &sources);
-                        self.assign(&target, &sources, weak);
+                        let write = if self.fresh_object(args, position, &sources) {
+                            Write::Definite
+                        } else {
+                            Write::Possible
+                        };
+                        self.assign(&target, &sources, write);
                     }
                     if let Some(sources) = arguments.elements.get(&None) {
-                        self.assign(&target, sources, true);
+                        self.assign(&target, sources, Write::Possible);
                     }
                     self.values.insert(id, target);
                 }
@@ -1591,9 +1606,10 @@ impl CallableState {
             && self.exact_objects.contains(&place.identifier)
     }
 
-    /// Copies the own properties of `sources` onto `target`. A weak copy keeps
-    /// each existing value alongside the copied one.
-    fn assign(&mut self, target: &Values, sources: &Values, weak: bool) {
+    /// Copies the own properties of `sources` onto `target`. A possible copy
+    /// keeps each existing value alongside the copied one and leaves the
+    /// target's presence facts as they were.
+    fn assign(&mut self, target: &Values, sources: &Values, write: Write) {
         for &source in &sources.identities {
             let properties = self.properties.get(&source).cloned().unwrap_or_default();
             let split = self.split_domain(source);
@@ -1602,7 +1618,7 @@ impl CallableState {
                     self.split_unknown(object);
                 }
             }
-            for (key, mut values) in properties {
+            for (key, values) in properties {
                 if key.is_none() && split {
                     // Index-only values stay index-only on the target; only
                     // generic unknown-key writes may land on any named key.
@@ -1613,10 +1629,7 @@ impl CallableState {
                     }
                     continue;
                 }
-                if weak && key.is_some() {
-                    values.extend(&self.project(target, &key));
-                }
-                self.store_into(target, key, values);
+                self.write(target, key, values, write);
             }
         }
     }
@@ -2454,7 +2467,11 @@ impl CallableState {
     }
 
     fn store_into(&mut self, objects: &Values, key: Option<String>, values: Values) {
-        let definite = self.singleton(objects) && key.is_some();
+        self.write(objects, key, values, Write::Definite);
+    }
+
+    fn write(&mut self, objects: &Values, key: Option<String>, values: Values, write: Write) {
+        let definite = matches!(write, Write::Definite) && self.singleton(objects) && key.is_some();
         for &object in &objects.identities {
             self.array_lengths.remove(&object);
             if key.is_none() {
@@ -2729,7 +2746,8 @@ impl CallableState {
                             let exact = sources.identities.len() == 1
                                 && sources.identities.contains(&source)
                                 && self.exact_objects.contains(&source);
-                            self.assign(&Values::single(id), &sources, !exact);
+                            let write = if exact { Write::Definite } else { Write::Possible };
+                            self.assign(&Values::single(id), &sources, write);
                         }
                     }
                 }
