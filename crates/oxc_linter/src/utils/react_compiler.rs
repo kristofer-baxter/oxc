@@ -2,8 +2,8 @@ use std::borrow::Cow;
 
 use lazy_regex::Regex;
 use oxc_ast::ast::{
-    BindingPattern, Declaration, ExportDefaultDeclarationKind, Expression, FunctionType, Program,
-    Statement,
+    Argument, BindingPattern, Declaration, ExportDefaultDeclarationKind, Expression, FunctionType,
+    Program, Statement,
 };
 use oxc_diagnostics::OxcCode;
 use oxc_react_compiler::{
@@ -133,6 +133,11 @@ pub fn should_run_react_compiler(ctx: &ContextHost) -> bool {
 /// Port of `mayContainReactCode` in `eslint-plugin-react-hooks`'s
 /// `src/shared/RunReactCompiler.ts`: only compile files with a top-level function
 /// named like a component or hook, or an anonymous default-exported function.
+///
+/// Unlike upstream, a `memo(...)` or `forwardRef(...)` wrapper around a function
+/// also counts. The compiler treats those callbacks as components, so skipping
+/// a file whose only component is `export const Button = memo(() => ...)` would
+/// silently drop its findings.
 fn may_contain_react_code(program: &Program) -> bool {
     program.body.iter().any(is_top_level_react_code)
 }
@@ -145,7 +150,7 @@ fn is_top_level_react_code(statement: &Statement) -> bool {
                 func.r#type == FunctionType::FunctionDeclaration
                     && func.id.as_ref().is_none_or(|id| is_component_or_hook_name(&id.name))
             }
-            declaration => declaration.as_expression().is_some_and(is_function_expression),
+            declaration => declaration.as_expression().is_some_and(is_component_initializer),
         },
         _ => statement.as_declaration().is_some_and(is_react_declaration),
     }
@@ -160,18 +165,39 @@ fn is_react_declaration(declaration: &Declaration) -> bool {
         Declaration::VariableDeclaration(declaration) => {
             declaration.declarations.iter().any(|declarator| {
                 matches!(&declarator.id, BindingPattern::BindingIdentifier(id) if is_component_or_hook_name(&id.name))
-                    && declarator.init.as_ref().is_some_and(is_function_expression)
+                    && declarator.init.as_ref().is_some_and(is_component_initializer)
             })
         }
         _ => false,
     }
 }
 
-fn is_function_expression(expr: &Expression) -> bool {
-    matches!(
-        expr.without_parentheses(),
-        Expression::ArrowFunctionExpression(_) | Expression::FunctionExpression(_)
-    )
+/// A function expression, or one wrapped (at any depth) in `memo`, `forwardRef`,
+/// `React.memo` or `React.forwardRef`.
+fn is_component_initializer(expr: &Expression) -> bool {
+    match expr.without_parentheses() {
+        Expression::ArrowFunctionExpression(_) | Expression::FunctionExpression(_) => true,
+        Expression::CallExpression(call) => {
+            is_component_wrapper(&call.callee)
+                && call
+                    .arguments
+                    .first()
+                    .and_then(Argument::as_expression)
+                    .is_some_and(is_component_initializer)
+        }
+        _ => false,
+    }
+}
+
+fn is_component_wrapper(callee: &Expression) -> bool {
+    match callee.without_parentheses() {
+        Expression::Identifier(id) => matches!(id.name.as_str(), "memo" | "forwardRef"),
+        Expression::StaticMemberExpression(member) => {
+            matches!(&member.object, Expression::Identifier(object) if object.name == "React")
+                && matches!(member.property.name.as_str(), "memo" | "forwardRef")
+        }
+        _ => false,
+    }
 }
 
 /// `/^[A-Z]/` or `/^use[A-Z0-9]/`.

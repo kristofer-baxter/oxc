@@ -10,8 +10,8 @@ use crate::react_compiler_hir::visitors::{
 };
 use crate::react_compiler_hir::{
     ArrayElement, ArrayPatternElement, BlockId, HirFunction, IdentifierId, Instruction,
-    InstructionId, InstructionKind, InstructionValue, ObjectPropertyKey, ObjectPropertyOrSpread,
-    ParamPattern, Pattern, PlaceOrSpread, PrimitiveValue, Terminal,
+    InstructionId, InstructionKind, InstructionValue, NonLocalBinding, ObjectPropertyKey,
+    ObjectPropertyOrSpread, ParamPattern, Pattern, PlaceOrSpread, PrimitiveValue, Terminal,
 };
 
 type Captures = FxHashMap<IdentifierId, FxHashSet<IdentifierId>>;
@@ -612,17 +612,42 @@ impl PendingCapture {
     }
 }
 
+/// `keys` and `values` hold every key and value that may be present. A Map also
+/// splits its values by primitive key so that a definite `set` replaces and a
+/// definite `delete` removes the earlier value; unknown keys stay in `unkeyed`.
 #[derive(Clone, Default, PartialEq, Eq)]
 struct CollectionContents {
     keys: Values,
     values: Values,
+    map: bool,
+    keyed: FxHashMap<String, Values>,
+    unkeyed: Values,
 }
 
 impl CollectionContents {
     fn extend(&mut self, other: &Self) {
         self.keys.extend(&other.keys);
         self.values.extend(&other.values);
+        self.map |= other.map;
+        for (key, values) in &other.keyed {
+            self.keyed.entry(key.clone()).or_default().extend(values);
+        }
+        self.unkeyed.extend(&other.unkeyed);
     }
+
+    fn rebuild_map_values(&mut self) {
+        let mut values = self.unkeyed.clone();
+        for keyed in self.keyed.values() {
+            values.extend(keyed);
+        }
+        self.values = values;
+    }
+}
+
+fn remove_identity(values: &mut Values, identity: IdentifierId) {
+    values.identities.remove(&identity);
+    values.contexts.remove(&identity);
+    values.iterators.remove(&identity);
 }
 
 #[derive(Clone, Default, PartialEq, Eq)]
@@ -635,6 +660,12 @@ struct CallableState {
     array_lengths: FxHashMap<IdentifierId, usize>,
     arrays: FxHashSet<IdentifierId>,
     collections: FxHashMap<IdentifierId, CollectionContents>,
+    // The synthetic `[key, value]` entry object standing for each Map.
+    map_entries: FxHashMap<IdentifierId, IdentifierId>,
+    // Member names of property loads and names of loaded globals, used to
+    // recognize built-in methods that have no canonical signature name.
+    members: FxHashMap<IdentifierId, String>,
+    globals: FxHashMap<IdentifierId, String>,
     projections: Projections,
     deferred_calls: DeferredCalls,
     pending: FxHashMap<IdentifierId, PendingCapture>,
@@ -1023,51 +1054,315 @@ impl CallableState {
         };
         match (&instruction.value, signature.canonical_name.as_deref()) {
             (InstructionValue::NewExpression { .. }, Some(name @ ("Set" | "Map"))) => {
-                let mut contents = CollectionContents::default();
+                let map = name == "Map";
+                let mut contents = CollectionContents { map, ..CollectionContents::default() };
+                // Iterating the source yields Set values, Map entry pairs, or
+                // array elements. A Map reads key and value from each pair.
+                let mut items = Values::default();
                 for source in argument(0).identities {
                     if let Some(existing) = self.collections.get(&source) {
-                        contents.extend(existing);
+                        if existing.map == map {
+                            contents.extend(existing);
+                            continue;
+                        }
+                        if existing.map {
+                            if let Some(&entry) = self.map_entries.get(&source) {
+                                items.extend(&Values::single(entry));
+                            }
+                        } else {
+                            items.extend(&existing.values);
+                        }
                     } else if let Some(properties) = self.properties.get(&source) {
                         for (key, item) in properties {
-                            if key.as_ref().is_some_and(|key| key.parse::<usize>().is_err()) {
-                                continue;
-                            }
-                            if name == "Map" {
-                                contents.keys.extend(&self.project(item, &Some("0".to_string())));
-                                contents.values.extend(&self.project(item, &Some("1".to_string())));
-                            } else {
-                                contents.keys.extend(item);
-                                contents.values.extend(item);
+                            if key.as_ref().is_none_or(|key| key.parse::<usize>().is_ok()) {
+                                items.extend(item);
                             }
                         }
                     }
                 }
-                self.allocate(instruction.lvalue.identifier);
-                self.collections.insert(instruction.lvalue.identifier, contents);
+                if map {
+                    contents.keys.extend(&self.project(&items, &Some("0".to_string())));
+                    contents.unkeyed.extend(&self.project(&items, &Some("1".to_string())));
+                    contents.rebuild_map_values();
+                } else {
+                    contents.keys.extend(&items);
+                    contents.values.extend(&items);
+                }
+                let id = instruction.lvalue.identifier;
+                self.allocate(id);
+                self.collections.insert(id, contents);
+                if let InstructionValue::NewExpression { callee, .. } = &instruction.value
+                    && map
+                {
+                    // The constructor callee is a load, never an allocation, so
+                    // it can stand for this Map's `[key, value]` entry pairs.
+                    self.map_entries.insert(id, callee.identifier);
+                    self.sync_map_entries(id);
+                }
             }
             (
                 InstructionValue::MethodCall { receiver, .. },
-                Some(name @ ("Set.add" | "Map.set" | "Set.clear" | "Map.clear")),
+                Some(
+                    "Set.add" | "Map.set" | "Set.clear" | "Map.clear" | "Set.delete" | "Map.delete",
+                ),
             ) => {
+                // Contents are updated by `update_collection_method`. Typed
+                // receivers that are not tracked still return themselves.
                 let objects = self.values(receiver.identifier);
-                let key = argument(0);
-                let value = if name == "Map.set" { argument(1) } else { key.clone() };
-                for object in &objects.identities {
-                    if let Some(contents) = self.collections.get_mut(object) {
-                        if name.ends_with(".clear") {
-                            if objects.identities.len() == 1 {
-                                *contents = CollectionContents::default();
-                            }
-                        } else {
-                            contents.keys.extend(&key);
-                            contents.values.extend(&value);
-                        }
-                    }
-                }
                 self.refresh_pending(&objects, Some(&"forEach".to_string()));
-                if matches!(name, "Set.add" | "Map.set") {
+                if matches!(signature.canonical_name.as_deref(), Some("Set.add" | "Map.set")) {
                     self.values.insert(instruction.lvalue.identifier, objects);
                 }
+            }
+            _ => {}
+        }
+    }
+
+    /// Collection methods are matched by member name because `delete`, `get`
+    /// and friends carry no canonical signature name.
+    fn update_collection_method(&mut self, instruction: &Instruction<'_>) {
+        let InstructionValue::MethodCall { receiver, property, args, .. } = &instruction.value
+        else {
+            return;
+        };
+        let Some(name) = self.members.get(&property.identifier).cloned() else { return };
+        let objects = self.values(receiver.identifier);
+        if !objects.identities.iter().any(|object| self.collections.contains_key(object)) {
+            return;
+        }
+        let argument = |index: usize| match args.get(index) {
+            Some(PlaceOrSpread::Place(place)) => {
+                (self.values(place.identifier), self.keys.get(&place.identifier).cloned())
+            }
+            Some(PlaceOrSpread::Spread(spread)) => (self.elements(spread.place.identifier), None),
+            None => (Values::default(), None),
+        };
+        let (key, key_name) = argument(0);
+        let (value, _) = argument(1);
+        let definite = objects.identities.len() == 1;
+        let mut result = None;
+        for object in &objects.identities {
+            let removable = self.removable_identity(*object, &key);
+            let Some(contents) = self.collections.get_mut(object) else { continue };
+            match (name.as_str(), contents.map) {
+                ("add", false) => {
+                    contents.keys.extend(&key);
+                    contents.values.extend(&key);
+                }
+                ("set", true) => {
+                    contents.keys.extend(&key);
+                    match &key_name {
+                        Some(key_name) if definite => {
+                            contents.keyed.insert(key_name.clone(), value.clone());
+                        }
+                        Some(key_name) => {
+                            contents.keyed.entry(key_name.clone()).or_default().extend(&value);
+                        }
+                        None => contents.unkeyed.extend(&value),
+                    }
+                    contents.rebuild_map_values();
+                }
+                ("clear", map) if definite => {
+                    *contents = CollectionContents { map, ..CollectionContents::default() };
+                }
+                ("delete", true) if definite => {
+                    if let Some(key_name) = &key_name {
+                        contents.keyed.remove(key_name);
+                        contents.rebuild_map_values();
+                    }
+                }
+                ("delete", false) if definite => {
+                    if let Some(identity) = removable {
+                        remove_identity(&mut contents.keys, identity);
+                        remove_identity(&mut contents.values, identity);
+                    }
+                }
+                ("get", true) => {
+                    let values = result.get_or_insert_with(Values::default);
+                    match key_name.as_ref().and_then(|key_name| contents.keyed.get(key_name)) {
+                        Some(keyed) => {
+                            values.extend(keyed);
+                            values.extend(&contents.unkeyed);
+                        }
+                        None if key_name.is_some() => values.extend(&contents.unkeyed),
+                        None => values.extend(&contents.values),
+                    }
+                }
+                _ => continue,
+            }
+            if contents.map {
+                self.sync_map_entries(*object);
+            }
+        }
+        match name.as_str() {
+            "get" => {
+                if let Some(result) = result {
+                    self.values.insert(instruction.lvalue.identifier, result);
+                }
+            }
+            "add" | "set" => {
+                self.values.insert(instruction.lvalue.identifier, objects.clone());
+                self.refresh_pending(&objects, Some(&"forEach".to_string()));
+            }
+            "clear" | "delete" => self.refresh_pending(&objects, Some(&"forEach".to_string())),
+            _ => {}
+        }
+    }
+
+    /// `Set.delete(value)` removes `value` only when it is one function
+    /// identity that no other member can also carry, such as a bound copy.
+    fn removable_identity(&self, set: IdentifierId, key: &Values) -> Option<IdentifierId> {
+        let contents = self.collections.get(&set)?;
+        let mut identities = key.identities.iter();
+        let identity = *identities.next()?;
+        if identities.next().is_some() || !key.contexts.contains_key(&identity) {
+            return None;
+        }
+        contents
+            .values
+            .identities
+            .iter()
+            .all(|&other| {
+                other == identity
+                    || contents.values.contexts.contains_key(&other)
+                    || self.properties.contains_key(&other)
+                    || self.collections.contains_key(&other)
+            })
+            .then_some(identity)
+    }
+
+    fn sync_map_entries(&mut self, map: IdentifierId) {
+        let (Some(&entry), Some(contents)) =
+            (self.map_entries.get(&map), self.collections.get(&map))
+        else {
+            return;
+        };
+        let properties = FxHashMap::from_iter([
+            (Some("0".to_string()), contents.keys.clone()),
+            (Some("1".to_string()), contents.values.clone()),
+        ]);
+        self.properties.insert(entry, properties);
+        self.arrays.insert(entry);
+        self.array_lengths.insert(entry, 2);
+    }
+
+    /// Values produced by iterating `identifier`: array elements, Set values,
+    /// or the `[key, value]` entries of a Map.
+    fn elements(&self, identifier: IdentifierId) -> Values {
+        let mut result = Values::default();
+        for object in self.values(identifier).identities {
+            if let Some(contents) = self.collections.get(&object) {
+                if !contents.map {
+                    result.extend(&contents.values);
+                } else if let Some(&entry) = self.map_entries.get(&object) {
+                    result.extend(&Values::single(entry));
+                }
+            } else if let Some(properties) = self.properties.get(&object) {
+                for (key, values) in properties {
+                    if key.as_ref().is_none_or(|key| key.parse::<usize>().is_ok()) {
+                        result.extend(values);
+                    }
+                }
+            }
+        }
+        result
+    }
+
+    fn new_array(&mut self, id: IdentifierId, elements: Values) {
+        self.allocate(id);
+        self.arrays.insert(id);
+        self.array_lengths.remove(&id);
+        self.properties.insert(id, FxHashMap::from_iter([(None, elements)]));
+    }
+
+    /// Array and `Object` built-ins that move values between containers
+    /// without invoking them. Anything else leaves its receiver unchanged.
+    fn update_transfer(&mut self, instruction: &Instruction<'_>) {
+        let InstructionValue::MethodCall { receiver, property, args, .. } = &instruction.value
+        else {
+            return;
+        };
+        let Some(name) = self.members.get(&property.identifier).cloned() else { return };
+        let id = instruction.lvalue.identifier;
+        let argument_values = |state: &Self, from: usize| {
+            let mut values = Values::default();
+            for argument in args.iter().skip(from) {
+                match argument {
+                    PlaceOrSpread::Place(place) => values.extend(&state.values(place.identifier)),
+                    PlaceOrSpread::Spread(spread) => {
+                        values.extend(&state.elements(spread.place.identifier));
+                    }
+                }
+            }
+            values
+        };
+        let argument_place = |index: usize| match args.get(index) {
+            Some(PlaceOrSpread::Place(place)) => Some(place.identifier),
+            _ => None,
+        };
+        if let Some(global) = self.globals.get(&receiver.identifier).cloned() {
+            match (global.as_str(), name.as_str()) {
+                ("Array", "of") => {
+                    let elements = argument_values(self, 0);
+                    self.new_array(id, elements);
+                }
+                // A mapping callback is invoked; leave that call unmodeled.
+                ("Array", "from") if args.len() == 1 => {
+                    let elements = argument_place(0)
+                        .map_or_else(|| argument_values(self, 0), |place| self.elements(place));
+                    self.new_array(id, elements);
+                }
+                ("Object", "assign") => {
+                    let Some(target) = argument_place(0) else { return };
+                    for argument in args.iter().skip(1) {
+                        let PlaceOrSpread::Place(source) = argument else { continue };
+                        for (key, values) in self.properties(source.identifier) {
+                            self.store(target, key, values);
+                        }
+                    }
+                    self.copy(target, id);
+                }
+                _ => {}
+            }
+            return;
+        }
+        let receivers = self.values(receiver.identifier);
+        if !receivers.identities.iter().any(|object| self.arrays.contains(object)) {
+            return;
+        }
+        let elements = self.elements(receiver.identifier);
+        match name.as_str() {
+            "push" | "unshift" => {
+                let values = argument_values(self, 0);
+                self.store(receiver.identifier, None, values);
+            }
+            "fill" => {
+                let values = argument_place(0).map(|place| self.values(place)).unwrap_or_default();
+                self.store(receiver.identifier, None, values);
+            }
+            "splice" => {
+                let values = argument_values(self, 2);
+                self.store(receiver.identifier, None, values);
+                self.new_array(id, elements);
+            }
+            "concat" | "toSpliced" | "with" => {
+                let mut values = elements;
+                for argument in args.iter().skip(usize::from(name != "concat")) {
+                    let place = match argument {
+                        PlaceOrSpread::Place(place) => place,
+                        PlaceOrSpread::Spread(spread) => &spread.place,
+                    };
+                    values.extend(&self.values(place.identifier));
+                    values.extend(&self.elements(place.identifier));
+                }
+                self.new_array(id, values);
+            }
+            "slice" | "toReversed" | "toSorted" | "flat" => self.new_array(id, elements),
+            "reverse" | "sort" | "copyWithin" => {
+                self.values.insert(id, receivers);
+            }
+            "at" | "pop" | "shift" => {
+                self.values.insert(id, elements);
             }
             _ => {}
         }
@@ -1144,6 +1439,11 @@ impl CallableState {
         for (&id, contents) in &other.collections {
             self.collections.entry(id).or_default().extend(contents);
         }
+        for (&map, &entry) in &other.map_entries {
+            self.map_entries.insert(map, entry);
+        }
+        self.members.retain(|id, name| other.members.get(id) == Some(name));
+        self.globals.retain(|id, name| other.globals.get(id) == Some(name));
         for (&id, call) in &other.deferred_calls {
             if let Some(into) = self.deferred_calls.get_mut(&id) {
                 into.merge(call);
@@ -1189,14 +1489,19 @@ impl CallableState {
         } else {
             self.builtin_function_methods.remove(&into);
         }
-        let mut values = if key.is_some() {
-            properties.get(&key).or_else(|| properties.get(&None)).cloned().unwrap_or_default()
-        } else {
-            properties.into_values().fold(Values::default(), |mut result, values| {
-                result.extend(&values);
-                result
-            })
-        };
+        let mut values = Values::default();
+        for object in self.values(object).identities {
+            let Some(properties) = self.properties.get(&object) else { continue };
+            if key.is_some() {
+                if let Some(found) = self.lookup(object, properties, &key) {
+                    values.extend(found);
+                }
+            } else {
+                for found in properties.values() {
+                    values.extend(found);
+                }
+            }
+        }
         for object in self.values(object).identities {
             if self.projections.contains_key(&object) {
                 self.projections
@@ -1208,6 +1513,20 @@ impl CallableState {
         }
         self.values.insert(into, values);
         self.keys.remove(&into);
+    }
+
+    /// An unknown-key write to an array stands for some index, so it answers
+    /// index reads but not named reads such as `push` or `length`.
+    fn lookup<'p>(
+        &self,
+        object: IdentifierId,
+        properties: &'p Properties,
+        key: &Option<String>,
+    ) -> Option<&'p Values> {
+        let named = key.as_ref().is_some_and(|key| key.parse::<usize>().is_err());
+        properties.get(key).or_else(|| {
+            (!named || !self.arrays.contains(&object)).then(|| properties.get(&None))?
+        })
     }
 
     fn invoked(&self, instruction: &InstructionValue<'_>) -> Values {
@@ -1254,14 +1573,25 @@ impl CallableState {
                     )]),
                     length: Some(1),
                 },
-                PlaceOrSpread::Spread(spread) => Arguments {
-                    elements: self.properties(spread.place.identifier),
-                    length: self.array_length(&self.values(spread.place.identifier)),
-                },
+                PlaceOrSpread::Spread(spread) => self.spread(spread.place.identifier),
             };
             result.append(&next);
         }
         result
+    }
+
+    /// Spreading a Set or Map yields its values or entry pairs at unknown
+    /// positions; spreading an array keeps its indexed elements.
+    fn spread(&self, identifier: IdentifierId) -> Arguments {
+        let mut arguments = Arguments {
+            elements: self.properties(identifier),
+            length: self.array_length(&self.values(identifier)),
+        };
+        if self.values(identifier).identities.iter().any(|id| self.collections.contains_key(id)) {
+            arguments.elements.entry(None).or_default().extend(&self.elements(identifier));
+            arguments.length = None;
+        }
+        arguments
     }
 
     fn project(&self, objects: &Values, key: &Option<String>) -> Values {
@@ -1269,7 +1599,7 @@ impl CallableState {
         for object in &objects.identities {
             let Some(properties) = self.properties.get(object) else { continue };
             if key.is_some() {
-                if let Some(values) = properties.get(key).or_else(|| properties.get(&None)) {
+                if let Some(values) = self.lookup(*object, properties, key) {
                     result.extend(values);
                 }
             } else {
@@ -1896,10 +2226,7 @@ impl CallableState {
                             )]),
                             length: Some(1),
                         },
-                        ArrayElement::Spread(spread) => Arguments {
-                            elements: self.properties(spread.place.identifier),
-                            length: self.array_length(&self.values(spread.place.identifier)),
-                        },
+                        ArrayElement::Spread(spread) => self.spread(spread.place.identifier),
                         ArrayElement::Hole => {
                             Arguments { elements: Properties::default(), length: Some(1) }
                         }
@@ -1914,7 +2241,11 @@ impl CallableState {
                 }
             }
             InstructionValue::PropertyLoad { object, property, .. } => {
-                self.load(object.identifier, Some(property.to_string()), id)
+                self.load(object.identifier, Some(property.to_string()), id);
+                self.members.insert(id, property.to_string());
+            }
+            InstructionValue::LoadGlobal { binding: NonLocalBinding::Global { name }, .. } => {
+                self.globals.insert(id, name.to_string());
             }
             InstructionValue::ComputedLoad { object, property, .. } => {
                 self.load(object.identifier, self.keys.get(&property.identifier).cloned(), id)
@@ -2084,7 +2415,9 @@ pub(super) fn infer_async_callable_contexts(
                     function_returns,
                     &captured_bindings,
                 );
+                state.update_collection_method(instruction);
                 state.update_collection(instruction, env);
+                state.update_transfer(instruction);
             }
             if matches!(block.terminal, Terminal::Return { .. } | Terminal::Throw { .. }) {
                 result.pending_at_exit.insert(block_id, state.pending_observation());
