@@ -496,16 +496,40 @@ fn array_index(key: &str) -> Option<usize> {
 }
 
 fn merge_properties(into: &mut Properties, other: &Properties) {
-    let fallback = into.get(&None).cloned().unwrap_or_default();
+    merge_properties_in(into, other, None);
+}
+
+/// Joins two views of one object. A key present on one side only takes the
+/// other side's unknown-key writes that could have named it. For an array,
+/// `named` holds each side's generic unknown-key writes (`into`, `other`): a
+/// named key falls back to those, never to the index summary, which index-only
+/// writes such as `push` also feed.
+fn merge_properties_in(
+    into: &mut Properties,
+    other: &Properties,
+    named: Option<(&Values, &Values)>,
+) {
+    let fallback =
+        |properties: &Properties, named: Option<&Values>, key: &Option<String>| match named {
+            Some(named) if key.as_ref().is_some_and(|key| array_index(key).is_none()) => {
+                Some(named.clone())
+            }
+            _ => properties.get(&None).cloned(),
+        };
+    let into_snapshot = into.clone();
     for (key, values) in into.iter_mut() {
-        if let Some(other) = other.get(key).or_else(|| other.get(&None)) {
+        if let Some(other) = other.get(key) {
             values.extend(other);
+        } else if let Some(other) = fallback(other, named.map(|(_, other)| other), key) {
+            values.extend(&other);
         }
     }
     for (key, values) in other {
         if !into.contains_key(key) {
             let mut values = values.clone();
-            values.extend(&fallback);
+            if let Some(own) = fallback(&into_snapshot, named.map(|(into, _)| into), key) {
+                values.extend(&own);
+            }
             into.insert(key.clone(), values);
         }
     }
@@ -709,13 +733,19 @@ struct EntryIds(Rc<RefCell<EntryTable>>);
 
 #[derive(Default)]
 struct EntryTable {
+    first: usize,
     next: usize,
     ids: FxHashMap<(IdentifierId, IdentifierId), IdentifierId>,
 }
 
 impl EntryIds {
     fn new(first: usize) -> Self {
-        Self(Rc::new(RefCell::new(EntryTable { next: first, ids: FxHashMap::default() })))
+        Self(Rc::new(RefCell::new(EntryTable { first, next: first, ids: FxHashMap::default() })))
+    }
+
+    fn contains(&self, id: IdentifierId) -> bool {
+        let table = self.0.borrow();
+        table.next > table.first && id.index() >= table.first
     }
 
     fn get(&self, map: IdentifierId, site: IdentifierId) -> IdentifierId {
@@ -775,6 +805,8 @@ struct CallableState {
     // Object literals without spread properties, so every key they list is
     // certainly present.
     exact_objects: FxHashSet<IdentifierId>,
+    /// Own named properties every path has definitely stored and not deleted.
+    present: FxHashMap<IdentifierId, FxHashSet<String>>,
     collections: FxHashMap<IdentifierId, CollectionContents>,
     // The synthetic `[key, value]` entry objects that may stand for each Map.
     // A pair is a snapshot: later Map mutations create a new pair instead of
@@ -1245,11 +1277,10 @@ impl CallableState {
             return MethodOverride::Possible;
         };
         let objects = self.values(receiver.identifier).identities;
-        let own = Some(name.clone());
         if !objects.is_empty()
-            && objects.iter().all(|object| {
-                self.properties.get(object).is_some_and(|properties| properties.contains_key(&own))
-            })
+            && objects
+                .iter()
+                .all(|object| self.present.get(object).is_some_and(|keys| keys.contains(name)))
         {
             MethodOverride::Definite
         } else {
@@ -1273,7 +1304,7 @@ impl CallableState {
         let key = arguments.at(0);
         let value = arguments.at(1);
         let key_name = self.argument_primitive(args, 0).cloned();
-        let definite = objects.identities.len() == 1;
+        let definite = self.singleton(&objects);
         let mut result = None;
         for object in &objects.identities {
             let removable = self.removable_identity(*object, &key);
@@ -1574,7 +1605,7 @@ impl CallableState {
     /// unknown-index bucket, so an indexed read sees any element that may
     /// have moved there.
     fn reorder(&mut self, objects: &Values, reorder: Reorder<'_>) {
-        let definite = objects.identities.len() == 1;
+        let definite = self.singleton(objects);
         for &object in &objects.identities {
             if !self.arrays.contains(&object) {
                 continue;
@@ -1692,6 +1723,7 @@ impl CallableState {
         self.values.insert(identifier, Values::single(identifier));
         self.named_unknown.remove(&identifier);
         self.exact_objects.remove(&identifier);
+        self.present.remove(&identifier);
     }
 
     fn update_context(&mut self, binding: IdentifierId) {
@@ -1739,9 +1771,26 @@ impl CallableState {
         for (&id, values) in &other.values {
             self.values.entry(id).or_default().extend(values);
         }
+        let empty = Values::default();
         for (&object, properties) in &other.properties {
-            merge_properties(self.properties.entry(object).or_default(), properties);
+            let named =
+                (self.arrays.contains(&object) || other.arrays.contains(&object)).then(|| {
+                    (
+                        self.named_unknown.get(&object).cloned().unwrap_or_default(),
+                        other.named_unknown.get(&object).unwrap_or(&empty),
+                    )
+                });
+            merge_properties_in(
+                self.properties.entry(object).or_default(),
+                properties,
+                named.as_ref().map(|(into, other)| (into, *other)),
+            );
         }
+        self.present.retain(|object, keys| {
+            let Some(other) = other.present.get(object) else { return false };
+            keys.retain(|key| other.contains(key));
+            !keys.is_empty()
+        });
         self.keys.retain(|id, key| other.keys.get(id) == Some(key));
         self.builtin_function_methods
             .retain(|id, method| other.builtin_function_methods.get(id) == Some(method));
@@ -2298,13 +2347,38 @@ impl CallableState {
         self.refresh_pending(objects, None);
     }
 
+    /// A delete leaves the key without values and, unlike a store of an
+    /// untracked value, makes the own property absent, so a built-in method of
+    /// the same name runs again.
+    fn delete(&mut self, object: IdentifierId, key: Option<String>) {
+        self.store(object, key.clone(), Values::default());
+        for object in self.values(object).identities {
+            if let Some(keys) = self.present.get_mut(&object) {
+                match &key {
+                    Some(key) => {
+                        keys.remove(key);
+                    }
+                    None => keys.clear(),
+                }
+            }
+        }
+    }
+
+    /// Whether `objects` names one runtime object, so a write may replace its
+    /// old contents. A Map entry pair summarizes every pair materialized from
+    /// that Map at that site, so writes through it are always weak.
+    fn singleton(&self, objects: &Values) -> bool {
+        objects.identities.len() == 1
+            && objects.identities.iter().all(|&id| !self.entry_ids.contains(id))
+    }
+
     fn store(&mut self, object: IdentifierId, key: Option<String>, values: Values) {
         let objects = self.values(object);
         self.store_into(&objects, key, values);
     }
 
     fn store_into(&mut self, objects: &Values, key: Option<String>, values: Values) {
-        let definite = objects.identities.len() == 1 && key.is_some();
+        let definite = self.singleton(objects) && key.is_some();
         for &object in &objects.identities {
             self.array_lengths.remove(&object);
             if key.is_none() {
@@ -2316,8 +2390,9 @@ impl CallableState {
                 if self.arrays.contains(&object) {
                     self.named_unknown.entry(object).or_default().extend(&values);
                 }
-            } else if definite {
+            } else if let (true, Some(name)) = (definite, &key) {
                 self.properties.entry(object).or_default().insert(key.clone(), values.clone());
+                self.present.entry(object).or_default().insert(name.clone());
             } else {
                 let properties = self.properties.get(&object);
                 let fallback = properties
@@ -2629,13 +2704,11 @@ impl CallableState {
                 self.values(value.identifier),
             ),
             InstructionValue::PropertyDelete { object, property, .. } => {
-                self.store(object.identifier, Some(property.to_string()), Values::default())
+                self.delete(object.identifier, Some(property.to_string()));
             }
-            InstructionValue::ComputedDelete { object, property, .. } => self.store(
-                object.identifier,
-                self.property_key(property.identifier),
-                Values::default(),
-            ),
+            InstructionValue::ComputedDelete { object, property, .. } => {
+                self.delete(object.identifier, self.property_key(property.identifier));
+            }
             InstructionValue::Destructure { lvalue, value, .. } => {
                 self.destructure(&lvalue.pattern, value.identifier);
                 self.copy(value.identifier, id);
@@ -2788,12 +2861,11 @@ pub(super) fn infer_async_callable_contexts(
                 match state.method_override(instruction) {
                     MethodOverride::Definite => {}
                     MethodOverride::Possible => {
-                        let id = instruction.lvalue.identifier;
-                        let custom = state.values(id);
+                        // Either method may run: join the whole heap after the
+                        // stored method with the heap after the built-in.
+                        let custom = state.clone();
                         state.update_builtins(instruction, env);
-                        let mut values = state.values(id);
-                        values.extend(&custom);
-                        state.values.insert(id, values);
+                        state.merge(&custom);
                     }
                     MethodOverride::None => state.update_builtins(instruction, env),
                 }
