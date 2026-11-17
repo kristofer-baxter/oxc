@@ -3,6 +3,8 @@ source: crates/oxc_react_compiler/tests/snapshot.rs
 input_file: crates/oxc_react_compiler/fixtures/logical-assignment-captured-key.js
 ---
 import { c as _c } from "react/compiler-runtime";
+// The key is a template literal so it is already a string: an object key
+// would be converted twice by the desugared read and store, which is a Todo.
 function Component(t0) {
 	const $ = _c(12);
 	const { value, initial, operator } = t0;
@@ -25,16 +27,16 @@ function Component(t0) {
 		});
 		if (operator === "??=") {
 			const t1 = obj;
-			const t2 = key;
+			const t2 = `${key}`;
 			result = t1[t2] ?? (t1[t2] = value);
 		} else {
 			if (operator === "||=") {
 				const t1 = obj;
-				const t2 = key;
+				const t2 = `${key}`;
 				result = t1[t2] || (t1[t2] = value);
 			} else {
 				const t1 = obj;
-				const t2 = key;
+				const t2 = `${key}`;
 				result = t1[t2] && (t1[t2] = value);
 			}
 		}

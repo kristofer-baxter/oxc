@@ -779,9 +779,17 @@ fn get_context_reassignment(
 
                     // Async reassignments produce their own diagnostic and do
                     // not taint the function value, matching the TS behavior.
+                    // An async generator's body runs only when its iterator is
+                    // advanced, so it is not diagnosed immediately below. Seed it
+                    // so that the value escaping render (returned, passed to JSX,
+                    // or stored in an escaping object) still reports the
+                    // reassignment, with the async diagnostic.
                     if inner_is_async {
                         async_function_values.insert(instr.lvalue.identifier);
-                    } else if let Some(reassignment_place) = reassignment.reassignment {
+                    }
+                    if (!inner_is_async || inner_function.generator)
+                        && let Some(reassignment_place) = reassignment.reassignment
+                    {
                         seeds.push((instr.lvalue.identifier, reassignment_place));
                     }
                     if !inner_is_async && let Some(reassignment_place) = reassignment.returned {

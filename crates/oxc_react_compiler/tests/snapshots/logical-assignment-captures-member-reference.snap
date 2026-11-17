@@ -69,7 +69,7 @@ function Component(t0) {
 			configurable: true
 		});
 		const t3 = keyed;
-		const t4 = key;
+		const t4 = `${key}`;
 		t2 = t3[t4] ?? (t3[t4] = value);
 		$[5] = value;
 		$[6] = key;

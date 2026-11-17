@@ -4738,6 +4738,23 @@ fn lower_assignment_expression<'a>(
     }
 }
 
+/// Whether `key` always evaluates to a primitive, so converting it to a property
+/// key has no side effects and gives the same key every time.
+fn is_primitive_property_key(key: &oxc::Expression<'_>) -> bool {
+    matches!(
+        key.without_parentheses(),
+        oxc::Expression::StringLiteral(_)
+            | oxc::Expression::NumericLiteral(_)
+            | oxc::Expression::BigIntLiteral(_)
+            | oxc::Expression::BooleanLiteral(_)
+            | oxc::Expression::NullLiteral(_)
+            | oxc::Expression::TemplateLiteral(_)
+            | oxc::Expression::UnaryExpression(_)
+            | oxc::Expression::BinaryExpression(_)
+            | oxc::Expression::UpdateExpression(_)
+    )
+}
+
 enum LogicalAssignmentTarget<'b, 'a> {
     Identifier(&'b oxc::IdentifierReference<'a>),
     /// `const` binding. The conditional store is not emitted: lowering it as
@@ -4809,6 +4826,18 @@ fn lower_logical_assignment_expression<'a>(
             (target, previous_value)
         }
         Some(SimpleAssignmentTargetRef::Member(member)) => {
+            // The desugared form reads and writes the property with two bracket
+            // accesses, so an object key would be coerced to a property key twice
+            // (`Symbol.toPrimitive` could pick a different property for the store).
+            // Only compile keys that are already primitive.
+            if let oxc::MemberExpression::ComputedMemberExpression(computed) = member
+                && !is_primitive_property_key(&computed.expression)
+            {
+                builder.record_error(diagnostics::todo_logical_assignment_object_key(
+                    computed.expression.span(),
+                ))?;
+                return Ok(InstructionValue::Primitive { value: PrimitiveValue::Undefined, span });
+            }
             let LoweredMemberExpression { object, property, computed, property_span, value } =
                 lower_member_expression_for_logical_assignment(builder, member)?;
             let target = LogicalAssignmentTarget::Member {

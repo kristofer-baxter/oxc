@@ -31,7 +31,7 @@ function Component(t0) {
 		const t2 = obj;
 		t2.x ?? (t2.x = rhs("fallback"));
 		const t3 = obj;
-		const t4 = key();
+		const t4 = `${key()}`;
 		t3[t4] || (t3[t4] = rhs("updated"));
 		const t5 = obj;
 		t1 = t5.full ?? (t5.full = rhs("skipped"));
