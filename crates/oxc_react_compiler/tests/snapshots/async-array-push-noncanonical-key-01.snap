@@ -1,0 +1,20 @@
+---
+source: crates/oxc_react_compiler/tests/snapshot.rs
+input_file: crates/oxc_react_compiler/fixtures/async-array-push-noncanonical-key-01.js
+---
+function Component(props) {
+	let count = 0;
+	const bad = () => count++;
+	const run = async () => {
+		await 0;
+		bad();
+	};
+	const safe = _temp;
+	const a = [];
+	a["01"] = safe;
+	a.push(run);
+	a.fill(run);
+	a["01"]();
+	return null;
+}
+function _temp() {}

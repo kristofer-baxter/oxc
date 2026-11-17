@@ -43,7 +43,7 @@ impl Arguments {
     fn append(&mut self, other: &Self) {
         for (key, values) in &other.elements {
             let key = self.length.and_then(|offset| {
-                key.as_ref()?.parse::<usize>().ok()?.checked_add(offset).map(|i| i.to_string())
+                array_index(key.as_ref()?)?.checked_add(offset).map(|i| i.to_string())
             });
             self.elements.entry(key).or_default().extend(values);
         }
@@ -70,7 +70,7 @@ impl Arguments {
     fn from(&self, from: usize) -> Values {
         let mut values = Values::default();
         for (key, element) in &self.elements {
-            if key.as_ref().is_none_or(|key| key.parse::<usize>().is_ok_and(|key| key >= from)) {
+            if key.as_ref().is_none_or(|key| array_index(key).is_some_and(|key| key >= from)) {
                 values.extend(element);
             }
         }
@@ -83,7 +83,7 @@ impl Arguments {
             .into_iter()
             .filter_map(|(key, value)| {
                 let key = match key {
-                    Some(key) => Some(key.parse::<usize>().ok()?.checked_sub(count)?.to_string()),
+                    Some(key) => Some(array_index(&key)?.checked_sub(count)?.to_string()),
                     None => None,
                 };
                 Some((key, value))
@@ -374,7 +374,7 @@ fn infer_capture_members(
                 keys.insert(instruction.lvalue.identifier, value.to_string());
             }
             InstructionValue::PropertyLoad { object, property, .. } => {
-                if !rest_arguments || property.to_string().parse::<usize>().is_ok() {
+                if !rest_arguments || array_index(&property.to_string()).is_some() {
                     receivers.insert(instruction.lvalue.identifier, object.identifier);
                 }
             }
@@ -382,7 +382,7 @@ fn infer_capture_members(
                 if !rest_arguments
                     || keys
                         .get(&property.identifier)
-                        .is_some_and(|key| key.parse::<usize>().is_ok()) =>
+                        .is_some_and(|key| array_index(key).is_some()) =>
             {
                 receivers.insert(instruction.lvalue.identifier, object.identifier);
             }
@@ -486,6 +486,14 @@ fn infer_capture_members(
 
 // Named members include every reaching write to that member. The unknown-key
 // bucket is only the fallback for names that have not been written explicitly.
+/// The array index a property key names: a canonical decimal below
+/// 2^32 - 1. Other numeric-looking keys such as "01" or "4294967295" are
+/// ordinary named properties.
+fn array_index(key: &str) -> Option<usize> {
+    let index: u32 = key.parse().ok()?;
+    (index != u32::MAX && index.to_string() == key).then(|| usize::try_from(index).ok())?
+}
+
 fn merge_properties(into: &mut Properties, other: &Properties) {
     let fallback = into.get(&None).cloned().unwrap_or_default();
     for (key, values) in into.iter_mut() {
@@ -871,7 +879,7 @@ impl CallableState {
                 {
                     let identities = members
                         .iter()
-                        .filter(|member| member.parse::<usize>().is_ok())
+                        .filter(|member| array_index(member).is_some())
                         .flat_map(|member| {
                             elements
                                 .get(&Some(member.clone()))
@@ -998,7 +1006,7 @@ impl CallableState {
             arguments
                 .elements
                 .keys()
-                .filter_map(|key| key.as_ref()?.parse::<usize>().ok())
+                .filter_map(|key| array_index(key.as_ref()?))
                 .max()
                 .unwrap_or(0)
                 + 1
@@ -1057,7 +1065,7 @@ impl CallableState {
         for (key, values) in
             self.properties(receiver.identifier).into_iter().filter(|_| !collection_callback)
         {
-            if key.as_ref().is_none_or(|key| key.parse::<usize>().is_ok()) {
+            if key.as_ref().is_none_or(|key| array_index(key).is_some()) {
                 items.extend(&values);
             }
         }
@@ -1103,7 +1111,7 @@ impl CallableState {
                         }
                     } else if let Some(properties) = self.properties.get(&source) {
                         for (key, item) in properties {
-                            if key.as_ref().is_none_or(|key| key.parse::<usize>().is_ok()) {
+                            if key.as_ref().is_none_or(|key| array_index(key).is_some()) {
                                 items.extend(item);
                             }
                         }
@@ -1307,7 +1315,7 @@ impl CallableState {
                 }
             } else if let Some(properties) = self.properties.get(&object) {
                 for (key, values) in properties {
-                    if key.as_ref().is_none_or(|key| key.parse::<usize>().is_ok()) {
+                    if key.as_ref().is_none_or(|key| array_index(key).is_some()) {
                         result.extend(values);
                     }
                 }
@@ -1342,20 +1350,22 @@ impl CallableState {
                     self.new_array(id, elements);
                 }
                 ("Object", "assign") => {
-                    // Sources are copied in argument order. Alternatives for
-                    // one position, and spread sources at unknown positions,
-                    // may or may not write a key, so they merge weakly.
+                    // Sources are copied in argument order. A source overwrites
+                    // only when it is certainly the object it names: the
+                    // argument is that object's own allocation. Anything else
+                    // (a conditional, a variable that may hold null, a spread
+                    // source) may write nothing, so it merges weakly.
                     let target = arguments.at(0);
                     let mut positions: Vec<usize> = arguments
                         .elements
                         .keys()
-                        .filter_map(|key| key.as_ref()?.parse().ok())
+                        .filter_map(|key| array_index(key.as_ref()?))
                         .filter(|&position| position >= 1)
                         .collect();
                     positions.sort_unstable();
                     for position in positions {
                         let sources = arguments.elements[&Some(position.to_string())].clone();
-                        let weak = sources.identities.len() != 1;
+                        let weak = !Self::fresh_object(args, position, &sources);
                         self.assign(&target, &sources, weak);
                     }
                     if let Some(sources) = arguments.elements.get(&None) {
@@ -1420,6 +1430,19 @@ impl CallableState {
         }
     }
 
+    /// Whether argument `position` is a plain place that is itself the one
+    /// object allocation in `sources`, so it cannot be null or another value.
+    fn fresh_object(args: &[PlaceOrSpread], position: usize, sources: &Values) -> bool {
+        if args[..position.min(args.len())]
+            .iter()
+            .any(|arg| matches!(arg, PlaceOrSpread::Spread(_)))
+        {
+            return false;
+        }
+        let Some(PlaceOrSpread::Place(place)) = args.get(position) else { return false };
+        sources.identities.len() == 1 && sources.identities.contains(&place.identifier)
+    }
+
     /// Copies the own properties of `sources` onto `target`. A weak copy keeps
     /// each existing value alongside the copied one.
     fn assign(&mut self, target: &Values, sources: &Values, weak: bool) {
@@ -1447,8 +1470,8 @@ impl CallableState {
             let length = self.array_lengths.get(&object).copied().filter(|_| definite);
             let properties = self.properties.entry(object).or_default();
             let mut indexed = Vec::new();
-            properties.retain(|key, values| match key.as_ref().map(|key| key.parse::<usize>()) {
-                Some(Ok(index)) => {
+            properties.retain(|key, values| match key.as_ref().and_then(|key| array_index(key)) {
+                Some(index) => {
                     indexed.push((index, std::mem::take(values)));
                     false
                 }
@@ -1707,7 +1730,7 @@ impl CallableState {
         properties: &'p Properties,
         key: &Option<String>,
     ) -> Option<&'p Values> {
-        let named = key.as_ref().is_some_and(|key| key.parse::<usize>().is_err());
+        let named = key.as_ref().is_some_and(|key| array_index(key).is_none());
         properties.get(key).or_else(|| {
             (!named || !self.arrays.contains(&object) || self.named_unknown.contains(&object))
                 .then(|| properties.get(&None))?
@@ -1923,9 +1946,7 @@ impl CallableState {
                     .iter()
                     .filter_map(|(key, value)| {
                         let key = match key {
-                            Some(key) => {
-                                Some(key.parse::<usize>().ok()?.checked_sub(index)?.to_string())
-                            }
+                            Some(key) => Some(array_index(key)?.checked_sub(index)?.to_string()),
                             None => None,
                         };
                         Some((key, value.clone()))
@@ -2110,7 +2131,7 @@ impl CallableState {
                             {
                                 return members
                                     .iter()
-                                    .filter(|member| member.parse::<usize>().is_ok())
+                                    .filter(|member| array_index(member).is_some())
                                     .flat_map(|member| {
                                         elements
                                             .get(&Some(member.clone()))
@@ -2147,7 +2168,7 @@ impl CallableState {
             self.array_lengths.remove(&object);
             let properties = self.properties.entry(object).or_default();
             for (key, property) in properties.iter_mut() {
-                if key.as_ref().is_none_or(|key| key.parse::<usize>().is_ok()) {
+                if key.as_ref().is_none_or(|key| array_index(key).is_some()) {
                     property.extend(values);
                 }
             }
@@ -2245,12 +2266,9 @@ impl CallableState {
                                 .into_iter()
                                 .filter_map(|(key, values)| {
                                     let key = match key {
-                                        Some(key) => Some(
-                                            key.parse::<usize>()
-                                                .ok()?
-                                                .checked_sub(index)?
-                                                .to_string(),
-                                        ),
+                                        Some(key) => {
+                                            Some(array_index(&key)?.checked_sub(index)?.to_string())
+                                        }
                                         None => None,
                                     };
                                     Some((key, values))
