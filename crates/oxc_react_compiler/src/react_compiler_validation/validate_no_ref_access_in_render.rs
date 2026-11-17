@@ -487,7 +487,7 @@ fn nullish_lazy_ref_init_ref_id(
 }
 
 /// Whether `identifier` holds the value of a `current` property load, following
-/// local copies back to the load.
+/// local copies and type assertions back to the load.
 fn loads_ref_current(func: &HirFunction, identifier: IdentifierId) -> bool {
     let mut identifier = identifier;
     let mut visited = FxHashSet::default();
@@ -504,6 +504,10 @@ fn loads_ref_current(func: &HirFunction, identifier: IdentifierId) -> bool {
             }
             InstructionValue::LoadLocal { place, .. } => {
                 Some(CurrentSource::Copy(place.identifier))
+            }
+            // `as`, `satisfies` and angle-bracket assertions keep the value.
+            InstructionValue::TypeCastExpression { value, .. } => {
+                Some(CurrentSource::Copy(value.identifier))
             }
             _ => Some(CurrentSource::Current(false)),
         });
