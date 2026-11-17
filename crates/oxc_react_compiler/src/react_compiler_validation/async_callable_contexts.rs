@@ -57,6 +57,26 @@ impl Arguments {
         }
     }
 
+    /// Values that may land at `index` after spreads are expanded.
+    fn at(&self, index: usize) -> Values {
+        let mut values = self.elements.get(&Some(index.to_string())).cloned().unwrap_or_default();
+        if let Some(unknown) = self.elements.get(&None) {
+            values.extend(unknown);
+        }
+        values
+    }
+
+    /// Values that may land at `from` or any later position.
+    fn from(&self, from: usize) -> Values {
+        let mut values = Values::default();
+        for (key, element) in &self.elements {
+            if key.as_ref().is_none_or(|key| key.parse::<usize>().is_ok_and(|key| key >= from)) {
+                values.extend(element);
+            }
+        }
+        values
+    }
+
     fn skip(mut self, count: usize) -> Self {
         self.elements = self
             .elements
@@ -659,6 +679,9 @@ struct CallableState {
     builtin_function_methods: FxHashMap<IdentifierId, String>,
     array_lengths: FxHashMap<IdentifierId, usize>,
     arrays: FxHashSet<IdentifierId>,
+    // Arrays written through an unknown key that may name a non-index
+    // property, so named reads must consult the unknown-key bucket.
+    named_unknown: FxHashSet<IdentifierId>,
     collections: FxHashMap<IdentifierId, CollectionContents>,
     // The synthetic `[key, value]` entry object standing for each Map.
     map_entries: FxHashMap<IdentifierId, IdentifierId>,
@@ -1044,14 +1067,7 @@ impl CallableState {
         let ty = &env.types[env.identifiers[callee].type_];
         let Some(signature) = env.get_function_signature(ty).ok().flatten() else { return };
         let arguments = self.arguments(args);
-        let argument = |index: usize| {
-            let mut values =
-                arguments.elements.get(&Some(index.to_string())).cloned().unwrap_or_default();
-            if let Some(unknown) = arguments.elements.get(&None) {
-                values.extend(unknown);
-            }
-            values
-        };
+        let argument = |index: usize| arguments.at(index);
         match (&instruction.value, signature.canonical_name.as_deref()) {
             (InstructionValue::NewExpression { .. }, Some(name @ ("Set" | "Map"))) => {
                 let map = name == "Map";
@@ -1096,8 +1112,7 @@ impl CallableState {
                 {
                     // The constructor callee is a load, never an allocation, so
                     // it can stand for this Map's `[key, value]` entry pairs.
-                    self.map_entries.insert(id, callee.identifier);
-                    self.sync_map_entries(id);
+                    self.sync_map_entries(id, callee.identifier);
                 }
             }
             (
@@ -1130,15 +1145,10 @@ impl CallableState {
         if !objects.identities.iter().any(|object| self.collections.contains_key(object)) {
             return;
         }
-        let argument = |index: usize| match args.get(index) {
-            Some(PlaceOrSpread::Place(place)) => {
-                (self.values(place.identifier), self.keys.get(&place.identifier).cloned())
-            }
-            Some(PlaceOrSpread::Spread(spread)) => (self.elements(spread.place.identifier), None),
-            None => (Values::default(), None),
-        };
-        let (key, key_name) = argument(0);
-        let (value, _) = argument(1);
+        let arguments = self.arguments(args);
+        let key = arguments.at(0);
+        let value = arguments.at(1);
+        let key_name = self.argument_key(args, 0);
         let definite = objects.identities.len() == 1;
         let mut result = None;
         for object in &objects.identities {
@@ -1190,8 +1200,14 @@ impl CallableState {
                 }
                 _ => continue,
             }
-            if contents.map {
-                self.sync_map_entries(*object);
+            if contents.map && name != "get" {
+                // An ambiguous receiver only grows, so its pair can grow in place.
+                let entry = if definite {
+                    instruction.lvalue.identifier
+                } else {
+                    self.map_entries.get(object).copied().unwrap_or(instruction.lvalue.identifier)
+                };
+                self.sync_map_entries(*object, entry);
             }
         }
         match name.as_str() {
@@ -1231,26 +1247,45 @@ impl CallableState {
             .then_some(identity)
     }
 
-    fn sync_map_entries(&mut self, map: IdentifierId) {
-        let (Some(&entry), Some(contents)) =
-            (self.map_entries.get(&map), self.collections.get(&map))
-        else {
-            return;
-        };
+    /// Points `map` at a fresh `[key, value]` entry object holding its current
+    /// contents. The previous entry object is left as is, because pairs already
+    /// copied into another container or array keep the values they had.
+    /// `entry` is a temporary that is never an allocation, such as the
+    /// constructor callee or the mutating call's result.
+    fn sync_map_entries(&mut self, map: IdentifierId, entry: IdentifierId) {
+        let Some(contents) = self.collections.get(&map) else { return };
         let properties = FxHashMap::from_iter([
             (Some("0".to_string()), contents.keys.clone()),
             (Some("1".to_string()), contents.values.clone()),
         ]);
-        self.properties.insert(entry, properties);
+        if self.map_entries.get(&map) == Some(&entry) {
+            merge_properties(self.properties.entry(entry).or_default(), &properties);
+        } else {
+            self.properties.insert(entry, properties);
+        }
         self.arrays.insert(entry);
         self.array_lengths.insert(entry, 2);
+        self.map_entries.insert(map, entry);
+    }
+
+    /// The primitive key at `index`, known only when no spread comes first.
+    fn argument_key(&self, args: &[PlaceOrSpread], index: usize) -> Option<String> {
+        let PlaceOrSpread::Place(place) = args.get(index)? else { return None };
+        if args[..index].iter().any(|arg| matches!(arg, PlaceOrSpread::Spread(_))) {
+            return None;
+        }
+        self.keys.get(&place.identifier).cloned()
     }
 
     /// Values produced by iterating `identifier`: array elements, Set values,
     /// or the `[key, value]` entries of a Map.
     fn elements(&self, identifier: IdentifierId) -> Values {
+        self.elements_of(&self.values(identifier))
+    }
+
+    fn elements_of(&self, values: &Values) -> Values {
         let mut result = Values::default();
-        for object in self.values(identifier).identities {
+        for &object in &values.identities {
             if let Some(contents) = self.collections.get(&object) {
                 if !contents.map {
                     result.extend(&contents.values);
@@ -1284,43 +1319,25 @@ impl CallableState {
         };
         let Some(name) = self.members.get(&property.identifier).cloned() else { return };
         let id = instruction.lvalue.identifier;
-        let argument_values = |state: &Self, from: usize| {
-            let mut values = Values::default();
-            for argument in args.iter().skip(from) {
-                match argument {
-                    PlaceOrSpread::Place(place) => values.extend(&state.values(place.identifier)),
-                    PlaceOrSpread::Spread(spread) => {
-                        values.extend(&state.elements(spread.place.identifier));
-                    }
-                }
-            }
-            values
-        };
-        let argument_place = |index: usize| match args.get(index) {
-            Some(PlaceOrSpread::Place(place)) => Some(place.identifier),
-            _ => None,
-        };
+        let arguments = self.arguments(args);
         if let Some(global) = self.globals.get(&receiver.identifier).cloned() {
             match (global.as_str(), name.as_str()) {
-                ("Array", "of") => {
-                    let elements = argument_values(self, 0);
-                    self.new_array(id, elements);
-                }
+                ("Array", "of") => self.new_array(id, arguments.from(0)),
                 // A mapping callback is invoked; leave that call unmodeled.
-                ("Array", "from") if args.len() == 1 => {
-                    let elements = argument_place(0)
-                        .map_or_else(|| argument_values(self, 0), |place| self.elements(place));
+                ("Array", "from") if arguments.length.is_none_or(|length| length == 1) => {
+                    let elements = self.elements_of(&arguments.at(0));
                     self.new_array(id, elements);
                 }
                 ("Object", "assign") => {
-                    let Some(target) = argument_place(0) else { return };
-                    for argument in args.iter().skip(1) {
-                        let PlaceOrSpread::Place(source) = argument else { continue };
-                        for (key, values) in self.properties(source.identifier) {
-                            self.store(target, key, values);
+                    let target = arguments.at(0);
+                    let sources = arguments.from(1);
+                    for source in &sources.identities {
+                        let properties = self.properties.get(source).cloned().unwrap_or_default();
+                        for (key, values) in properties {
+                            self.store_into(&target, key, values);
                         }
                     }
-                    self.copy(target, id);
+                    self.values.insert(id, target);
                 }
                 _ => {}
             }
@@ -1332,29 +1349,17 @@ impl CallableState {
         }
         let elements = self.elements(receiver.identifier);
         match name.as_str() {
-            "push" | "unshift" => {
-                let values = argument_values(self, 0);
-                self.store_index(receiver.identifier, &values);
-            }
-            "fill" => {
-                let values = argument_place(0).map(|place| self.values(place)).unwrap_or_default();
-                self.store_index(receiver.identifier, &values);
-            }
+            "push" | "unshift" => self.store_index(&receivers, &arguments.from(0)),
+            "fill" => self.store_index(&receivers, &arguments.at(0)),
             "splice" => {
-                let values = argument_values(self, 2);
-                self.store_index(receiver.identifier, &values);
+                self.store_index(&receivers, &arguments.from(2));
                 self.new_array(id, elements);
             }
             "concat" | "toSpliced" | "with" => {
                 let mut values = elements;
-                for argument in args.iter().skip(usize::from(name != "concat")) {
-                    let place = match argument {
-                        PlaceOrSpread::Place(place) => place,
-                        PlaceOrSpread::Spread(spread) => &spread.place,
-                    };
-                    values.extend(&self.values(place.identifier));
-                    values.extend(&self.elements(place.identifier));
-                }
+                let operands = arguments.from(usize::from(name != "concat"));
+                values.extend(&operands);
+                values.extend(&self.elements_of(&operands));
                 self.new_array(id, values);
             }
             "slice" | "toReversed" | "toSorted" | "flat" => self.new_array(id, elements),
@@ -1440,11 +1445,24 @@ impl CallableState {
             .retain(|id, method| other.builtin_function_methods.get(id) == Some(method));
         self.array_lengths.retain(|id, length| other.array_lengths.get(id) == Some(length));
         self.arrays.extend(&other.arrays);
+        self.named_unknown.extend(&other.named_unknown);
         for (&id, contents) in &other.collections {
             self.collections.entry(id).or_default().extend(contents);
         }
         for (&map, &entry) in &other.map_entries {
-            self.map_entries.insert(map, entry);
+            match self.map_entries.get(&map) {
+                // Each path may have rotated the entry pair; the surviving pair
+                // must carry the contents of both.
+                Some(&current) if current != entry => {
+                    if let Some(properties) = other.properties.get(&entry) {
+                        merge_properties(self.properties.entry(current).or_default(), properties);
+                    }
+                }
+                Some(_) => {}
+                None => {
+                    self.map_entries.insert(map, entry);
+                }
+            }
         }
         self.members.retain(|id, name| other.members.get(id) == Some(name));
         self.globals.retain(|id, name| other.globals.get(id) == Some(name));
@@ -1529,7 +1547,8 @@ impl CallableState {
     ) -> Option<&'p Values> {
         let named = key.as_ref().is_some_and(|key| key.parse::<usize>().is_err());
         properties.get(key).or_else(|| {
-            (!named || !self.arrays.contains(&object)).then(|| properties.get(&None))?
+            (!named || !self.arrays.contains(&object) || self.named_unknown.contains(&object))
+                .then(|| properties.get(&None))?
         })
     }
 
@@ -1961,8 +1980,7 @@ impl CallableState {
 
     /// A write to some unknown index of an array, as `push`, `unshift`, `fill`
     /// and `splice` do. Named properties such as own methods keep their values.
-    fn store_index(&mut self, object: IdentifierId, values: &Values) {
-        let objects = self.values(object);
+    fn store_index(&mut self, objects: &Values, values: &Values) {
         for &object in &objects.identities {
             self.array_lengths.remove(&object);
             let properties = self.properties.entry(object).or_default();
@@ -1973,11 +1991,15 @@ impl CallableState {
             }
             properties.entry(None).or_default().extend(values);
         }
-        self.refresh_pending(&objects, None);
+        self.refresh_pending(objects, None);
     }
 
     fn store(&mut self, object: IdentifierId, key: Option<String>, values: Values) {
         let objects = self.values(object);
+        self.store_into(&objects, key, values);
+    }
+
+    fn store_into(&mut self, objects: &Values, key: Option<String>, values: Values) {
         let definite = objects.identities.len() == 1 && key.is_some();
         for &object in &objects.identities {
             self.array_lengths.remove(&object);
@@ -1987,6 +2009,7 @@ impl CallableState {
                     property.extend(&values);
                 }
                 properties.entry(None).or_default().extend(&values);
+                self.named_unknown.insert(object);
             } else if definite {
                 properties.insert(key.clone(), values.clone());
             } else {
@@ -1994,7 +2017,7 @@ impl CallableState {
                 properties.entry(key.clone()).or_insert(fallback).extend(&values);
             }
         }
-        self.refresh_pending(&objects, key.as_ref());
+        self.refresh_pending(objects, key.as_ref());
     }
 
     fn refresh_pending(&mut self, objects: &Values, key: Option<&String>) {
