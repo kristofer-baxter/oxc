@@ -152,12 +152,30 @@ impl Gen for Statement<'_> {
             }
             Self::LabeledStatement(stmt) => stmt.print(p, ctx),
             Self::EmptyStatement(stmt) => stmt.print(p, ctx),
-            Self::ImportDeclaration(decl) => decl.print(p, ctx),
-            Self::ExportDeclaration(decl) => decl.print(p, ctx),
-            Self::ExportNamedDeclaration(decl) => decl.print(p, ctx),
-            Self::ExportFromDeclaration(decl) => decl.print(p, ctx),
-            Self::ExportDefaultDeclaration(decl) => decl.print(p, ctx),
-            Self::ExportAllDeclaration(decl) => decl.print(p, ctx),
+            Self::ImportDeclaration(decl) => {
+                decl.print(p, ctx);
+                p.printed_declaration_ends(&**decl);
+            }
+            Self::ExportDeclaration(decl) => {
+                decl.print(p, ctx);
+                p.printed_declaration_ends(&**decl);
+            }
+            Self::ExportNamedDeclaration(decl) => {
+                decl.print(p, ctx);
+                p.printed_declaration_ends(&**decl);
+            }
+            Self::ExportFromDeclaration(decl) => {
+                decl.print(p, ctx);
+                p.printed_declaration_ends(&**decl);
+            }
+            Self::ExportDefaultDeclaration(decl) => {
+                decl.print(p, ctx);
+                p.printed_declaration_ends(&**decl);
+            }
+            Self::ExportAllDeclaration(decl) => {
+                decl.print(p, ctx);
+                p.printed_declaration_ends(&**decl);
+            }
             Self::WithStatement(stmt) => stmt.print(p, ctx),
             Self::DebuggerStatement(stmt) => stmt.print(p, ctx),
             // TypeScript-specific (less common)
@@ -917,6 +935,7 @@ impl Gen for ImportDeclaration<'_> {
         p.print_indent();
         p.add_source_mapping(self.span);
         p.print_space_before_identifier();
+        p.printed_declaration_starts(self);
         p.print_str("import");
         if self.import_kind.is_type() {
             p.print_str(" type");
@@ -1077,6 +1096,7 @@ impl Gen for ExportDeclaration<'_> {
         }
         p.print_indent();
         p.add_source_mapping(self.span);
+        p.printed_declaration_starts(self);
         p.print_str("export");
         let decl = &self.declaration;
         // A decorated class starts with `@`, so no space is needed after `export`.
@@ -1113,14 +1133,14 @@ impl Gen for ExportDeclaration<'_> {
 
 impl Gen for ExportNamedDeclaration<'_> {
     fn r#gen(&self, p: &mut Codegen, ctx: Context) {
-        gen_export_specifiers(p, ctx, self.span, self.export_kind, &self.specifiers);
+        gen_export_specifiers(p, ctx, self, self.span, self.export_kind, &self.specifiers);
         p.print_semicolon_after_statement();
     }
 }
 
 impl Gen for ExportFromDeclaration<'_> {
     fn r#gen(&self, p: &mut Codegen, ctx: Context) {
-        gen_export_specifiers(p, ctx, self.span, self.export_kind, &self.specifiers);
+        gen_export_specifiers(p, ctx, self, self.span, self.export_kind, &self.specifiers);
         p.print_soft_space();
         p.print_str("from");
         p.print_soft_space();
@@ -1133,9 +1153,10 @@ impl Gen for ExportFromDeclaration<'_> {
     }
 }
 
-fn gen_export_specifiers(
+fn gen_export_specifiers<T>(
     p: &mut Codegen,
     ctx: Context,
+    declaration: &T,
     span: Span,
     export_kind: ImportOrExportKind,
     specifiers: &[ExportSpecifier<'_>],
@@ -1143,6 +1164,7 @@ fn gen_export_specifiers(
     p.print_comments_at(span.start);
     p.print_indent();
     p.add_source_mapping(span);
+    p.printed_declaration_starts(declaration);
     p.print_str("export");
     if export_kind.is_type() {
         p.print_hard_space();
@@ -1237,6 +1259,7 @@ impl Gen for ExportAllDeclaration<'_> {
         p.print_comments_at(self.span.start);
         p.print_indent();
         p.add_source_mapping(self.span);
+        p.printed_declaration_starts(self);
         p.print_str("export");
         if self.export_kind.is_type() {
             p.print_str(" type");
@@ -1277,6 +1300,7 @@ impl Gen for ExportDefaultDeclaration<'_> {
         }
         p.print_indent();
         p.add_source_mapping(self.span);
+        p.printed_declaration_starts(self);
         p.print_str("export default");
         p.print_soft_space();
         self.declaration.print(p, ctx);
@@ -1407,7 +1431,13 @@ impl Gen for IdentifierReference<'_> {
         let name = p.get_identifier_reference_name(self);
         p.print_space_before_identifier();
         p.add_source_mapping_for_name(self.span, name);
-        p.print_name(name);
+        if p.records_reference(self) {
+            let start = p.printed_start();
+            p.print_name(name);
+            p.printed_reference(self, start);
+        } else {
+            p.print_name(name);
+        }
     }
 }
 
@@ -1625,6 +1655,14 @@ impl GenExpr for CallExpression<'_> {
             } else if is_statement {
                 p.start_of_stmt = p.code_len();
             }
+            // A space that separates the callee from what is before it
+            // is not part of the call.
+            // Parentheses around a callee are not printed, so one inside them counts.
+            if matches!(self.callee.without_parentheses(), Expression::Identifier(_)) {
+                p.print_space_before_identifier();
+            }
+            let start = p.printed_start();
+            p.printing_reference_as(&self.callee, crate::PrintedNode::CALLED);
             self.callee.print_expr(p, Precedence::Postfix, Context::empty());
             if self.optional {
                 p.print_str("?.");
@@ -1636,6 +1674,21 @@ impl GenExpr for CallExpression<'_> {
                 && !cjs_module_lexer::try_print_require_call(p, self)
             {
                 p.print_arguments(self.span, &self.arguments, ctx);
+            }
+            if let Expression::Identifier(callee) = self.callee.without_parentheses() {
+                if callee.name == "require" {
+                    p.printed(self, start, crate::PrintedKind::Require, self.span);
+                } else if callee.name == "\0native_temporal_read"
+                    && let Some(Argument::Identifier(read)) = self.arguments.first()
+                    && let Some(reference) = read.reference_id.get()
+                {
+                    p.printed(self, start, crate::PrintedKind::TemporalRead, self.span);
+                    #[expect(clippy::cast_possible_truncation)]
+                    if let Some(node) = p.printed_nodes.as_mut().and_then(|nodes| nodes.last_mut())
+                    {
+                        node.reference = reference.index() as u32;
+                    }
+                }
             }
         });
     }
@@ -1843,6 +1896,18 @@ impl Gen for ObjectProperty<'_> {
         let mut shorthand = false;
         if let PropertyKey::StaticIdentifier(key) = &self.key {
             if key.name == "__proto__" {
+                // A shorthand whose value was replaced by something that is no bare name:
+                // `__proto__: value` would set the prototype, so the
+                // own property is written with a computed key.
+                if self.shorthand
+                    && !matches!(self.value.without_parentheses(), Expression::Identifier(_))
+                {
+                    p.print_str("[\"__proto__\"]");
+                    p.print_colon();
+                    p.print_soft_space();
+                    self.value.print_expr(p, Precedence::Comma, Context::empty());
+                    return;
+                }
                 shorthand = self.shorthand;
             } else if let Expression::Identifier(ident) = self.value.without_parentheses()
                 && key.name == p.get_identifier_reference_name(ident)
@@ -1875,6 +1940,9 @@ impl Gen for ObjectProperty<'_> {
         }
 
         p.print_leading_comments_before_expression(&self.value);
+        if shorthand {
+            p.printing_reference_as(&self.value, crate::PrintedNode::SHORTHAND);
+        }
         self.value.print_expr(p, Precedence::Comma, Context::empty());
     }
 }
@@ -2253,13 +2321,21 @@ impl Gen for AssignmentTargetPropertyIdentifier<'_> {
     fn r#gen(&self, p: &mut Codegen, ctx: Context) {
         let ident_name = p.get_identifier_reference_name(&self.binding);
         if ident_name == self.binding.name.as_str() {
+            p.printing_shorthand_target(&self.binding);
             self.binding.print(p, ctx);
         } else {
             // `({x: a} = y);`
             p.print_name(self.binding.name.as_str());
             p.print_colon();
             p.print_soft_space();
-            p.print_name(ident_name);
+            // The renamed target is the reference, after its key.
+            if p.records_reference(&self.binding) {
+                let start = p.printed_start();
+                p.print_name(ident_name);
+                p.printed_reference(&self.binding, start);
+            } else {
+                p.print_name(ident_name);
+            }
         }
         if let Some(expr) = &self.init {
             p.print_soft_space();
@@ -2315,6 +2391,9 @@ impl Gen for AssignmentTargetPropertyProperty<'_> {
             }
             p.print_colon();
             p.print_soft_space();
+        } else if let Some(binding) = self.binding.identifier() {
+            // The key was left out, so the binding's text is the key too.
+            p.printing_shorthand_target(binding);
         }
         self.binding.print(p, ctx);
     }
@@ -2354,6 +2433,7 @@ impl GenExpr for ImportExpression<'_> {
         p.wrap(wrap, |p| {
             p.print_space_before_identifier();
             p.add_source_mapping(self.span);
+            let printed_start = p.printed_start();
             p.print_str("import");
             if let Some(phase) = self.phase {
                 p.print_ascii_byte(b'.');
@@ -2388,6 +2468,14 @@ impl GenExpr for ImportExpression<'_> {
                 p.dedent();
             }
             p.print_ascii_byte(b')');
+            p.printed(self, printed_start, crate::PrintedKind::Import, self.span);
+            // Bit 1 of an `import()`'s flags: it has a second argument that is more than a
+            // name, which reading does nothing.
+            if self.options.as_ref().is_some_and(|options| !matches!(options, Expression::Identifier(_)))
+                && let Some(node) = p.printed_nodes.as_mut().and_then(|nodes| nodes.last_mut())
+            {
+                node.flags = 1;
+            }
         });
     }
 }
@@ -2420,6 +2508,7 @@ impl GenExpr for TaggedTemplateExpression<'_> {
     fn gen_expr(&self, p: &mut Codegen, _precedence: Precedence, ctx: Context) {
         p.add_source_mapping(self.span);
         // Propagate `FORBID_CALL` to the tag so a `new` callee like `f()` wraps.
+        p.printing_reference_as(&self.tag, crate::PrintedNode::CALLED);
         self.tag.print_expr(p, Precedence::Postfix, ctx.intersection(Context::FORBID_CALL));
         if let Some(type_parameters) = &self.type_arguments {
             type_parameters.print(p, ctx);
@@ -2479,6 +2568,7 @@ impl GenExpr for NewExpression<'_> {
             p.add_source_mapping(self.span);
             p.print_str("new");
             p.print_soft_space();
+            p.printing_reference_as(&self.callee, crate::PrintedNode::CONSTRUCTED);
             self.callee.print_expr(p, Precedence::New, Context::FORBID_CALL);
             if let Some(type_parameters) = &self.type_arguments {
                 type_parameters.print(p, ctx);
@@ -2583,7 +2673,9 @@ impl Gen for ImportMeta {
     fn r#gen(&self, p: &mut Codegen, _ctx: Context) {
         p.print_space_before_identifier();
         p.add_source_mapping(self.span);
+        let start = p.printed_start();
         p.print_str("import.meta");
+        p.printed(self, start, crate::PrintedKind::Meta, self.span);
     }
 }
 
