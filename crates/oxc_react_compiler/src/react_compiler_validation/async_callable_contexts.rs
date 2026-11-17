@@ -7,7 +7,8 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use super::validate_locals_not_reassigned_after_render::no_alias_callback_parameters;
 use crate::react_compiler_hir::environment::Environment;
 use crate::react_compiler_hir::visitors::{
-    each_instruction_value_lvalue, each_instruction_value_operand, each_terminal_operand,
+    each_instruction_lvalue, each_instruction_value_lvalue, each_instruction_value_operand,
+    each_terminal_operand,
 };
 use crate::react_compiler_hir::{
     ArrayElement, ArrayPatternElement, BlockId, HirFunction, IdentifierId, Instruction,
@@ -821,6 +822,10 @@ struct CallableState {
     // changing one that may already be stored elsewhere.
     map_entries: FxHashMap<IdentifierId, FxHashSet<IdentifierId>>,
     entry_ids: EntryIds,
+    /// Identities allocated by an instruction of this function that runs at
+    /// most once per call. Parameters, captures, callee-returned objects and
+    /// allocations in a loop may each stand for several runtime objects.
+    once: Rc<FxHashSet<IdentifierId>>,
     // Member names of property loads and names of loaded globals, used to
     // recognize built-in methods that have no canonical signature name.
     members: FxHashMap<IdentifierId, String>,
@@ -2428,7 +2433,10 @@ impl CallableState {
     /// that Map at that site, so writes through it are always weak.
     fn singleton(&self, objects: &Values) -> bool {
         objects.identities.len() == 1
-            && objects.identities.iter().all(|&id| !self.entry_ids.contains(id))
+            && objects
+                .identities
+                .iter()
+                .all(|&id| !self.entry_ids.contains(id) && self.once.contains(&id))
     }
 
     fn store(&mut self, object: IdentifierId, key: Option<String>, values: Values) {
@@ -2800,6 +2808,36 @@ impl CallableState {
     }
 }
 
+/// Identities assigned by instructions in blocks outside every CFG cycle, so
+/// each names at most one runtime object per call of `func`.
+fn single_allocations(func: &HirFunction) -> FxHashSet<IdentifierId> {
+    let mut once = FxHashSet::default();
+    for (&block_id, block) in &func.body.blocks {
+        let mut seen = FxHashSet::default();
+        let mut stack: Vec<BlockId> = block.preds.iter().copied().collect();
+        let mut cyclic = false;
+        while let Some(current) = stack.pop() {
+            if current == block_id {
+                cyclic = true;
+                break;
+            }
+            if seen.insert(current)
+                && let Some(predecessor) = func.body.blocks.get(&current)
+            {
+                stack.extend(predecessor.preds.iter().copied());
+            }
+        }
+        if cyclic {
+            continue;
+        }
+        for &instruction_id in &block.instructions {
+            let instruction = &func.instructions[instruction_id.index()];
+            once.extend(each_instruction_lvalue(instruction).iter().map(|place| place.identifier));
+        }
+    }
+    once
+}
+
 /// Resolve async identity at each value-producing instruction. Heap properties
 /// use reaching values across the CFG: a load snapshots the value before later
 /// writes, and a definite store replaces the old member. Containment never makes
@@ -2824,14 +2862,18 @@ pub(super) fn infer_async_callable_contexts(
     let captured_bindings = captured_contexts.values().flatten().copied().collect();
     let mut states: FxHashMap<BlockId, CallableState> = FxHashMap::default();
     let entry_ids = EntryIds::new(env.identifiers.len());
+    let once = Rc::new(single_allocations(func));
     loop {
         let mut changed = false;
         for (&block_id, block) in &func.body.blocks {
             let mut predecessors =
                 block.preds.iter().filter_map(|predecessor| states.get(predecessor));
             let mut state = predecessors.next().cloned().unwrap_or_else(|| {
-                let mut state =
-                    CallableState { entry_ids: entry_ids.clone(), ..CallableState::default() };
+                let mut state = CallableState {
+                    entry_ids: entry_ids.clone(),
+                    once: Rc::clone(&once),
+                    ..CallableState::default()
+                };
                 for place in
                     func.context.iter().chain(func.params.iter().map(|param| match param {
                         ParamPattern::Place(place) => place,
