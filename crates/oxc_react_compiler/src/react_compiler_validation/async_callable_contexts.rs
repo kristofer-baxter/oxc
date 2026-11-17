@@ -670,6 +670,19 @@ fn remove_identity(values: &mut Values, identity: IdentifierId) {
     values.iterators.remove(&identity);
 }
 
+/// How an array mutation moves its index slots.
+#[derive(Clone, Copy)]
+enum Reorder<'a> {
+    Reverse,
+    Shift,
+    Pop,
+    /// Inserted at the front, in order.
+    Unshift(&'a Arguments),
+    /// Moves slots in a way the model does not track, optionally inserting
+    /// values at unknown positions.
+    Scramble(Option<&'a Values>),
+}
+
 #[derive(Clone, Default, PartialEq, Eq)]
 struct CallableState {
     values: FxHashMap<IdentifierId, Values>,
@@ -1329,13 +1342,24 @@ impl CallableState {
                     self.new_array(id, elements);
                 }
                 ("Object", "assign") => {
+                    // Sources are copied in argument order. Alternatives for
+                    // one position, and spread sources at unknown positions,
+                    // may or may not write a key, so they merge weakly.
                     let target = arguments.at(0);
-                    let sources = arguments.from(1);
-                    for source in &sources.identities {
-                        let properties = self.properties.get(source).cloned().unwrap_or_default();
-                        for (key, values) in properties {
-                            self.store_into(&target, key, values);
-                        }
+                    let mut positions: Vec<usize> = arguments
+                        .elements
+                        .keys()
+                        .filter_map(|key| key.as_ref()?.parse().ok())
+                        .filter(|&position| position >= 1)
+                        .collect();
+                    positions.sort_unstable();
+                    for position in positions {
+                        let sources = arguments.elements[&Some(position.to_string())].clone();
+                        let weak = sources.identities.len() != 1;
+                        self.assign(&target, &sources, weak);
+                    }
+                    if let Some(sources) = arguments.elements.get(&None) {
+                        self.assign(&target, sources, true);
                     }
                     self.values.insert(id, target);
                 }
@@ -1349,11 +1373,37 @@ impl CallableState {
         }
         let elements = self.elements(receiver.identifier);
         match name.as_str() {
-            "push" | "unshift" => self.store_index(&receivers, &arguments.from(0)),
+            "push" => self.store_index(&receivers, &arguments.from(0)),
             "fill" => self.store_index(&receivers, &arguments.at(0)),
+            "unshift" => self.reorder(&receivers, Reorder::Unshift(&arguments)),
+            "shift" => {
+                self.values.insert(id, elements);
+                self.reorder(&receivers, Reorder::Shift);
+            }
+            "pop" => {
+                self.values.insert(id, elements);
+                self.reorder(&receivers, Reorder::Pop);
+            }
+            "reverse" => {
+                self.reorder(&receivers, Reorder::Reverse);
+                self.values.insert(id, receivers);
+            }
+            "sort" | "copyWithin" => {
+                self.reorder(&receivers, Reorder::Scramble(None));
+                self.values.insert(id, receivers);
+            }
             "splice" => {
-                self.store_index(&receivers, &arguments.from(2));
+                self.reorder(&receivers, Reorder::Scramble(Some(&arguments.from(2))));
                 self.new_array(id, elements);
+            }
+            "flat" => {
+                let depth = if args.is_empty() {
+                    Some(1)
+                } else {
+                    self.argument_key(args, 0).and_then(|depth| depth.parse().ok())
+                };
+                let flattened = self.flatten(elements, depth);
+                self.new_array(id, flattened);
             }
             "concat" | "toSpliced" | "with" => {
                 let mut values = elements;
@@ -1362,15 +1412,127 @@ impl CallableState {
                 values.extend(&self.elements_of(&operands));
                 self.new_array(id, values);
             }
-            "slice" | "toReversed" | "toSorted" | "flat" => self.new_array(id, elements),
-            "reverse" | "sort" | "copyWithin" => {
-                self.values.insert(id, receivers);
-            }
-            "at" | "pop" | "shift" => {
+            "slice" | "toReversed" | "toSorted" => self.new_array(id, elements),
+            "at" => {
                 self.values.insert(id, elements);
             }
             _ => {}
         }
+    }
+
+    /// Copies the own properties of `sources` onto `target`. A weak copy keeps
+    /// each existing value alongside the copied one.
+    fn assign(&mut self, target: &Values, sources: &Values, weak: bool) {
+        for source in &sources.identities {
+            let properties = self.properties.get(source).cloned().unwrap_or_default();
+            for (key, mut values) in properties {
+                if weak && key.is_some() {
+                    values.extend(&self.project(target, &key));
+                }
+                self.store_into(target, key, values);
+            }
+        }
+    }
+
+    /// Moves the index slots of the arrays in `objects`. An exact move needs
+    /// one receiver of known length; otherwise every index slot joins the
+    /// unknown-index bucket, so an indexed read sees any element that may
+    /// have moved there.
+    fn reorder(&mut self, objects: &Values, reorder: Reorder<'_>) {
+        let definite = objects.identities.len() == 1;
+        for &object in &objects.identities {
+            if !self.arrays.contains(&object) {
+                continue;
+            }
+            let length = self.array_lengths.get(&object).copied().filter(|_| definite);
+            let properties = self.properties.entry(object).or_default();
+            let mut indexed = Vec::new();
+            properties.retain(|key, values| match key.as_ref().map(|key| key.parse::<usize>()) {
+                Some(Ok(index)) => {
+                    indexed.push((index, std::mem::take(values)));
+                    false
+                }
+                _ => true,
+            });
+            let exact = length.and_then(|length| {
+                let moved = |index: usize| match reorder {
+                    Reorder::Reverse => length.checked_sub(index + 1),
+                    Reorder::Shift => index.checked_sub(1),
+                    Reorder::Pop => (index + 1 < length).then_some(index),
+                    Reorder::Unshift(inserted) => Some(index + inserted.length?),
+                    Reorder::Scramble(_) => None,
+                };
+                let new_length = match reorder {
+                    Reorder::Reverse => length,
+                    Reorder::Shift | Reorder::Pop => length.saturating_sub(1),
+                    Reorder::Unshift(inserted) => {
+                        if inserted.elements.contains_key(&None) {
+                            return None;
+                        }
+                        length + inserted.length?
+                    }
+                    Reorder::Scramble(_) => return None,
+                };
+                let mut slots = Properties::default();
+                for (index, values) in &indexed {
+                    if *index >= length {
+                        return None;
+                    }
+                    let removed = matches!(reorder, Reorder::Shift) && *index == 0
+                        || matches!(reorder, Reorder::Pop) && *index + 1 == length;
+                    if removed {
+                        continue;
+                    }
+                    slots.insert(Some(moved(*index)?.to_string()), values.clone());
+                }
+                if let Reorder::Unshift(inserted) = reorder {
+                    for (key, values) in &inserted.elements {
+                        slots.insert(key.clone(), values.clone());
+                    }
+                }
+                Some((slots, new_length))
+            });
+            if let Some((slots, new_length)) = exact {
+                properties.extend(slots);
+                self.array_lengths.insert(object, new_length);
+            } else {
+                let unknown = properties.entry(None).or_default();
+                for (_, values) in &indexed {
+                    unknown.extend(values);
+                }
+                match reorder {
+                    Reorder::Unshift(inserted) => unknown.extend(&inserted.from(0)),
+                    Reorder::Scramble(Some(inserted)) => unknown.extend(inserted),
+                    _ => {}
+                }
+                self.array_lengths.remove(&object);
+            }
+        }
+        self.refresh_pending(objects, None);
+    }
+
+    /// Elements of `elements` flattened `depth` levels, or every level when
+    /// the depth is unknown. Nested arrays are kept alongside their elements.
+    fn flatten(&self, mut elements: Values, depth: Option<usize>) -> Values {
+        let mut seen = FxHashSet::default();
+        let mut level = 0;
+        while depth.is_none_or(|depth| level < depth) {
+            let nested = Values {
+                identities: elements
+                    .identities
+                    .iter()
+                    .copied()
+                    .filter(|id| self.arrays.contains(id) && seen.insert(*id))
+                    .collect(),
+                ..Values::default()
+            };
+            if nested.identities.is_empty() {
+                break;
+            }
+            elements.extend(&self.elements_of(&nested));
+            level += 1;
+        }
+        elements
     }
 
     fn values(&self, identifier: IdentifierId) -> Values {
