@@ -388,8 +388,7 @@ impl<'a> Codegen<'a> {
             #[expect(clippy::cast_possible_truncation)]
             let end = self.code.len() as u32;
             #[expect(clippy::cast_possible_truncation)]
-            let reference =
-                identifier.reference_id.get().map_or(u32::MAX, |id| id.index() as u32);
+            let reference = identifier.reference_id.get().map_or(u32::MAX, |id| id.index() as u32);
             nodes.push(PrintedNode {
                 node: address,
                 start,
@@ -429,7 +428,8 @@ impl<'a> Codegen<'a> {
     #[inline]
     pub(crate) fn printed_declaration_starts<T>(&mut self, node: &T) {
         if self.printed_nodes.is_some() {
-            self.printed_declarations.push((std::ptr::from_ref(node) as usize, self.printed_start()));
+            self.printed_declarations
+                .push((std::ptr::from_ref(node) as usize, self.printed_start()));
         }
     }
 
@@ -439,7 +439,9 @@ impl<'a> Codegen<'a> {
         let address = std::ptr::from_ref(node) as usize;
         // The innermost declaration that started and has not ended is on top; one that
         // was printed by another path and never ended is dropped with it.
-        if let Some(at) = self.printed_declarations.iter().rposition(|(started, _)| *started == address) {
+        if let Some(at) =
+            self.printed_declarations.iter().rposition(|(started, _)| *started == address)
+        {
             let start = self.printed_declarations[at].1;
             self.printed_declarations.truncate(at);
             self.printed(node, start, PrintedKind::Declaration, node.span());
@@ -1598,7 +1600,12 @@ mod printed_nodes_tests {
             .collect();
         assert_eq!(
             starts,
-            ["export const x = 1;", "export namespace M", "export const y = 2;", "export namespace N"]
+            [
+                "export const x = 1;",
+                "export namespace M",
+                "export const y = 2;",
+                "export namespace N"
+            ]
         );
     }
 

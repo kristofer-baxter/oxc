@@ -258,6 +258,7 @@ mod tests {
     use oxc_codegen::{Codegen, CodegenOptions};
     use oxc_parser::Parser;
     use oxc_span::SourceType;
+    use rustc_hash::FxHashSet;
 
     use crate::{CompressOptions, Compressor};
 
@@ -288,7 +289,7 @@ mod tests {
         options.set_inline_enum_members(true);
         assert!(options.inline_enum_members());
         options.set_inline_enum_members(false);
-        options.drop_labels = Default::default();
+        options.drop_labels = FxHashSet::default();
         assert!(options.inline_enum_members());
     }
 }

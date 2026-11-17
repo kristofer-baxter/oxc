@@ -2471,7 +2471,10 @@ impl GenExpr for ImportExpression<'_> {
             p.printed(self, printed_start, crate::PrintedKind::Import, self.span);
             // Bit 1 of an `import()`'s flags: it has a second argument that is more than a
             // name, which reading does nothing.
-            if self.options.as_ref().is_some_and(|options| !matches!(options, Expression::Identifier(_)))
+            if self
+                .options
+                .as_ref()
+                .is_some_and(|options| !matches!(options, Expression::Identifier(_)))
                 && let Some(node) = p.printed_nodes.as_mut().and_then(|nodes| nodes.last_mut())
             {
                 node.flags = 1;
