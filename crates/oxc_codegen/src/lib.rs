@@ -97,6 +97,64 @@ pub struct CodegenReturn<'a> {
 
     /// All the legal comments returned from [LegalComment::Linked] or [LegalComment::External].
     pub legal_comments: Vec<Comment>,
+
+    /// Where the nodes that [`Codegen::with_printed_nodes`] asked for are in `code`
+    /// so a linker can rewrite them without parsing the output again. Empty unless asked for.
+    pub printed_nodes: Vec<PrintedNode>,
+}
+
+/// Where one node's text is in the printed code: an identifier
+/// reference, a module declaration from its keyword to the end of its line, a call, an
+/// `import()` or an `import.meta`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrintedNode {
+    /// The node's address in the tree that was printed.
+    pub node: usize,
+    /// The byte at which its text starts, after any comments and indentation before it.
+    pub start: u32,
+    /// The byte after its text. For a module declaration, after its line's newline.
+    pub end: u32,
+    /// What the node is.
+    pub kind: PrintedKind,
+    /// For a reference: [`PrintedNode::CALLED`], [`PrintedNode::CONSTRUCTED`] and
+    /// [`PrintedNode::SHORTHAND`], as it was printed.
+    pub flags: u8,
+    /// For a reference, its reference id; otherwise `u32::MAX`.
+    pub reference: u32,
+    /// The node's span in the tree.
+    pub span: Span,
+}
+
+impl PrintedNode {
+    /// The reference is the callee of a call or the tag of a template.
+    pub const CALLED: u8 = 2;
+    /// The reference is what `new` constructs.
+    pub const CONSTRUCTED: u8 = 4;
+    /// The reference was printed as a shorthand property or assignment target, so its
+    /// text is the property's key too.
+    pub const SHORTHAND: u8 = 1;
+}
+
+/// What a [`PrintedNode`] is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrintedKind {
+    /// An ECMAScript import or export declaration. The TypeScript-only forms
+    /// (`export = value`, `export as namespace N`, `import x = require("x")`) are not
+    /// recorded: the hook is for code that has been lowered to JavaScript.
+    Declaration,
+    /// A reference whose id was asked for.
+    Reference,
+    /// A reference named `arguments`.
+    Arguments,
+    /// A call of `require`.
+    Require,
+    /// An `import()`.
+    Import,
+    /// An `import.meta`.
+    Meta,
+    /// A call of the host's marker around a read that may come before its binding is
+    /// initialized, where what it reads is a name: `reference` is that name's.
+    TemporalRead,
 }
 
 /// A code generator for printing JavaScript and TypeScript code.
@@ -181,6 +239,17 @@ pub struct Codegen<'a> {
 
     #[cfg(feature = "sourcemap")]
     sourcemap_builder: Option<SourcemapBuilder<'a>>,
+
+    /// Where nodes were printed, when asked for.
+    printed_nodes: Option<Vec<PrintedNode>>,
+    /// The references to record, as a set of bits by reference id.
+    printed_references: Vec<u64>,
+    /// The module declarations being printed, outermost first, and where the keyword of
+    /// each starts: a declaration can hold others, as an exported namespace does.
+    printed_declarations: Vec<(usize, u32)>,
+    /// The identifier that is about to be printed as a callee, a constructor or a
+    /// shorthand, by address, and which of those.
+    printed_flags: (usize, u8),
 }
 
 /// How [`Codegen::print_non_ascii_escaped`] escapes a non-ASCII character, by the grammar
@@ -252,6 +321,130 @@ impl<'a> Codegen<'a> {
             orphan_comment_keys: Vec::new(),
             #[cfg(feature = "sourcemap")]
             sourcemap_builder: None,
+            printed_nodes: None,
+            printed_references: Vec::new(),
+            printed_declarations: Vec::new(),
+            printed_flags: (0, 0),
+        }
+    }
+
+    /// Records where module declarations, `require(…)` calls, `import()`, `import.meta`,
+    /// `arguments` and the identifier references whose ids are set in `references` (bit
+    /// `id % 64` of word `id / 64`) are printed, for [`CodegenReturn::printed_nodes`]
+    /// so a linker can rewrite them without parsing the output again.
+    #[must_use]
+    pub fn with_printed_nodes(mut self, references: Vec<u64>) -> Self {
+        self.printed_nodes = Some(Vec::new());
+        self.printed_references = references;
+        self
+    }
+
+    /// Whether the reference `identifier` is one to record.
+    #[inline]
+    pub(crate) fn records_reference(&self, identifier: &IdentifierReference<'_>) -> bool {
+        if self.printed_nodes.is_none() {
+            return false;
+        }
+        identifier.name == "arguments"
+            || identifier.reference_id.get().is_some_and(|id| {
+                let id = id.index();
+                self.printed_references
+                    .get(id / 64)
+                    .is_some_and(|word| word & (1 << (id % 64)) != 0)
+            })
+    }
+
+    /// The length of the code so far, where the next node's text starts.
+    #[inline]
+    #[expect(clippy::cast_possible_truncation)]
+    pub(crate) fn printed_start(&self) -> u32 {
+        self.code.len() as u32
+    }
+
+    /// Records that `node`'s text is what was printed since `start`.
+    #[inline]
+    pub(crate) fn printed<T>(&mut self, node: &T, start: u32, kind: PrintedKind, span: Span) {
+        if let Some(nodes) = self.printed_nodes.as_mut() {
+            #[expect(clippy::cast_possible_truncation)]
+            let end = self.code.len() as u32;
+            nodes.push(PrintedNode {
+                node: std::ptr::from_ref(node) as usize,
+                start,
+                end,
+                kind,
+                flags: 0,
+                reference: u32::MAX,
+                span,
+            });
+        }
+    }
+
+    /// Records the reference `identifier`, printed since `start`.
+    #[inline]
+    pub(crate) fn printed_reference(&mut self, identifier: &IdentifierReference<'_>, start: u32) {
+        let address = std::ptr::from_ref(identifier) as usize;
+        let flags = if self.printed_flags.0 == address { self.printed_flags.1 } else { 0 };
+        if let Some(nodes) = self.printed_nodes.as_mut() {
+            #[expect(clippy::cast_possible_truncation)]
+            let end = self.code.len() as u32;
+            #[expect(clippy::cast_possible_truncation)]
+            let reference = identifier.reference_id.get().map_or(u32::MAX, |id| id.index() as u32);
+            nodes.push(PrintedNode {
+                node: address,
+                start,
+                end,
+                kind: if identifier.name == "arguments" {
+                    PrintedKind::Arguments
+                } else {
+                    PrintedKind::Reference
+                },
+                flags,
+                reference,
+                span: identifier.span,
+            });
+        }
+    }
+
+    /// Notes that `expression`, if it is an identifier, is about to be printed in the
+    /// position that `flags` names.
+    #[inline]
+    pub(crate) fn printing_reference_as(&mut self, expression: &Expression<'_>, flags: u8) {
+        if self.printed_nodes.is_some()
+            && let Expression::Identifier(identifier) = expression.without_parentheses()
+        {
+            self.printed_flags = (std::ptr::from_ref(&**identifier) as usize, flags);
+        }
+    }
+
+    /// Notes that the binding of a shorthand assignment target is about to be printed.
+    #[inline]
+    pub(crate) fn printing_shorthand_target(&mut self, identifier: &IdentifierReference<'_>) {
+        if self.printed_nodes.is_some() {
+            self.printed_flags = (std::ptr::from_ref(identifier) as usize, PrintedNode::SHORTHAND);
+        }
+    }
+
+    /// Notes that the keyword of the module declaration `node` starts here.
+    #[inline]
+    pub(crate) fn printed_declaration_starts<T>(&mut self, node: &T) {
+        if self.printed_nodes.is_some() {
+            self.printed_declarations
+                .push((std::ptr::from_ref(node) as usize, self.printed_start()));
+        }
+    }
+
+    /// Records the module declaration `node`, which has been printed.
+    #[inline]
+    pub(crate) fn printed_declaration_ends<T: GetSpan>(&mut self, node: &T) {
+        let address = std::ptr::from_ref(node) as usize;
+        // The innermost declaration that started and has not ended is on top; one that
+        // was printed by another path and never ended is dropped with it.
+        if let Some(at) =
+            self.printed_declarations.iter().rposition(|(started, _)| *started == address)
+        {
+            let start = self.printed_declarations[at].1;
+            self.printed_declarations.truncate(at);
+            self.printed(node, start, PrintedKind::Declaration, node.span());
         }
     }
 
@@ -320,6 +513,7 @@ impl<'a> Codegen<'a> {
         #[cfg(feature = "sourcemap")]
         let map = self.sourcemap_builder.map(SourcemapBuilder::into_sourcemap);
         CodegenReturn {
+            printed_nodes: self.printed_nodes.unwrap_or_default(),
             code,
             #[cfg(feature = "sourcemap")]
             map,
@@ -1053,7 +1247,14 @@ impl<'a> Codegen<'a> {
     fn print_jsx_identifier_reference(&mut self, ident: &IdentifierReference<'_>) {
         let name = self.get_identifier_reference_name(ident);
         self.add_source_mapping_for_name(ident.span, name);
-        self.print_str(name);
+        // A component's name is a reference like any other.
+        if self.records_reference(ident) {
+            let start = self.printed_start();
+            self.print_str(name);
+            self.printed_reference(ident, start);
+        } else {
+            self.print_str(name);
+        }
     }
 
     #[inline]
@@ -1243,4 +1444,190 @@ impl<'a> Codegen<'a> {
     #[inline]
     #[expect(clippy::needless_pass_by_ref_mut, clippy::unused_self)]
     fn add_source_mapping_for_private_name(&mut self, _span: Span, _name: &str) {}
+}
+
+/// What [`Codegen::with_printed_nodes`] records.
+#[cfg(test)]
+mod printed_nodes_tests {
+    use oxc_allocator::Allocator;
+    use oxc_parser::Parser;
+    use oxc_semantic::SemanticBuilder;
+    use oxc_span::SourceType;
+
+    use super::{Codegen, CodegenOptions, PrintedKind, PrintedNode};
+
+    /// Prints `source` with every reference asked for, and gives the code with each
+    /// record's kind, flags, text and the source text of its span. `rename` gives the
+    /// root binding of that name another.
+    fn printed(
+        source: &str,
+        source_type: SourceType,
+        minify: bool,
+        rename: Option<(&str, &str)>,
+    ) -> (String, Vec<(PrintedKind, u8, String, String)>) {
+        let allocator = Allocator::default();
+        let parsed = Parser::new(&allocator, source, source_type).parse();
+        assert!(parsed.diagnostics.is_empty(), "{source}: {:?}", parsed.diagnostics);
+        let mut scoping = SemanticBuilder::new().build(&parsed.program).semantic.into_scoping();
+        let references = vec![u64::MAX; scoping.references_len() / 64 + 1];
+        if let Some((from, to)) = rename {
+            let symbol = scoping.get_root_binding(from.into()).expect("the binding to rename");
+            scoping.set_symbol_name(symbol, to.into());
+        }
+        let options = if minify { CodegenOptions::minify() } else { CodegenOptions::default() };
+        let output = Codegen::new()
+            .with_options(options)
+            .with_scoping(Some(scoping))
+            .with_printed_nodes(references)
+            .build(&parsed.program);
+        let records = output
+            .printed_nodes
+            .iter()
+            .map(|node| {
+                (
+                    node.kind,
+                    node.flags,
+                    output.code[node.start as usize..node.end as usize].to_owned(),
+                    source[node.span.start as usize..node.span.end as usize].to_owned(),
+                )
+            })
+            .collect();
+        (output.code, records)
+    }
+
+    fn references(records: &[(PrintedKind, u8, String, String)]) -> Vec<(u8, &str)> {
+        records
+            .iter()
+            .filter(|record| record.0 == PrintedKind::Reference)
+            .map(|record| (record.1, record.2.as_str()))
+            .collect()
+    }
+
+    #[test]
+    fn a_renamed_shorthand_target_is_recorded_after_its_key() {
+        let (code, records) =
+            printed("let x; ({ x } = source);", SourceType::mjs(), false, Some(("x", "y")));
+        assert!(code.contains("x: y"), "{code}");
+        assert_eq!(references(&records), [(0, "y"), (0, "source")]);
+    }
+
+    #[test]
+    fn jsx_names_are_recorded() {
+        let (_, records) = printed(
+            "const Foo = {}; <Foo />; <Foo></Foo>; <Foo.Bar />;",
+            SourceType::jsx(),
+            false,
+            Some(("Foo", "Renamed")),
+        );
+        assert_eq!(references(&records), [(0, "Renamed"); 4]);
+    }
+
+    #[test]
+    fn a_target_whose_key_is_left_out_is_a_shorthand() {
+        let (code, records) = printed(
+            "let x; ({ x: x } = source); ({ x: x = 1 } = source); ({ y: x } = source);",
+            SourceType::mjs(),
+            true,
+            None,
+        );
+        assert_eq!(code, "let x;({x}=source);({x=1}=source);({y:x}=source);", "{code}");
+        assert_eq!(
+            references(&records),
+            [
+                (PrintedNode::SHORTHAND, "x"),
+                (0, "source"),
+                (PrintedNode::SHORTHAND, "x"),
+                (0, "source"),
+                (0, "x"),
+                (0, "source")
+            ]
+        );
+    }
+
+    #[test]
+    fn a_call_starts_after_the_space_that_separates_it() {
+        for (source, minify) in [
+            ("function f() { return require('x'); }", true),
+            ("function f() { throw require('x'); }", true),
+            ("typeof require('x'); void require('x'); delete require('x').y;", true),
+            ("function f() { return require('x'); }", false),
+            ("function f() { return (require)('x'); }", true),
+            ("function f() { throw ((require))('x'); }", true),
+            ("typeof (require)('x'); void (require)('x');", true),
+        ] {
+            let (code, records) = printed(source, SourceType::cjs(), minify, None);
+            let calls: Vec<_> =
+                records.iter().filter(|record| record.0 == PrintedKind::Require).collect();
+            assert!(!calls.is_empty(), "{code}");
+            for call in calls {
+                assert!(call.2.starts_with("require("), "{:?} in {code}", call.2);
+                assert!(call.2.ends_with(')'), "{:?} in {code}", call.2);
+                assert!(call.3.ends_with("('x')"), "{:?}", call.3);
+                // Replacing the record leaves the keyword before it apart from what follows.
+                let at = code.find(call.2.as_str()).expect("the record's text is in the code");
+                let replaced = format!("{}dependency{}", &code[..at], &code[at + call.2.len()..]);
+                assert!(!replaced.contains("returndependency"), "{replaced}");
+                assert!(!replaced.contains("throwdependency"), "{replaced}");
+                assert!(!replaced.contains("typeofdependency"), "{replaced}");
+                assert!(!replaced.contains("voiddependency"), "{replaced}");
+            }
+        }
+    }
+
+    #[test]
+    fn typescript_only_declarations_are_not_recorded() {
+        for source in ["export = value;", "export as namespace N;", "import x = require('x');"] {
+            let (_, records) = printed(source, SourceType::ts(), false, None);
+            assert!(
+                records.iter().all(|record| record.0 != PrintedKind::Declaration),
+                "{source}: {records:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_declaration_inside_another_keeps_both() {
+        let (_, records) = printed(
+            "export namespace N { export namespace M { export const x = 1; } export const y = 2; }",
+            SourceType::ts(),
+            false,
+            None,
+        );
+        let starts: Vec<_> = records
+            .iter()
+            .filter(|record| record.0 == PrintedKind::Declaration)
+            .map(|record| record.2.split('{').next().unwrap_or_default().trim().to_owned())
+            .collect();
+        assert_eq!(
+            starts,
+            [
+                "export const x = 1;",
+                "export namespace M",
+                "export const y = 2;",
+                "export namespace N"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_declaration_has_its_span() {
+        let source = "import a from 'a';\nexport { a };\nexport * from 'b';\nexport default 1;\nexport const z = 1;\nexport { q } from 'c';\n";
+        let (_, records) = printed(source, SourceType::mjs(), false, None);
+        let spans: Vec<_> = records
+            .iter()
+            .filter(|record| record.0 == PrintedKind::Declaration)
+            .map(|record| record.3.as_str())
+            .collect();
+        assert_eq!(
+            spans,
+            [
+                "import a from 'a';",
+                "export { a };",
+                "export * from 'b';",
+                "export default 1;",
+                "export const z = 1;",
+                "export { q } from 'c';"
+            ]
+        );
+    }
 }
