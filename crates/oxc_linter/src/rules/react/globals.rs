@@ -82,6 +82,15 @@ function Component() {
   return <div />;
 }
 ",
+        // A `memo` wrapper bound to a non-component name does not open the
+        // React Compiler gate, matching upstream.
+        "
+let someGlobal = false;
+export const helper = memo(() => {
+  someGlobal = true;
+  return <div />;
+});
+",
     ];
 
     let fail = vec![
@@ -95,6 +104,29 @@ function Component() {
   setGlobal();
   return <div>{String(someGlobal)}</div>;
 }
+",
+        // Unlike upstream's file gate, `memo`/`forwardRef`-wrapped components are
+        // compiled even when they are the only component in the file.
+        "
+let someGlobal = false;
+export const Component = React.memo(function (props) {
+  someGlobal = true;
+  return <div>{props.text}</div>;
+});
+",
+        "
+let someGlobal = false;
+export const Input = memo(forwardRef((props, ref) => {
+  someGlobal = true;
+  return <input ref={ref} />;
+}));
+",
+        "
+let someGlobal = false;
+export default memo(() => {
+  someGlobal = true;
+  return <div />;
+});
 ",
     ];
 

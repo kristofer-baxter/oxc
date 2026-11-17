@@ -450,6 +450,11 @@ fn nullish_lazy_ref_init_ref_id(
     let RefAccessType::RefValue { ref_id: Some(ref_id), .. } = ref_env.get(test.identifier)? else {
         return None;
     };
+    // Only `ref.current` is the lazily initialized slot. A test on another
+    // member (`ref[key] ?? (ref.current = init)`) reads the ref during render.
+    if !loads_ref_current(func, test.identifier) {
+        return None;
+    }
     // The initializer may add control flow (`ref.current ??= a ? b : c`), which
     // moves the store into a later block of the alternate region. Walk that region
     // up to the logical's fallthrough, and accept only a store to `current` on the
@@ -479,6 +484,45 @@ fn nullish_lazy_ref_init_ref_id(
         pending.extend(each_terminal_successor(&block.terminal));
     }
     if stores_same_ref { Some(*ref_id) } else { None }
+}
+
+/// Whether `identifier` holds the value of a `current` property load, following
+/// local copies and type assertions back to the load.
+fn loads_ref_current(func: &HirFunction, identifier: IdentifierId) -> bool {
+    let mut identifier = identifier;
+    let mut visited = FxHashSet::default();
+    while visited.insert(identifier) {
+        let mut sources = func.instructions.iter().filter_map(|instr| match &instr.value {
+            InstructionValue::StoreLocal { lvalue, value, .. }
+                if lvalue.place.identifier == identifier =>
+            {
+                Some(CurrentSource::Copy(value.identifier))
+            }
+            _ if instr.lvalue.identifier != identifier => None,
+            InstructionValue::PropertyLoad { property, .. } => {
+                Some(CurrentSource::Current(property.is_string("current")))
+            }
+            InstructionValue::LoadLocal { place, .. } => {
+                Some(CurrentSource::Copy(place.identifier))
+            }
+            // `as`, `satisfies` and angle-bracket assertions keep the value.
+            InstructionValue::TypeCastExpression { value, .. } => {
+                Some(CurrentSource::Copy(value.identifier))
+            }
+            _ => Some(CurrentSource::Current(false)),
+        });
+        let (Some(source), None) = (sources.next(), sources.next()) else { return false };
+        match source {
+            CurrentSource::Current(current) => return current,
+            CurrentSource::Copy(next) => identifier = next,
+        }
+    }
+    false
+}
+
+enum CurrentSource {
+    Current(bool),
+    Copy(IdentifierId),
 }
 
 #[derive(Debug, PartialEq, Eq, Hash)]

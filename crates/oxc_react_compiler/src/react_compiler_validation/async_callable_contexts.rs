@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::rc::Rc;
 
 use oxc_span::Span;
@@ -6,12 +7,13 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use super::validate_locals_not_reassigned_after_render::no_alias_callback_parameters;
 use crate::react_compiler_hir::environment::Environment;
 use crate::react_compiler_hir::visitors::{
-    each_instruction_value_lvalue, each_instruction_value_operand, each_terminal_operand,
+    each_instruction_lvalue, each_instruction_value_lvalue, each_instruction_value_operand,
+    each_terminal_operand,
 };
 use crate::react_compiler_hir::{
     ArrayElement, ArrayPatternElement, BlockId, HirFunction, IdentifierId, Instruction,
-    InstructionId, InstructionKind, InstructionValue, ObjectPropertyKey, ObjectPropertyOrSpread,
-    ParamPattern, Pattern, PlaceOrSpread, PrimitiveValue, Terminal,
+    InstructionId, InstructionKind, InstructionValue, NonLocalBinding, ObjectPropertyKey,
+    ObjectPropertyOrSpread, ParamPattern, Pattern, PlaceOrSpread, PrimitiveValue, Terminal,
 };
 
 type Captures = FxHashMap<IdentifierId, FxHashSet<IdentifierId>>;
@@ -43,7 +45,7 @@ impl Arguments {
     fn append(&mut self, other: &Self) {
         for (key, values) in &other.elements {
             let key = self.length.and_then(|offset| {
-                key.as_ref()?.parse::<usize>().ok()?.checked_add(offset).map(|i| i.to_string())
+                array_index(key.as_ref()?)?.checked_add(offset).map(|i| i.to_string())
             });
             self.elements.entry(key).or_default().extend(values);
         }
@@ -57,13 +59,33 @@ impl Arguments {
         }
     }
 
+    /// Values that may land at `index` after spreads are expanded.
+    fn at(&self, index: usize) -> Values {
+        let mut values = self.elements.get(&Some(index.to_string())).cloned().unwrap_or_default();
+        if let Some(unknown) = self.elements.get(&None) {
+            values.extend(unknown);
+        }
+        values
+    }
+
+    /// Values that may land at `from` or any later position.
+    fn from(&self, from: usize) -> Values {
+        let mut values = Values::default();
+        for (key, element) in &self.elements {
+            if key.as_ref().is_none_or(|key| array_index(key).is_some_and(|key| key >= from)) {
+                values.extend(element);
+            }
+        }
+        values
+    }
+
     fn skip(mut self, count: usize) -> Self {
         self.elements = self
             .elements
             .into_iter()
             .filter_map(|(key, value)| {
                 let key = match key {
-                    Some(key) => Some(key.parse::<usize>().ok()?.checked_sub(count)?.to_string()),
+                    Some(key) => Some(array_index(&key)?.checked_sub(count)?.to_string()),
                     None => None,
                 };
                 Some((key, value))
@@ -354,7 +376,7 @@ fn infer_capture_members(
                 keys.insert(instruction.lvalue.identifier, value.to_string());
             }
             InstructionValue::PropertyLoad { object, property, .. } => {
-                if !rest_arguments || property.to_string().parse::<usize>().is_ok() {
+                if !rest_arguments || array_index(&property.to_string()).is_some() {
                     receivers.insert(instruction.lvalue.identifier, object.identifier);
                 }
             }
@@ -362,7 +384,7 @@ fn infer_capture_members(
                 if !rest_arguments
                     || keys
                         .get(&property.identifier)
-                        .is_some_and(|key| key.parse::<usize>().is_ok()) =>
+                        .is_some_and(|key| array_index(key).is_some()) =>
             {
                 receivers.insert(instruction.lvalue.identifier, object.identifier);
             }
@@ -466,17 +488,49 @@ fn infer_capture_members(
 
 // Named members include every reaching write to that member. The unknown-key
 // bucket is only the fallback for names that have not been written explicitly.
+/// The array index a property key names: a canonical decimal below
+/// 2^32 - 1. Other numeric-looking keys such as "01" or "4294967295" are
+/// ordinary named properties.
+fn array_index(key: &str) -> Option<usize> {
+    let index: u32 = key.parse().ok()?;
+    (index != u32::MAX && index.to_string() == key).then(|| usize::try_from(index).ok())?
+}
+
 fn merge_properties(into: &mut Properties, other: &Properties) {
-    let fallback = into.get(&None).cloned().unwrap_or_default();
+    merge_properties_in(into, other, None);
+}
+
+/// Joins two views of one object. A key present on one side only takes the
+/// other side's unknown-key writes that could have named it. For an array,
+/// `named` holds each side's generic unknown-key writes (`into`, `other`): a
+/// named key falls back to those, never to the index summary, which index-only
+/// writes such as `push` also feed.
+fn merge_properties_in(
+    into: &mut Properties,
+    other: &Properties,
+    named: Option<(&Values, &Values)>,
+) {
+    let fallback =
+        |properties: &Properties, named: Option<&Values>, key: &Option<String>| match named {
+            Some(named) if key.as_ref().is_some_and(|key| array_index(key).is_none()) => {
+                Some(named.clone())
+            }
+            _ => properties.get(&None).cloned(),
+        };
+    let into_snapshot = into.clone();
     for (key, values) in into.iter_mut() {
-        if let Some(other) = other.get(key).or_else(|| other.get(&None)) {
+        if let Some(other) = other.get(key) {
             values.extend(other);
+        } else if let Some(other) = fallback(other, named.map(|(_, other)| other), key) {
+            values.extend(&other);
         }
     }
     for (key, values) in other {
         if !into.contains_key(key) {
             let mut values = values.clone();
-            values.extend(&fallback);
+            if let Some(own) = fallback(&into_snapshot, named.map(|(into, _)| into), key) {
+                values.extend(&own);
+            }
             into.insert(key.clone(), values);
         }
     }
@@ -546,6 +600,10 @@ impl Values {
         Self { identities: FxHashSet::from_iter([identifier]), ..Self::default() }
     }
 
+    fn is_empty(&self) -> bool {
+        self.identities.is_empty() && self.contexts.is_empty() && self.iterators.is_empty()
+    }
+
     fn extend(&mut self, other: &Self) {
         self.identities.extend(&other.identities);
         for (target, source) in
@@ -612,17 +670,129 @@ impl PendingCapture {
     }
 }
 
+/// `keys` and `values` hold every key and value that may be present. A Map also
+/// splits its values by primitive key so that a definite `set` replaces and a
+/// definite `delete` removes the earlier value; unknown keys stay in `unkeyed`.
 #[derive(Clone, Default, PartialEq, Eq)]
 struct CollectionContents {
     keys: Values,
     values: Values,
+    map: bool,
+    keyed: FxHashMap<PrimitiveKey, Values>,
+    unkeyed: Values,
 }
 
 impl CollectionContents {
     fn extend(&mut self, other: &Self) {
         self.keys.extend(&other.keys);
         self.values.extend(&other.values);
+        self.map |= other.map;
+        for (key, values) in &other.keyed {
+            self.keyed.entry(key.clone()).or_default().extend(values);
+        }
+        self.unkeyed.extend(&other.unkeyed);
     }
+
+    fn rebuild_map_values(&mut self) {
+        let mut values = self.unkeyed.clone();
+        for keyed in self.keyed.values() {
+            values.extend(keyed);
+        }
+        self.values = values;
+    }
+}
+
+/// A primitive's type and its property-key spelling. Property access only
+/// uses `text`, while Map keys also compare `kind`, so `1` and `"1"` differ.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct PrimitiveKey {
+    kind: PrimitiveKind,
+    text: String,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum PrimitiveKind {
+    String,
+    Number,
+    BigInt,
+    Boolean,
+    Null,
+    Undefined,
+}
+
+/// Mints one synthetic pair identity per Map and mutation site, numbered after
+/// the function's real identifiers. Every block state shares the table, so a
+/// site always yields the same pair across fixpoint iterations.
+#[derive(Clone, Default)]
+struct EntryIds(Rc<RefCell<EntryTable>>);
+
+#[derive(Default)]
+struct EntryTable {
+    first: usize,
+    next: usize,
+    ids: FxHashMap<(IdentifierId, IdentifierId), IdentifierId>,
+}
+
+impl EntryIds {
+    fn new(first: usize) -> Self {
+        Self(Rc::new(RefCell::new(EntryTable { first, next: first, ids: FxHashMap::default() })))
+    }
+
+    fn contains(&self, id: IdentifierId) -> bool {
+        let table = self.0.borrow();
+        table.next > table.first && id.index() >= table.first
+    }
+
+    fn get(&self, map: IdentifierId, site: IdentifierId) -> IdentifierId {
+        let mut table = self.0.borrow_mut();
+        if let Some(&id) = table.ids.get(&(map, site)) {
+            return id;
+        }
+        let id = IdentifierId::from_usize(table.next);
+        table.next += 1;
+        table.ids.insert((map, site), id);
+        id
+    }
+}
+
+impl PartialEq for EntryIds {
+    fn eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for EntryIds {}
+
+/// Whether a method call may run a program-stored own property rather than
+/// the built-in method of that name.
+enum MethodOverride {
+    None,
+    Possible,
+    Definite,
+}
+
+/// How a store treats the target's existing value for a named key.
+#[derive(Clone, Copy)]
+enum Write {
+    /// The store certainly happens: on one runtime object it replaces the old
+    /// value and makes the key an own property on every path.
+    Definite,
+    /// The store may not happen (a copy from a source that may be empty or
+    /// null), so it adds a possible value and proves nothing about presence.
+    Possible,
+}
+
+/// How an array mutation moves its index slots.
+#[derive(Clone, Copy)]
+enum Reorder<'a> {
+    Reverse,
+    Shift,
+    Pop,
+    /// Inserted at the front, in order.
+    Unshift(&'a Arguments),
+    /// Moves slots in a way the model does not track, optionally inserting
+    /// values at unknown positions.
+    Scramble(Option<&'a Values>),
 }
 
 #[derive(Clone, Default, PartialEq, Eq)]
@@ -630,11 +800,36 @@ struct CallableState {
     values: FxHashMap<IdentifierId, Values>,
     context_values: Captures,
     properties: FxHashMap<IdentifierId, Properties>,
-    keys: FxHashMap<IdentifierId, String>,
+    keys: FxHashMap<IdentifierId, PrimitiveKey>,
     builtin_function_methods: FxHashMap<IdentifierId, String>,
     array_lengths: FxHashMap<IdentifierId, usize>,
     arrays: FxHashSet<IdentifierId>,
+    // Values written into an array through an unknown key, which may name a
+    // non-index property. Index-only writes such as `push` stay out of it, so
+    // named reads see only writes that could have targeted them.
+    named_unknown: FxHashMap<IdentifierId, Values>,
+    /// Plain objects whose unknown-key bucket holds index-only values copied
+    /// from an array; like arrays, they track generic writes in `named_unknown`.
+    indexed: FxHashSet<IdentifierId>,
+    // Object literals without spread properties, so every key they list is
+    // certainly present.
+    exact_objects: FxHashSet<IdentifierId>,
+    /// Own named properties every path has definitely stored and not deleted.
+    present: FxHashMap<IdentifierId, FxHashSet<String>>,
     collections: FxHashMap<IdentifierId, CollectionContents>,
+    // The synthetic `[key, value]` entry objects that may stand for each Map.
+    // A pair is a snapshot: later Map mutations create a new pair instead of
+    // changing one that may already be stored elsewhere.
+    map_entries: FxHashMap<IdentifierId, FxHashSet<IdentifierId>>,
+    entry_ids: EntryIds,
+    /// Identities allocated by an instruction of this function that runs at
+    /// most once per call. Parameters, captures, callee-returned objects and
+    /// allocations in a loop may each stand for several runtime objects.
+    once: Rc<FxHashSet<IdentifierId>>,
+    // Member names of property loads and names of loaded globals, used to
+    // recognize built-in methods that have no canonical signature name.
+    members: FxHashMap<IdentifierId, String>,
+    globals: FxHashMap<IdentifierId, String>,
     projections: Projections,
     deferred_calls: DeferredCalls,
     pending: FxHashMap<IdentifierId, PendingCapture>,
@@ -721,9 +916,7 @@ impl CallableState {
             };
             if let Some(members) = &members {
                 for member in members {
-                    if let Some(values) =
-                        properties.get(&Some(member.clone())).or_else(|| properties.get(&None))
-                    {
+                    if let Some(values) = self.lookup(id, properties, &Some(member.clone())) {
                         add(values);
                     }
                 }
@@ -768,10 +961,14 @@ impl CallableState {
                             let members = summary.capture_reads.get(&binding);
                             return elements
                                 .iter()
-                                .filter(|(key, _)| {
-                                    key.as_ref().is_none_or(|key| {
+                                .filter(|(key, _)| match key {
+                                    Some(key) => {
                                         members.is_none_or(|members| members.contains(key))
-                                    })
+                                    }
+                                    // Unknown positions answer only index reads.
+                                    None => members.is_none_or(|members| {
+                                        members.iter().any(|member| array_index(member).is_some())
+                                    }),
                                 })
                                 .flat_map(|(_, values)| values.identities.iter().copied())
                                 .collect();
@@ -804,7 +1001,7 @@ impl CallableState {
                 {
                     let identities = members
                         .iter()
-                        .filter(|member| member.parse::<usize>().is_ok())
+                        .filter(|member| array_index(member).is_some())
                         .flat_map(|member| {
                             elements
                                 .get(&Some(member.clone()))
@@ -931,7 +1128,7 @@ impl CallableState {
             arguments
                 .elements
                 .keys()
-                .filter_map(|key| key.as_ref()?.parse::<usize>().ok())
+                .filter_map(|key| array_index(key.as_ref()?))
                 .max()
                 .unwrap_or(0)
                 + 1
@@ -990,7 +1187,7 @@ impl CallableState {
         for (key, values) in
             self.properties(receiver.identifier).into_iter().filter(|_| !collection_callback)
         {
-            if key.as_ref().is_none_or(|key| key.parse::<usize>().is_ok()) {
+            if key.as_ref().is_none_or(|key| array_index(key).is_some()) {
                 items.extend(&values);
             }
         }
@@ -1013,64 +1210,504 @@ impl CallableState {
         let ty = &env.types[env.identifiers[callee].type_];
         let Some(signature) = env.get_function_signature(ty).ok().flatten() else { return };
         let arguments = self.arguments(args);
-        let argument = |index: usize| {
-            let mut values =
-                arguments.elements.get(&Some(index.to_string())).cloned().unwrap_or_default();
-            if let Some(unknown) = arguments.elements.get(&None) {
-                values.extend(unknown);
-            }
-            values
-        };
+        let argument = |index: usize| arguments.at(index);
         match (&instruction.value, signature.canonical_name.as_deref()) {
             (InstructionValue::NewExpression { .. }, Some(name @ ("Set" | "Map"))) => {
-                let mut contents = CollectionContents::default();
+                let map = name == "Map";
+                let mut contents = CollectionContents { map, ..CollectionContents::default() };
+                // Iterating the source yields Set values, Map entry pairs, or
+                // array elements. A Map reads key and value from each pair.
+                let mut items = Values::default();
                 for source in argument(0).identities {
                     if let Some(existing) = self.collections.get(&source) {
-                        contents.extend(existing);
+                        if existing.map == map {
+                            contents.extend(existing);
+                            continue;
+                        }
+                        if existing.map {
+                            for &entry in self.map_entries.get(&source).into_iter().flatten() {
+                                items.extend(&Values::single(entry));
+                            }
+                        } else {
+                            items.extend(&existing.values);
+                        }
                     } else if let Some(properties) = self.properties.get(&source) {
                         for (key, item) in properties {
-                            if key.as_ref().is_some_and(|key| key.parse::<usize>().is_err()) {
-                                continue;
-                            }
-                            if name == "Map" {
-                                contents.keys.extend(&self.project(item, &Some("0".to_string())));
-                                contents.values.extend(&self.project(item, &Some("1".to_string())));
-                            } else {
-                                contents.keys.extend(item);
-                                contents.values.extend(item);
+                            if key.as_ref().is_none_or(|key| array_index(key).is_some()) {
+                                items.extend(item);
                             }
                         }
                     }
                 }
-                self.allocate(instruction.lvalue.identifier);
-                self.collections.insert(instruction.lvalue.identifier, contents);
+                if map {
+                    contents.keys.extend(&self.project(&items, &Some("0".to_string())));
+                    contents.unkeyed.extend(&self.project(&items, &Some("1".to_string())));
+                    contents.rebuild_map_values();
+                } else {
+                    contents.keys.extend(&items);
+                    contents.values.extend(&items);
+                }
+                let id = instruction.lvalue.identifier;
+                self.allocate(id);
+                self.collections.insert(id, contents);
+                if map {
+                    self.sync_map_entries(id, id);
+                }
             }
             (
                 InstructionValue::MethodCall { receiver, .. },
-                Some(name @ ("Set.add" | "Map.set" | "Set.clear" | "Map.clear")),
+                Some(
+                    "Set.add" | "Map.set" | "Set.clear" | "Map.clear" | "Set.delete" | "Map.delete",
+                ),
             ) => {
+                // Contents are updated by `update_collection_method`. Typed
+                // receivers that are not tracked still return themselves.
                 let objects = self.values(receiver.identifier);
-                let key = argument(0);
-                let value = if name == "Map.set" { argument(1) } else { key.clone() };
-                for object in &objects.identities {
-                    if let Some(contents) = self.collections.get_mut(object) {
-                        if name.ends_with(".clear") {
-                            if objects.identities.len() == 1 {
-                                *contents = CollectionContents::default();
-                            }
-                        } else {
-                            contents.keys.extend(&key);
-                            contents.values.extend(&value);
-                        }
-                    }
-                }
                 self.refresh_pending(&objects, Some(&"forEach".to_string()));
-                if matches!(name, "Set.add" | "Map.set") {
+                if matches!(signature.canonical_name.as_deref(), Some("Set.add" | "Map.set")) {
                     self.values.insert(instruction.lvalue.identifier, objects);
                 }
             }
             _ => {}
         }
+    }
+
+    fn update_builtins(&mut self, instruction: &Instruction<'_>, env: &Environment<'_>) {
+        self.update_collection_method(instruction);
+        self.update_collection(instruction, env);
+        self.update_transfer(instruction);
+    }
+
+    /// Whether a method call may run an own property the program stored over
+    /// the built-in method of the same name. Built-in methods load as empty
+    /// values, so a tracked callee means a stored function may run instead.
+    fn method_override(&self, instruction: &Instruction<'_>) -> MethodOverride {
+        let InstructionValue::MethodCall { receiver, property, .. } = &instruction.value else {
+            return MethodOverride::None;
+        };
+        if self.values(property.identifier).is_empty() {
+            return MethodOverride::None;
+        }
+        let Some(name) = self.members.get(&property.identifier) else {
+            return MethodOverride::Possible;
+        };
+        let objects = self.values(receiver.identifier).identities;
+        if !objects.is_empty()
+            && objects
+                .iter()
+                .all(|object| self.present.get(object).is_some_and(|keys| keys.contains(name)))
+        {
+            MethodOverride::Definite
+        } else {
+            MethodOverride::Possible
+        }
+    }
+
+    /// Collection methods are matched by member name because `delete`, `get`
+    /// and friends carry no canonical signature name.
+    fn update_collection_method(&mut self, instruction: &Instruction<'_>) {
+        let InstructionValue::MethodCall { receiver, property, args, .. } = &instruction.value
+        else {
+            return;
+        };
+        let Some(name) = self.members.get(&property.identifier).cloned() else { return };
+        let objects = self.values(receiver.identifier);
+        if !objects.identities.iter().any(|object| self.collections.contains_key(object)) {
+            return;
+        }
+        let arguments = self.arguments(args);
+        let key = arguments.at(0);
+        let value = arguments.at(1);
+        let key_name = self.argument_primitive(args, 0).cloned();
+        let definite = self.singleton(&objects);
+        let mut result = None;
+        for object in &objects.identities {
+            let Some(contents) = self.collections.get_mut(object) else { continue };
+            match (name.as_str(), contents.map) {
+                ("add", false) => {
+                    contents.keys.extend(&key);
+                    contents.values.extend(&key);
+                }
+                ("set", true) => {
+                    contents.keys.extend(&key);
+                    match &key_name {
+                        Some(key_name) if definite => {
+                            contents.keyed.insert(key_name.clone(), value.clone());
+                        }
+                        Some(key_name) => {
+                            contents.keyed.entry(key_name.clone()).or_default().extend(&value);
+                        }
+                        None => contents.unkeyed.extend(&value),
+                    }
+                    contents.rebuild_map_values();
+                }
+                ("clear", map) if definite => {
+                    *contents = CollectionContents { map, ..CollectionContents::default() };
+                }
+                ("delete", true) if definite => {
+                    if let Some(key_name) = &key_name {
+                        contents.keyed.remove(key_name);
+                        contents.rebuild_map_values();
+                    }
+                }
+                // `Set.delete(value)` keeps every member: an allocation
+                // identity stands for every runtime object minted at that
+                // site (a loop, a factory called twice), and a value that may
+                // be null or untracked carries no identity at all, so no
+                // member is ever proven equal to the deleted value.
+                ("get", true) => {
+                    let values = result.get_or_insert_with(Values::default);
+                    match key_name.as_ref().and_then(|key_name| contents.keyed.get(key_name)) {
+                        Some(keyed) => {
+                            values.extend(keyed);
+                            values.extend(&contents.unkeyed);
+                        }
+                        None if key_name.is_some() => values.extend(&contents.unkeyed),
+                        None => values.extend(&contents.values),
+                    }
+                }
+                _ => continue,
+            }
+            if contents.map && name != "get" {
+                self.sync_map_entries(*object, instruction.lvalue.identifier);
+            }
+        }
+        match name.as_str() {
+            "get" => {
+                if let Some(result) = result {
+                    self.values.insert(instruction.lvalue.identifier, result);
+                }
+            }
+            "add" | "set" => {
+                self.values.insert(instruction.lvalue.identifier, objects.clone());
+                self.refresh_pending(&objects, Some(&"forEach".to_string()));
+            }
+            "clear" | "delete" => self.refresh_pending(&objects, Some(&"forEach".to_string())),
+            _ => {}
+        }
+    }
+
+    /// Points `map` at the `[key, value]` pair minted for `site`, holding the
+    /// Map's current contents. Earlier pairs are left as is, because pairs
+    /// already copied into another container or array keep the values they
+    /// had. Only a loop that returns to `site` finds its pair already present;
+    /// it merges, so a pair saved on an earlier iteration keeps its values.
+    fn sync_map_entries(&mut self, map: IdentifierId, site: IdentifierId) {
+        let Some(contents) = self.collections.get(&map) else { return };
+        let entry = self.entry_ids.get(map, site);
+        let properties = FxHashMap::from_iter([
+            (Some("0".to_string()), contents.keys.clone()),
+            (Some("1".to_string()), contents.values.clone()),
+        ]);
+        merge_properties(self.properties.entry(entry).or_default(), &properties);
+        self.arrays.insert(entry);
+        self.array_lengths.insert(entry, 2);
+        self.map_entries.insert(map, FxHashSet::from_iter([entry]));
+    }
+
+    /// The property-key spelling of a known primitive.
+    fn property_key(&self, id: IdentifierId) -> Option<String> {
+        self.keys.get(&id).map(|key| key.text.clone())
+    }
+
+    /// The primitive at `index`, known only when no spread comes first.
+    fn argument_primitive(&self, args: &[PlaceOrSpread], index: usize) -> Option<&PrimitiveKey> {
+        let PlaceOrSpread::Place(place) = args.get(index)? else { return None };
+        if args[..index].iter().any(|arg| matches!(arg, PlaceOrSpread::Spread(_))) {
+            return None;
+        }
+        self.keys.get(&place.identifier)
+    }
+
+    /// The property-key spelling of the primitive at `index`.
+    fn argument_key(&self, args: &[PlaceOrSpread], index: usize) -> Option<String> {
+        self.argument_primitive(args, index).map(|key| key.text.clone())
+    }
+
+    /// Values produced by iterating `identifier`: array elements, Set values,
+    /// or the `[key, value]` entries of a Map.
+    fn elements(&self, identifier: IdentifierId) -> Values {
+        self.elements_of(&self.values(identifier))
+    }
+
+    fn elements_of(&self, values: &Values) -> Values {
+        let mut result = Values::default();
+        for &object in &values.identities {
+            if let Some(contents) = self.collections.get(&object) {
+                if !contents.map {
+                    result.extend(&contents.values);
+                } else {
+                    for &entry in self.map_entries.get(&object).into_iter().flatten() {
+                        result.extend(&Values::single(entry));
+                    }
+                }
+            } else if let Some(properties) = self.properties.get(&object) {
+                for (key, values) in properties {
+                    if key.as_ref().is_none_or(|key| array_index(key).is_some()) {
+                        result.extend(values);
+                    }
+                }
+            }
+        }
+        result
+    }
+
+    fn new_array(&mut self, id: IdentifierId, elements: Values) {
+        self.allocate(id);
+        self.arrays.insert(id);
+        self.array_lengths.remove(&id);
+        self.properties.insert(id, FxHashMap::from_iter([(None, elements)]));
+    }
+
+    /// Array and `Object` built-ins that move values between containers
+    /// without invoking them. Anything else leaves its receiver unchanged.
+    fn update_transfer(&mut self, instruction: &Instruction<'_>) {
+        let InstructionValue::MethodCall { receiver, property, args, .. } = &instruction.value
+        else {
+            return;
+        };
+        let Some(name) = self.members.get(&property.identifier).cloned() else { return };
+        let id = instruction.lvalue.identifier;
+        let arguments = self.arguments(args);
+        if let Some(global) = self.globals.get(&receiver.identifier).cloned() {
+            match (global.as_str(), name.as_str()) {
+                ("Array", "of") => self.new_array(id, arguments.from(0)),
+                // A mapping callback is invoked; leave that call unmodeled.
+                ("Array", "from") if arguments.length.is_none_or(|length| length == 1) => {
+                    let elements = self.elements_of(&arguments.at(0));
+                    self.new_array(id, elements);
+                }
+                ("Object", "assign") => {
+                    // Sources are copied in argument order. A source overwrites
+                    // only when it is certainly the object it names: the
+                    // argument is that object's own allocation. Anything else
+                    // (a conditional, a variable that may hold null, a spread
+                    // source) may write nothing, so it merges weakly.
+                    let target = arguments.at(0);
+                    let mut positions: Vec<usize> = arguments
+                        .elements
+                        .keys()
+                        .filter_map(|key| array_index(key.as_ref()?))
+                        .filter(|&position| position >= 1)
+                        .collect();
+                    positions.sort_unstable();
+                    for position in positions {
+                        let sources = arguments.elements[&Some(position.to_string())].clone();
+                        let write = if self.fresh_object(args, position, &sources) {
+                            Write::Definite
+                        } else {
+                            Write::Possible
+                        };
+                        self.assign(&target, &sources, write);
+                    }
+                    if let Some(sources) = arguments.elements.get(&None) {
+                        self.assign(&target, sources, Write::Possible);
+                    }
+                    self.values.insert(id, target);
+                }
+                _ => {}
+            }
+            return;
+        }
+        let receivers = self.values(receiver.identifier);
+        if !receivers.identities.iter().any(|object| self.arrays.contains(object)) {
+            return;
+        }
+        let elements = self.elements(receiver.identifier);
+        match name.as_str() {
+            "push" => self.store_index(&receivers, &arguments.from(0)),
+            "fill" => {
+                self.store_index(&receivers, &arguments.at(0));
+                self.values.insert(id, receivers);
+            }
+            "unshift" => self.reorder(&receivers, Reorder::Unshift(&arguments)),
+            "shift" => {
+                self.values.insert(id, elements);
+                self.reorder(&receivers, Reorder::Shift);
+            }
+            "pop" => {
+                self.values.insert(id, elements);
+                self.reorder(&receivers, Reorder::Pop);
+            }
+            "reverse" => {
+                self.reorder(&receivers, Reorder::Reverse);
+                self.values.insert(id, receivers);
+            }
+            "sort" | "copyWithin" => {
+                self.reorder(&receivers, Reorder::Scramble(None));
+                self.values.insert(id, receivers);
+            }
+            "splice" => {
+                self.reorder(&receivers, Reorder::Scramble(Some(&arguments.from(2))));
+                self.new_array(id, elements);
+            }
+            "flat" => {
+                let depth = if args.is_empty() {
+                    Some(1)
+                } else {
+                    self.argument_key(args, 0).and_then(|depth| depth.parse().ok())
+                };
+                let flattened = self.flatten(elements, depth);
+                self.new_array(id, flattened);
+            }
+            "concat" | "toSpliced" | "with" => {
+                let mut values = elements;
+                let operands = arguments.from(usize::from(name != "concat"));
+                values.extend(&operands);
+                values.extend(&self.elements_of(&operands));
+                self.new_array(id, values);
+            }
+            "slice" | "toReversed" | "toSorted" => self.new_array(id, elements),
+            "at" => {
+                self.values.insert(id, elements);
+            }
+            _ => {}
+        }
+    }
+
+    /// Whether argument `position` is a plain place that is itself the one
+    /// object allocation in `sources`, so it cannot be null or another value,
+    /// and that allocation is an object literal whose keys are all present.
+    fn fresh_object(&self, args: &[PlaceOrSpread], position: usize, sources: &Values) -> bool {
+        if args[..position.min(args.len())]
+            .iter()
+            .any(|arg| matches!(arg, PlaceOrSpread::Spread(_)))
+        {
+            return false;
+        }
+        let Some(PlaceOrSpread::Place(place)) = args.get(position) else { return false };
+        sources.identities.len() == 1
+            && sources.identities.contains(&place.identifier)
+            && self.exact_objects.contains(&place.identifier)
+    }
+
+    /// Copies the own properties of `sources` onto `target`. A possible copy
+    /// keeps each existing value alongside the copied one and leaves the
+    /// target's presence facts as they were.
+    fn assign(&mut self, target: &Values, sources: &Values, write: Write) {
+        for &source in &sources.identities {
+            let properties = self.properties.get(&source).cloned().unwrap_or_default();
+            let split = self.split_domain(source);
+            if split {
+                for &object in &target.identities {
+                    self.split_unknown(object);
+                }
+            }
+            for (key, values) in properties {
+                if key.is_none() && split {
+                    // Index-only values stay index-only on the target; only
+                    // generic unknown-key writes may land on any named key.
+                    self.store_index(target, &values);
+                    let generic = self.generic_unknown(source);
+                    if !generic.is_empty() {
+                        self.store_into(target, None, generic);
+                    }
+                    continue;
+                }
+                self.write(target, key, values, write);
+            }
+        }
+    }
+
+    /// Moves the index slots of the arrays in `objects`. An exact move needs
+    /// one receiver of known length; otherwise every index slot joins the
+    /// unknown-index bucket, so an indexed read sees any element that may
+    /// have moved there.
+    fn reorder(&mut self, objects: &Values, reorder: Reorder<'_>) {
+        let definite = self.singleton(objects);
+        for &object in &objects.identities {
+            if !self.arrays.contains(&object) {
+                continue;
+            }
+            let length = self.array_lengths.get(&object).copied().filter(|_| definite);
+            let properties = self.properties.entry(object).or_default();
+            let mut indexed = Vec::new();
+            properties.retain(|key, values| match key.as_ref().and_then(|key| array_index(key)) {
+                Some(index) => {
+                    indexed.push((index, std::mem::take(values)));
+                    false
+                }
+                _ => true,
+            });
+            let exact = length.and_then(|length| {
+                let moved = |index: usize| match reorder {
+                    Reorder::Reverse => length.checked_sub(index + 1),
+                    Reorder::Shift => index.checked_sub(1),
+                    Reorder::Pop => (index + 1 < length).then_some(index),
+                    Reorder::Unshift(inserted) => Some(index + inserted.length?),
+                    Reorder::Scramble(_) => None,
+                };
+                let new_length = match reorder {
+                    Reorder::Reverse => length,
+                    Reorder::Shift | Reorder::Pop => length.saturating_sub(1),
+                    Reorder::Unshift(inserted) => {
+                        if inserted.elements.contains_key(&None) {
+                            return None;
+                        }
+                        length + inserted.length?
+                    }
+                    Reorder::Scramble(_) => return None,
+                };
+                let mut slots = Properties::default();
+                for (index, values) in &indexed {
+                    if *index >= length {
+                        return None;
+                    }
+                    let removed = matches!(reorder, Reorder::Shift) && *index == 0
+                        || matches!(reorder, Reorder::Pop) && *index + 1 == length;
+                    if removed {
+                        continue;
+                    }
+                    slots.insert(Some(moved(*index)?.to_string()), values.clone());
+                }
+                if let Reorder::Unshift(inserted) = reorder {
+                    for (key, values) in &inserted.elements {
+                        slots.insert(key.clone(), values.clone());
+                    }
+                }
+                Some((slots, new_length))
+            });
+            if let Some((slots, new_length)) = exact {
+                properties.extend(slots);
+                self.array_lengths.insert(object, new_length);
+            } else {
+                let unknown = properties.entry(None).or_default();
+                for (_, values) in &indexed {
+                    unknown.extend(values);
+                }
+                match reorder {
+                    Reorder::Unshift(inserted) => unknown.extend(&inserted.from(0)),
+                    Reorder::Scramble(Some(inserted)) => unknown.extend(inserted),
+                    _ => {}
+                }
+                self.array_lengths.remove(&object);
+            }
+        }
+        self.refresh_pending(objects, None);
+    }
+
+    /// Elements of `elements` flattened `depth` levels, or every level when
+    /// the depth is unknown. Nested arrays are kept alongside their elements.
+    fn flatten(&self, mut elements: Values, depth: Option<usize>) -> Values {
+        let mut seen = FxHashSet::default();
+        let mut level = 0;
+        while depth.is_none_or(|depth| level < depth) {
+            let nested = Values {
+                identities: elements
+                    .identities
+                    .iter()
+                    .copied()
+                    .filter(|id| self.arrays.contains(id) && seen.insert(*id))
+                    .collect(),
+                ..Values::default()
+            };
+            if nested.identities.is_empty() {
+                break;
+            }
+            elements.extend(&self.elements_of(&nested));
+            level += 1;
+        }
+        elements
     }
 
     fn values(&self, identifier: IdentifierId) -> Values {
@@ -1093,6 +1730,10 @@ impl CallableState {
 
     fn allocate(&mut self, identifier: IdentifierId) {
         self.values.insert(identifier, Values::single(identifier));
+        self.named_unknown.remove(&identifier);
+        self.indexed.remove(&identifier);
+        self.exact_objects.remove(&identifier);
+        self.present.remove(&identifier);
     }
 
     fn update_context(&mut self, binding: IdentifierId) {
@@ -1111,11 +1752,18 @@ impl CallableState {
         for contents in self.collections.values_mut() {
             contents.keys.update_context(binding, &values);
             contents.values.update_context(binding, &values);
+            contents.unkeyed.update_context(binding, &values);
+            for keyed in contents.keyed.values_mut() {
+                keyed.update_context(binding, &values);
+            }
         }
         for properties in self.properties.values_mut() {
             for value in properties.values_mut() {
                 value.update_context(binding, &values);
             }
+        }
+        for value in self.named_unknown.values_mut() {
+            value.update_context(binding, &values);
         }
     }
 
@@ -1133,17 +1781,51 @@ impl CallableState {
         for (&id, values) in &other.values {
             self.values.entry(id).or_default().extend(values);
         }
+        let split: FxHashSet<IdentifierId> = self
+            .arrays
+            .iter()
+            .chain(&self.indexed)
+            .chain(&other.arrays)
+            .chain(&other.indexed)
+            .copied()
+            .collect();
+        let generic: FxHashMap<IdentifierId, (Values, Values)> = split
+            .iter()
+            .map(|&object| (object, (self.generic_unknown(object), other.generic_unknown(object))))
+            .collect();
         for (&object, properties) in &other.properties {
-            merge_properties(self.properties.entry(object).or_default(), properties);
+            merge_properties_in(
+                self.properties.entry(object).or_default(),
+                properties,
+                generic.get(&object).map(|(into, other)| (into, other)),
+            );
         }
+        for (object, (mut into, other)) in generic {
+            into.extend(&other);
+            self.named_unknown.insert(object, into);
+        }
+        self.indexed.extend(&other.indexed);
+        self.present.retain(|object, keys| {
+            let Some(other) = other.present.get(object) else { return false };
+            keys.retain(|key| other.contains(key));
+            !keys.is_empty()
+        });
         self.keys.retain(|id, key| other.keys.get(id) == Some(key));
         self.builtin_function_methods
             .retain(|id, method| other.builtin_function_methods.get(id) == Some(method));
         self.array_lengths.retain(|id, length| other.array_lengths.get(id) == Some(length));
         self.arrays.extend(&other.arrays);
+        self.exact_objects.extend(&other.exact_objects);
         for (&id, contents) in &other.collections {
             self.collections.entry(id).or_default().extend(contents);
         }
+        // Each path keeps its own pair, so a pair saved on one path never
+        // gains the other path's values.
+        for (&map, entries) in &other.map_entries {
+            self.map_entries.entry(map).or_default().extend(entries);
+        }
+        self.members.retain(|id, name| other.members.get(id) == Some(name));
+        self.globals.retain(|id, name| other.globals.get(id) == Some(name));
         for (&id, call) in &other.deferred_calls {
             if let Some(into) = self.deferred_calls.get_mut(&id) {
                 into.merge(call);
@@ -1161,7 +1843,7 @@ impl CallableState {
             ObjectPropertyKey::Identifier { name, .. } | ObjectPropertyKey::String { name, .. } => {
                 Some(name.to_string())
             }
-            ObjectPropertyKey::Computed { name, .. } => self.keys.get(&name.identifier).cloned(),
+            ObjectPropertyKey::Computed { name, .. } => self.property_key(name.identifier),
         }
     }
 
@@ -1174,6 +1856,23 @@ impl CallableState {
             }
         }
         result
+    }
+
+    /// The union of the properties of every object `identifier` may hold,
+    /// joined by the same domain rule as control-flow merges. Also returns
+    /// the union's generic unknown-key writes and whether any object split them.
+    fn split_properties(&self, identifier: IdentifierId) -> (Properties, Values, bool) {
+        let mut result = Properties::default();
+        let mut generic = Values::default();
+        let mut split = false;
+        for object in self.values(identifier).identities {
+            let Some(properties) = self.properties.get(&object) else { continue };
+            let own = self.generic_unknown(object);
+            merge_properties_in(&mut result, properties, Some((&generic, &own)));
+            generic.extend(&own);
+            split |= self.split_domain(object);
+        }
+        (result, generic, split)
     }
 
     fn load(&mut self, object: IdentifierId, key: Option<String>, into: IdentifierId) {
@@ -1189,14 +1888,19 @@ impl CallableState {
         } else {
             self.builtin_function_methods.remove(&into);
         }
-        let mut values = if key.is_some() {
-            properties.get(&key).or_else(|| properties.get(&None)).cloned().unwrap_or_default()
-        } else {
-            properties.into_values().fold(Values::default(), |mut result, values| {
-                result.extend(&values);
-                result
-            })
-        };
+        let mut values = Values::default();
+        for object in self.values(object).identities {
+            let Some(properties) = self.properties.get(&object) else { continue };
+            if key.is_some() {
+                if let Some(found) = self.lookup(object, properties, &key) {
+                    values.extend(found);
+                }
+            } else {
+                for found in properties.values() {
+                    values.extend(found);
+                }
+            }
+        }
         for object in self.values(object).identities {
             if self.projections.contains_key(&object) {
                 self.projections
@@ -1208,6 +1912,61 @@ impl CallableState {
         }
         self.values.insert(into, values);
         self.keys.remove(&into);
+    }
+
+    /// An unknown-key write to an array stands for some index, so it answers
+    /// index reads but not named reads such as `push` or `length`.
+    fn lookup<'p>(
+        &'p self,
+        object: IdentifierId,
+        properties: &'p Properties,
+        key: &Option<String>,
+    ) -> Option<&'p Values> {
+        properties.get(key).or_else(|| self.unknown_fallback(object, properties, key))
+    }
+
+    /// Whether the object's unknown-key bucket may hold index-only values, so
+    /// its generic unknown-key writes are tracked apart in `named_unknown`.
+    fn split_domain(&self, object: IdentifierId) -> bool {
+        self.arrays.contains(&object) || self.indexed.contains(&object)
+    }
+
+    /// Unknown-key writes that may have named any property of `object`.
+    fn generic_unknown(&self, object: IdentifierId) -> Values {
+        if self.split_domain(object) {
+            self.named_unknown.get(&object).cloned().unwrap_or_default()
+        } else {
+            self.properties
+                .get(&object)
+                .and_then(|properties| properties.get(&None))
+                .cloned()
+                .unwrap_or_default()
+        }
+    }
+
+    /// Lets a plain object take index-only values: its unknown-key writes so
+    /// far were generic, so they become its named fallback.
+    fn split_unknown(&mut self, object: IdentifierId) {
+        if !self.split_domain(object) {
+            let generic = self.generic_unknown(object);
+            self.named_unknown.insert(object, generic);
+            self.indexed.insert(object);
+        }
+    }
+
+    /// What an absent `key` may read through earlier unknown-key writes.
+    fn unknown_fallback<'p>(
+        &'p self,
+        object: IdentifierId,
+        properties: &'p Properties,
+        key: &Option<String>,
+    ) -> Option<&'p Values> {
+        let named = key.as_ref().is_some_and(|key| array_index(key).is_none());
+        if named && self.split_domain(object) {
+            self.named_unknown.get(&object)
+        } else {
+            properties.get(&None)
+        }
     }
 
     fn invoked(&self, instruction: &InstructionValue<'_>) -> Values {
@@ -1254,14 +2013,25 @@ impl CallableState {
                     )]),
                     length: Some(1),
                 },
-                PlaceOrSpread::Spread(spread) => Arguments {
-                    elements: self.properties(spread.place.identifier),
-                    length: self.array_length(&self.values(spread.place.identifier)),
-                },
+                PlaceOrSpread::Spread(spread) => self.spread(spread.place.identifier),
             };
             result.append(&next);
         }
         result
+    }
+
+    /// Spreading a Set or Map yields its values or entry pairs at unknown
+    /// positions; spreading an array keeps its indexed elements.
+    fn spread(&self, identifier: IdentifierId) -> Arguments {
+        let mut arguments = Arguments {
+            elements: self.properties(identifier),
+            length: self.array_length(&self.values(identifier)),
+        };
+        if self.values(identifier).identities.iter().any(|id| self.collections.contains_key(id)) {
+            arguments.elements.entry(None).or_default().extend(&self.elements(identifier));
+            arguments.length = None;
+        }
+        arguments
     }
 
     fn project(&self, objects: &Values, key: &Option<String>) -> Values {
@@ -1269,7 +2039,7 @@ impl CallableState {
         for object in &objects.identities {
             let Some(properties) = self.properties.get(object) else { continue };
             if key.is_some() {
-                if let Some(values) = properties.get(key).or_else(|| properties.get(&None)) {
+                if let Some(values) = self.lookup(*object, properties, key) {
                     result.extend(values);
                 }
             } else {
@@ -1344,9 +2114,11 @@ impl CallableState {
         let mut result = Values::default();
         for source in sources {
             if let Some(elements) = rest_arguments.get(&source.object) {
-                if source.key.is_some() {
-                    if let Some(values) = elements.get(&source.key).or_else(|| elements.get(&None))
-                    {
+                if let Some(key) = &source.key {
+                    // A rest parameter holds only positional arguments, so its
+                    // unknown positions answer index reads, never named ones.
+                    let unknown = || elements.get(&None).filter(|_| array_index(key).is_some());
+                    if let Some(values) = elements.get(&source.key).or_else(unknown) {
                         result.extend(values);
                     }
                 } else {
@@ -1408,9 +2180,7 @@ impl CallableState {
                     .iter()
                     .filter_map(|(key, value)| {
                         let key = match key {
-                            Some(key) => {
-                                Some(key.parse::<usize>().ok()?.checked_sub(index)?.to_string())
-                            }
+                            Some(key) => Some(array_index(key)?.checked_sub(index)?.to_string()),
                             None => None,
                         };
                         Some((key, value.clone()))
@@ -1595,7 +2365,7 @@ impl CallableState {
                             {
                                 return members
                                     .iter()
-                                    .filter(|member| member.parse::<usize>().is_ok())
+                                    .filter(|member| array_index(member).is_some())
                                     .flat_map(|member| {
                                         elements
                                             .get(&Some(member.clone()))
@@ -1625,25 +2395,86 @@ impl CallableState {
         values
     }
 
-    fn store(&mut self, object: IdentifierId, key: Option<String>, values: Values) {
-        let objects = self.values(object);
-        let definite = objects.identities.len() == 1 && key.is_some();
+    /// A write to some unknown index of an array, as `push`, `unshift`, `fill`
+    /// and `splice` do. Named properties such as own methods keep their values.
+    fn store_index(&mut self, objects: &Values, values: &Values) {
         for &object in &objects.identities {
             self.array_lengths.remove(&object);
             let properties = self.properties.entry(object).or_default();
+            for (key, property) in properties.iter_mut() {
+                if key.as_ref().is_none_or(|key| array_index(key).is_some()) {
+                    property.extend(values);
+                }
+            }
+            properties.entry(None).or_default().extend(values);
+        }
+        self.refresh_pending(objects, None);
+    }
+
+    /// A delete leaves the key without values and, unlike a store of an
+    /// untracked value, makes the own property absent, so a built-in method of
+    /// the same name runs again.
+    fn delete(&mut self, object: IdentifierId, key: Option<String>) {
+        self.store(object, key.clone(), Values::default());
+        for object in self.values(object).identities {
+            if let Some(keys) = self.present.get_mut(&object) {
+                match &key {
+                    Some(key) => {
+                        keys.remove(key);
+                    }
+                    None => keys.clear(),
+                }
+            }
+        }
+    }
+
+    /// Whether `objects` names one runtime object, so a write may replace its
+    /// old contents. A Map entry pair summarizes every pair materialized from
+    /// that Map at that site, so writes through it are always weak.
+    fn singleton(&self, objects: &Values) -> bool {
+        objects.identities.len() == 1
+            && objects
+                .identities
+                .iter()
+                .all(|&id| !self.entry_ids.contains(id) && self.once.contains(&id))
+    }
+
+    fn store(&mut self, object: IdentifierId, key: Option<String>, values: Values) {
+        let objects = self.values(object);
+        self.store_into(&objects, key, values);
+    }
+
+    fn store_into(&mut self, objects: &Values, key: Option<String>, values: Values) {
+        self.write(objects, key, values, Write::Definite);
+    }
+
+    fn write(&mut self, objects: &Values, key: Option<String>, values: Values, write: Write) {
+        let definite = matches!(write, Write::Definite) && self.singleton(objects) && key.is_some();
+        for &object in &objects.identities {
+            self.array_lengths.remove(&object);
             if key.is_none() {
+                let properties = self.properties.entry(object).or_default();
                 for property in properties.values_mut() {
                     property.extend(&values);
                 }
                 properties.entry(None).or_default().extend(&values);
-            } else if definite {
-                properties.insert(key.clone(), values.clone());
+                if self.split_domain(object) {
+                    self.named_unknown.entry(object).or_default().extend(&values);
+                }
+            } else if let (true, Some(name)) = (definite, &key) {
+                self.properties.entry(object).or_default().insert(key.clone(), values.clone());
+                self.present.entry(object).or_default().insert(name.clone());
             } else {
-                let fallback = properties.get(&None).cloned().unwrap_or_default();
+                let properties = self.properties.get(&object);
+                let fallback = properties
+                    .and_then(|properties| self.unknown_fallback(object, properties, &key))
+                    .cloned()
+                    .unwrap_or_default();
+                let properties = self.properties.entry(object).or_default();
                 properties.entry(key.clone()).or_insert(fallback).extend(&values);
             }
         }
-        self.refresh_pending(&objects, key.as_ref());
+        self.refresh_pending(objects, key.as_ref());
     }
 
     fn refresh_pending(&mut self, objects: &Values, key: Option<&String>) {
@@ -1687,12 +2518,17 @@ impl CallableState {
                             self.load(source, key, property.place.identifier);
                         }
                         ObjectPropertyOrSpread::Spread(spread) => {
-                            let mut properties = self.properties(source);
+                            let (mut properties, generic, split) = self.split_properties(source);
                             properties.retain(|key, _| {
                                 key.as_ref().is_none_or(|key| !excluded.contains(key))
                             });
-                            self.allocate(spread.place.identifier);
-                            self.properties.insert(spread.place.identifier, properties);
+                            let rest = spread.place.identifier;
+                            self.allocate(rest);
+                            self.properties.insert(rest, properties);
+                            if split {
+                                self.indexed.insert(rest);
+                                self.named_unknown.insert(rest, generic);
+                            }
                         }
                     }
                 }
@@ -1709,18 +2545,18 @@ impl CallableState {
                                 .into_iter()
                                 .filter_map(|(key, values)| {
                                     let key = match key {
-                                        Some(key) => Some(
-                                            key.parse::<usize>()
-                                                .ok()?
-                                                .checked_sub(index)?
-                                                .to_string(),
-                                        ),
+                                        Some(key) => {
+                                            Some(array_index(&key)?.checked_sub(index)?.to_string())
+                                        }
                                         None => None,
                                     };
                                     Some((key, values))
                                 })
                                 .collect();
+                            // An array rest copies positions only, so no
+                            // generic unknown-key write reaches its named keys.
                             self.allocate(spread.place.identifier);
+                            self.arrays.insert(spread.place.identifier);
                             self.properties.insert(spread.place.identifier, properties);
                         }
                         ArrayPatternElement::Hole => {}
@@ -1782,13 +2618,24 @@ impl CallableState {
             }
             InstructionValue::Primitive { value, .. } => {
                 let key = match value {
-                    PrimitiveValue::String(value) => value.as_str().map(str::to_string),
-                    PrimitiveValue::Number(value) => Some(value.to_string()),
-                    PrimitiveValue::BigInt { value, .. } => Some(value.as_str().to_string()),
-                    PrimitiveValue::Boolean(value) => Some(value.to_string()),
-                    PrimitiveValue::Null => Some("null".to_string()),
-                    PrimitiveValue::Undefined => Some("undefined".to_string()),
-                };
+                    PrimitiveValue::String(value) => {
+                        value.as_str().map(|text| (PrimitiveKind::String, text.to_string()))
+                    }
+                    PrimitiveValue::Number(value) => {
+                        Some((PrimitiveKind::Number, value.to_string()))
+                    }
+                    PrimitiveValue::BigInt { value, .. } => {
+                        Some((PrimitiveKind::BigInt, value.as_str().to_string()))
+                    }
+                    PrimitiveValue::Boolean(value) => {
+                        Some((PrimitiveKind::Boolean, value.to_string()))
+                    }
+                    PrimitiveValue::Null => Some((PrimitiveKind::Null, "null".to_string())),
+                    PrimitiveValue::Undefined => {
+                        Some((PrimitiveKind::Undefined, "undefined".to_string()))
+                    }
+                }
+                .map(|(kind, text)| PrimitiveKey { kind, text });
                 if let Some(key) = key {
                     self.keys.insert(id, key);
                 } else {
@@ -1872,15 +2719,21 @@ impl CallableState {
                             );
                         }
                         ObjectPropertyOrSpread::Spread(spread) => {
-                            let mut properties = self.properties(spread.place.identifier);
-                            if let Some(values) = properties.remove(&None) {
-                                self.store(id, None, values);
-                            }
-                            for (key, values) in properties {
-                                self.store(id, key, values);
-                            }
+                            let source = spread.place.identifier;
+                            let sources = self.values(source);
+                            let exact = sources.identities.len() == 1
+                                && sources.identities.contains(&source)
+                                && self.exact_objects.contains(&source);
+                            let write = if exact { Write::Definite } else { Write::Possible };
+                            self.assign(&Values::single(id), &sources, write);
                         }
                     }
+                }
+                if properties
+                    .iter()
+                    .all(|property| matches!(property, ObjectPropertyOrSpread::Property(_)))
+                {
+                    self.exact_objects.insert(id);
                 }
             }
             InstructionValue::ArrayExpression { elements, .. } => {
@@ -1896,10 +2749,7 @@ impl CallableState {
                             )]),
                             length: Some(1),
                         },
-                        ArrayElement::Spread(spread) => Arguments {
-                            elements: self.properties(spread.place.identifier),
-                            length: self.array_length(&self.values(spread.place.identifier)),
-                        },
+                        ArrayElement::Spread(spread) => self.spread(spread.place.identifier),
                         ArrayElement::Hole => {
                             Arguments { elements: Properties::default(), length: Some(1) }
                         }
@@ -1914,10 +2764,14 @@ impl CallableState {
                 }
             }
             InstructionValue::PropertyLoad { object, property, .. } => {
-                self.load(object.identifier, Some(property.to_string()), id)
+                self.load(object.identifier, Some(property.to_string()), id);
+                self.members.insert(id, property.to_string());
+            }
+            InstructionValue::LoadGlobal { binding: NonLocalBinding::Global { name }, .. } => {
+                self.globals.insert(id, name.to_string());
             }
             InstructionValue::ComputedLoad { object, property, .. } => {
-                self.load(object.identifier, self.keys.get(&property.identifier).cloned(), id)
+                self.load(object.identifier, self.property_key(property.identifier), id)
             }
             InstructionValue::PropertyStore { object, property, value, .. } => self.store(
                 object.identifier,
@@ -1926,17 +2780,15 @@ impl CallableState {
             ),
             InstructionValue::ComputedStore { object, property, value, .. } => self.store(
                 object.identifier,
-                self.keys.get(&property.identifier).cloned(),
+                self.property_key(property.identifier),
                 self.values(value.identifier),
             ),
             InstructionValue::PropertyDelete { object, property, .. } => {
-                self.store(object.identifier, Some(property.to_string()), Values::default())
+                self.delete(object.identifier, Some(property.to_string()));
             }
-            InstructionValue::ComputedDelete { object, property, .. } => self.store(
-                object.identifier,
-                self.keys.get(&property.identifier).cloned(),
-                Values::default(),
-            ),
+            InstructionValue::ComputedDelete { object, property, .. } => {
+                self.delete(object.identifier, self.property_key(property.identifier));
+            }
             InstructionValue::Destructure { lvalue, value, .. } => {
                 self.destructure(&lvalue.pattern, value.identifier);
                 self.copy(value.identifier, id);
@@ -1954,6 +2806,36 @@ impl CallableState {
             _ => {}
         }
     }
+}
+
+/// Identities assigned by instructions in blocks outside every CFG cycle, so
+/// each names at most one runtime object per call of `func`.
+fn single_allocations(func: &HirFunction) -> FxHashSet<IdentifierId> {
+    let mut once = FxHashSet::default();
+    for (&block_id, block) in &func.body.blocks {
+        let mut seen = FxHashSet::default();
+        let mut stack: Vec<BlockId> = block.preds.iter().copied().collect();
+        let mut cyclic = false;
+        while let Some(current) = stack.pop() {
+            if current == block_id {
+                cyclic = true;
+                break;
+            }
+            if seen.insert(current)
+                && let Some(predecessor) = func.body.blocks.get(&current)
+            {
+                stack.extend(predecessor.preds.iter().copied());
+            }
+        }
+        if cyclic {
+            continue;
+        }
+        for &instruction_id in &block.instructions {
+            let instruction = &func.instructions[instruction_id.index()];
+            once.extend(each_instruction_lvalue(instruction).iter().map(|place| place.identifier));
+        }
+    }
+    once
 }
 
 /// Resolve async identity at each value-producing instruction. Heap properties
@@ -1979,13 +2861,19 @@ pub(super) fn infer_async_callable_contexts(
     let parameters = parameter_bindings(func, env);
     let captured_bindings = captured_contexts.values().flatten().copied().collect();
     let mut states: FxHashMap<BlockId, CallableState> = FxHashMap::default();
+    let entry_ids = EntryIds::new(env.identifiers.len());
+    let once = Rc::new(single_allocations(func));
     loop {
         let mut changed = false;
         for (&block_id, block) in &func.body.blocks {
             let mut predecessors =
                 block.preds.iter().filter_map(|predecessor| states.get(predecessor));
             let mut state = predecessors.next().cloned().unwrap_or_else(|| {
-                let mut state = CallableState::default();
+                let mut state = CallableState {
+                    entry_ids: entry_ids.clone(),
+                    once: Rc::clone(&once),
+                    ..CallableState::default()
+                };
                 for place in
                     func.context.iter().chain(func.params.iter().map(|param| match param {
                         ParamPattern::Place(place) => place,
@@ -2084,7 +2972,17 @@ pub(super) fn infer_async_callable_contexts(
                     function_returns,
                     &captured_bindings,
                 );
-                state.update_collection(instruction, env);
+                match state.method_override(instruction) {
+                    MethodOverride::Definite => {}
+                    MethodOverride::Possible => {
+                        // Either method may run: join the whole heap after the
+                        // stored method with the heap after the built-in.
+                        let custom = state.clone();
+                        state.update_builtins(instruction, env);
+                        state.merge(&custom);
+                    }
+                    MethodOverride::None => state.update_builtins(instruction, env),
+                }
             }
             if matches!(block.terminal, Terminal::Return { .. } | Terminal::Throw { .. }) {
                 result.pending_at_exit.insert(block_id, state.pending_observation());
