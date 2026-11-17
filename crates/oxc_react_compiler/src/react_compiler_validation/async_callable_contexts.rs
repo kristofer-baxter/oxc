@@ -1334,15 +1334,15 @@ impl CallableState {
         match name.as_str() {
             "push" | "unshift" => {
                 let values = argument_values(self, 0);
-                self.store(receiver.identifier, None, values);
+                self.store_index(receiver.identifier, &values);
             }
             "fill" => {
                 let values = argument_place(0).map(|place| self.values(place)).unwrap_or_default();
-                self.store(receiver.identifier, None, values);
+                self.store_index(receiver.identifier, &values);
             }
             "splice" => {
                 let values = argument_values(self, 2);
-                self.store(receiver.identifier, None, values);
+                self.store_index(receiver.identifier, &values);
                 self.new_array(id, elements);
             }
             "concat" | "toSpliced" | "with" => {
@@ -1406,6 +1406,10 @@ impl CallableState {
         for contents in self.collections.values_mut() {
             contents.keys.update_context(binding, &values);
             contents.values.update_context(binding, &values);
+            contents.unkeyed.update_context(binding, &values);
+            for keyed in contents.keyed.values_mut() {
+                keyed.update_context(binding, &values);
+            }
         }
         for properties in self.properties.values_mut() {
             for value in properties.values_mut() {
@@ -1953,6 +1957,23 @@ impl CallableState {
             }
         }
         values
+    }
+
+    /// A write to some unknown index of an array, as `push`, `unshift`, `fill`
+    /// and `splice` do. Named properties such as own methods keep their values.
+    fn store_index(&mut self, object: IdentifierId, values: &Values) {
+        let objects = self.values(object);
+        for &object in &objects.identities {
+            self.array_lengths.remove(&object);
+            let properties = self.properties.entry(object).or_default();
+            for (key, property) in properties.iter_mut() {
+                if key.as_ref().is_none_or(|key| key.parse::<usize>().is_ok()) {
+                    property.extend(values);
+                }
+            }
+            properties.entry(None).or_default().extend(values);
+        }
+        self.refresh_pending(&objects, None);
     }
 
     fn store(&mut self, object: IdentifierId, key: Option<String>, values: Values) {

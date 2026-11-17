@@ -1,0 +1,24 @@
+---
+source: crates/oxc_react_compiler/tests/snapshot.rs
+input_file: crates/oxc_react_compiler/fixtures/async-map-rebound-capture-foreach.js
+---
+function Component() {
+	let count = 0;
+	const bad = () => count++;
+	let f = bad;
+	const run = async () => {
+		await 0;
+		f();
+	};
+	const m = new Map();
+	m.set("x", run);
+	f = _temp;
+	m.set("y", _temp2);
+	m.forEach(_temp3);
+	return null;
+}
+function _temp3(g) {
+	return g();
+}
+function _temp2() {}
+function _temp() {}
