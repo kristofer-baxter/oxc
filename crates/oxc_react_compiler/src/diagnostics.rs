@@ -1549,6 +1549,18 @@ pub fn todo_logical_assignment_to_const(name: &str, span: Span) -> OxcDiagnostic
 }
 
 #[cold]
+pub fn todo_logical_assignment_object_key(span: Span) -> OxcDiagnostic {
+    diagnostic(
+        ErrorCategory::Todo,
+        "Logical assignment to a computed property with a non-primitive key is not supported",
+    )
+    .with_help(
+        "Convert the key to a string first (for example with a template literal), or write the read and the conditional store separately",
+    )
+    .with_label(span.primary_label("This key may be an object, and would be converted to a property key twice"))
+}
+
+#[cold]
 pub fn const_reassignment(
     name: &str,
     reassignment_span: Span,

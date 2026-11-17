@@ -11,7 +11,7 @@ use crate::react_compiler_hir::environment::Environment;
 use crate::react_compiler_hir::object_shape::HookKind;
 use crate::react_compiler_hir::visitors::{
     each_instruction_value_operand as canonical_each_instruction_value_operand,
-    each_pattern_operand, each_terminal_operand,
+    each_pattern_operand, each_terminal_operand, each_terminal_successor,
 };
 use crate::react_compiler_hir::{
     AliasingEffect, BlockId, FunctionId, HirFunction, Identifier, IdentifierId, InstructionValue,
@@ -444,23 +444,40 @@ fn nullish_lazy_ref_init_ref_id(
     if !coalesce_test_blocks.contains(&block_id) {
         return None;
     }
-    let Terminal::Branch { test, alternate, .. } = terminal else {
+    let Terminal::Branch { test, alternate, fallthrough, .. } = terminal else {
         return None;
     };
     let RefAccessType::RefValue { ref_id: Some(ref_id), .. } = ref_env.get(test.identifier)? else {
         return None;
     };
-    let alternate_block = func.body.blocks.get(alternate)?;
-    let stores_same_ref = alternate_block.instructions.iter().any(|&instr_id| {
-        let instr = &func.instructions[instr_id.index()];
-        let InstructionValue::PropertyStore { object, .. } = &instr.value else {
-            return false;
-        };
-        matches!(
-            ref_env.get(object.identifier),
-            Some(RefAccessType::Ref { ref_id: store_ref }) if store_ref == ref_id
-        )
-    });
+    // The initializer may add control flow (`ref.current ??= a ? b : c`), which
+    // moves the store into a later block of the alternate region. Walk that region
+    // up to the logical's fallthrough, and accept only a store to `current` on the
+    // tested ref: a write to another property does not initialize the ref.
+    let mut stores_same_ref = false;
+    let mut visited = FxHashSet::default();
+    let mut pending = vec![*alternate];
+    while let Some(block_id) = pending.pop() {
+        if block_id == *fallthrough || !visited.insert(block_id) {
+            continue;
+        }
+        let Some(block) = func.body.blocks.get(&block_id) else { continue };
+        stores_same_ref = block.instructions.iter().any(|&instr_id| {
+            let instr = &func.instructions[instr_id.index()];
+            let InstructionValue::PropertyStore { object, property, .. } = &instr.value else {
+                return false;
+            };
+            property.is_string("current")
+                && matches!(
+                    ref_env.get(object.identifier),
+                    Some(RefAccessType::Ref { ref_id: store_ref }) if store_ref == ref_id
+                )
+        });
+        if stores_same_ref {
+            break;
+        }
+        pending.extend(each_terminal_successor(&block.terminal));
+    }
     if stores_same_ref { Some(*ref_id) } else { None }
 }
 

@@ -41,7 +41,7 @@ function Component({value}) {
     },
     configurable: true,
   });
-  const fromKey = keyed[key] ??= value;
+  const fromKey = keyed[`${key}`] ??= value;
 
   return (
     <Stringify

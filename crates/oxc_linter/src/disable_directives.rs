@@ -223,11 +223,10 @@ impl RuleCommentRule {
             &source_text[comment_span.start as usize..self.name_span.start as usize];
         let before_trimmed = before_source.trim_end();
         if before_trimmed.ends_with(',') {
-            return Fix::delete(Span::new(
-                comment_span.start + before_trimmed.len() as u32 - 1,
-                self.name_span.end,
-            ))
-            .with_kind(self.directive_prefix.unused_directive_fix_kind());
+            return self.remove(
+                source_text,
+                Span::new(comment_span.start + before_trimmed.len() as u32 - 1, self.name_span.end),
+            );
         }
 
         let after_source = &source_text[self.name_span.end as usize..comment_span.end as usize];
@@ -235,11 +234,16 @@ impl RuleCommentRule {
         let whitespace_after = after_source.len() - after_trimmed.len();
         if let Some(after_comma) = after_trimmed.strip_prefix(',') {
             let whitespace_after_comma = after_comma.len() - after_comma.trim_start().len();
-            return Fix::delete(Span::new(
-                self.name_span.start,
-                self.name_span.end + whitespace_after as u32 + 1 + whitespace_after_comma as u32,
-            ))
-            .with_kind(self.directive_prefix.unused_directive_fix_kind());
+            return self.remove(
+                source_text,
+                Span::new(
+                    self.name_span.start,
+                    self.name_span.end
+                        + whitespace_after as u32
+                        + 1
+                        + whitespace_after_comma as u32,
+                ),
+            );
         }
 
         if whitespace_after > 0
@@ -247,25 +251,38 @@ impl RuleCommentRule {
             && !after_trimmed.starts_with('-')
             && !after_trimmed.starts_with("*/")
         {
-            return Fix::delete(Span::new(
-                self.name_span.start,
-                self.name_span.end + whitespace_after as u32,
-            ))
-            .with_kind(self.directive_prefix.unused_directive_fix_kind());
+            return self.remove(
+                source_text,
+                Span::new(self.name_span.start, self.name_span.end + whitespace_after as u32),
+            );
         }
 
         let whitespace_before = before_source.len() - before_trimmed.len();
         if whitespace_before > 0 && self.previous_token_is_rule(before_trimmed) {
-            return Fix::delete(Span::new(
-                self.name_span.start - whitespace_before as u32,
-                self.name_span.end,
-            ))
-            .with_kind(self.directive_prefix.unused_directive_fix_kind());
+            return self.remove(
+                source_text,
+                Span::new(self.name_span.start - whitespace_before as u32, self.name_span.end),
+            );
         }
 
         unreachable!(
             "A `RuleCommentRule` should have another rule in the same directive, because only one rule should be RuleCommentType::All"
         );
+    }
+
+    /// Delete `span`, keeping any line terminators it contains. A block comment
+    /// that spans lines acts as a line terminator for automatic semicolon
+    /// insertion (`return /* a,\n b */ x`), so removing the newline along with a
+    /// rule name could change what the code does.
+    fn remove(&self, source_text: &str, span: Span) -> Fix {
+        let line_terminators: String =
+            span.source_text(source_text).chars().filter(|&ch| is_line_terminator(ch)).collect();
+        let fix = if line_terminators.is_empty() {
+            Fix::delete(span)
+        } else {
+            Fix::new(line_terminators, span)
+        };
+        fix.with_kind(self.directive_prefix.unused_directive_fix_kind())
     }
 
     fn previous_token_is_rule(&self, text: &str) -> bool {
@@ -1970,6 +1987,51 @@ mod tests {
             apply_delete(source_text, fix.span),
             concat!("// eslint-disable-next-line no-bitwise - intentional\n", "const x = 1;\n",)
         );
+    }
+
+    #[test]
+    fn unused_disable_fix_keeps_line_terminators_in_block_comment() {
+        // The newline inside the comment ends the `return` statement (ASI), so the
+        // function returns `undefined`. The fix must not join `return` to `x`.
+        let cases = [
+            (
+                "function f() { return /* oxlint-disable no-debugger,\n no-compare-neg-zero */ x; }\nif (x === -0) {}\n",
+                "function f() { return /* oxlint-disable \nno-compare-neg-zero */ x; }\nif (x === -0) {}\n",
+            ),
+            (
+                "function f() { return /* oxlint-disable no-compare-neg-zero,\n no-debugger */ x; }\nif (x === -0) {}\n",
+                "function f() { return /* oxlint-disable no-compare-neg-zero\n */ x; }\nif (x === -0) {}\n",
+            ),
+            (
+                "function f() { return /* oxlint-disable no-debugger\n no-compare-neg-zero */ x; }\nif (x === -0) {}\n",
+                "function f() { return /* oxlint-disable \nno-compare-neg-zero */ x; }\nif (x === -0) {}\n",
+            ),
+        ];
+        for (source_text, expected) in cases {
+            let allocator = Allocator::default();
+            let semantic = process_source(&allocator, source_text);
+            let directives =
+                DisableDirectivesBuilder::new().build(semantic.source_text(), semantic.comments());
+            #[expect(clippy::cast_possible_truncation)] // for `as u32`
+            let comparison = Span::sized(source_text.find("x === -0").unwrap() as u32, 8);
+            assert!(directives.contains("no-compare-neg-zero", comparison), "{source_text}");
+            let unused = directives.collect_unused_disable_comments();
+            assert_eq!(unused.len(), 1, "{source_text}");
+            let RuleCommentType::Single(rules) = &unused[0].r#type else {
+                panic!("expected only the unused rule to be reported: {source_text}");
+            };
+            let unused_rules: Vec<_> =
+                rules.iter().filter(|rule| rule.rule_name == "no-debugger").collect();
+            assert_eq!(unused_rules.len(), 1, "{source_text}");
+            let fix = unused_rules[0].create_fix(source_text, unused[0].span);
+            let fixed = format!(
+                "{}{}{}",
+                &source_text[..fix.span.start as usize],
+                fix.content,
+                &source_text[fix.span.end as usize..]
+            );
+            assert_eq!(fixed, expected, "{source_text}");
+        }
     }
 
     #[test]

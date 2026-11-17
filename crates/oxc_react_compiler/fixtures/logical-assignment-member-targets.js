@@ -14,7 +14,7 @@ function Component({value}) {
   // Nullish target: assigns, evaluating the right side once
   obj.x ??= rhs('fallback');
   // Computed target: key() must evaluate exactly once
-  obj[key()] ||= rhs('updated');
+  obj[`${key()}`] ||= rhs('updated');
   // Non-nullish target: skips the assignment without evaluating the right side
   const skipped = (obj.full ??= rhs('skipped'));
   return <Stringify obj={obj} calls={calls} skipped={skipped} />;

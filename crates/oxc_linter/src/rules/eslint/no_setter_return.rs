@@ -1,6 +1,6 @@
 use oxc_ast::{
     AstKind,
-    ast::{Expression, MemberExpression, PropertyKey},
+    ast::{Expression, MemberExpression, PropertyKey, PropertyKind},
 };
 use oxc_diagnostics::OxcDiagnostic;
 use oxc_macros::declare_oxc_lint;
@@ -86,6 +86,10 @@ fn is_descriptor_setter<'a>(node: &AstNode<'a>, ctx: &LintContext<'a>) -> bool {
     let function = outermost_paren(node, ctx.semantic());
     let property = ctx.nodes().parent_node(function.id());
     let AstKind::ObjectProperty(prop) = property.kind() else { return false };
+    // `get set() {}` and `set set(v) {}` are accessors named `set`, not descriptor setters.
+    if prop.kind != PropertyKind::Init {
+        return false;
+    }
     let is_set = match &prop.key {
         PropertyKey::StaticIdentifier(ident) => ident.name == "set",
         key => key.as_expression().is_some_and(|expr| is_static_string(expr, "set")),
@@ -221,6 +225,13 @@ fn test() {
         "x = { foo: { set(val) { return 1; } } }",
         "Object.defineProperty(foo, 'bar', { value(val) { return 1; } })",
         "Reflect.defineProperty(foo, 'bar', { value: function set(val) { return 1; } })",
+        "Object.defineProperty({}, 'x', { get set() { return function(value) {}; } })",
+        "Reflect.defineProperty({}, 'x', { get set() { return (value) => {}; } })",
+        "Object.defineProperties({}, { x: { get set() { return function(value) {}; } } })",
+        "Object.create(null, { x: { get set() { return function(value) {}; } } })",
+        // ESLint reports this, but the getter is not the setter: the descriptor reads
+        // `set` through it, and the function it returns becomes the setter.
+        "Object.defineProperty(foo, 'bar', { get set() { return () => 1; } })",
         "Object.defineProperties(foo, { bar: { [set](val) { return 1; } } })",
         "Object.create(foo, { bar: { 'set ': function(val) { return 1; } } })",
         "Object.defineProperty(foo, 'bar', { [`set `]: (val) => { return 1; } })",
@@ -321,7 +332,6 @@ fn test() {
         "Object.defineProperty(foo, 'bar', { set: function(Object) { return 1; } })",
         "Object?.defineProperty(foo, 'bar', { set(val) { return 1; } })",
         "(Object?.defineProperty)(foo, 'bar', { set(val) { return 1; } })",
-        "Object.defineProperty(foo, 'bar', { get set() { return () => 1; } })",
         "Object.defineProperty(foo, 'bar', ({ set: ((val) => val) }))",
         "Object.create(foo, ({ bar: ({ set: (function(val) { if (val) { return val; } }) }) }))",
         "Object.defineProperty?.(foo, 'bar', { set: val => undefined })",
