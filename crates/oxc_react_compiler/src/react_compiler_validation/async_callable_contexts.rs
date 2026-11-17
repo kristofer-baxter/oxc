@@ -802,6 +802,9 @@ struct CallableState {
     // non-index property. Index-only writes such as `push` stay out of it, so
     // named reads see only writes that could have targeted them.
     named_unknown: FxHashMap<IdentifierId, Values>,
+    /// Plain objects whose unknown-key bucket holds index-only values copied
+    /// from an array; like arrays, they track generic writes in `named_unknown`.
+    indexed: FxHashSet<IdentifierId>,
     // Object literals without spread properties, so every key they list is
     // certainly present.
     exact_objects: FxHashSet<IdentifierId>,
@@ -903,9 +906,7 @@ impl CallableState {
             };
             if let Some(members) = &members {
                 for member in members {
-                    if let Some(values) =
-                        properties.get(&Some(member.clone())).or_else(|| properties.get(&None))
-                    {
+                    if let Some(values) = self.lookup(id, properties, &Some(member.clone())) {
                         add(values);
                     }
                 }
@@ -950,10 +951,14 @@ impl CallableState {
                             let members = summary.capture_reads.get(&binding);
                             return elements
                                 .iter()
-                                .filter(|(key, _)| {
-                                    key.as_ref().is_none_or(|key| {
+                                .filter(|(key, _)| match key {
+                                    Some(key) => {
                                         members.is_none_or(|members| members.contains(key))
-                                    })
+                                    }
+                                    // Unknown positions answer only index reads.
+                                    None => members.is_none_or(|members| {
+                                        members.iter().any(|member| array_index(member).is_some())
+                                    }),
                                 })
                                 .flat_map(|(_, values)| values.identities.iter().copied())
                                 .collect();
@@ -1589,9 +1594,25 @@ impl CallableState {
     /// Copies the own properties of `sources` onto `target`. A weak copy keeps
     /// each existing value alongside the copied one.
     fn assign(&mut self, target: &Values, sources: &Values, weak: bool) {
-        for source in &sources.identities {
-            let properties = self.properties.get(source).cloned().unwrap_or_default();
+        for &source in &sources.identities {
+            let properties = self.properties.get(&source).cloned().unwrap_or_default();
+            let split = self.split_domain(source);
+            if split {
+                for &object in &target.identities {
+                    self.split_unknown(object);
+                }
+            }
             for (key, mut values) in properties {
+                if key.is_none() && split {
+                    // Index-only values stay index-only on the target; only
+                    // generic unknown-key writes may land on any named key.
+                    self.store_index(target, &values);
+                    let generic = self.generic_unknown(source);
+                    if !generic.is_empty() {
+                        self.store_into(target, None, generic);
+                    }
+                    continue;
+                }
                 if weak && key.is_some() {
                     values.extend(&self.project(target, &key));
                 }
@@ -1722,6 +1743,7 @@ impl CallableState {
     fn allocate(&mut self, identifier: IdentifierId) {
         self.values.insert(identifier, Values::single(identifier));
         self.named_unknown.remove(&identifier);
+        self.indexed.remove(&identifier);
         self.exact_objects.remove(&identifier);
         self.present.remove(&identifier);
     }
@@ -1771,21 +1793,30 @@ impl CallableState {
         for (&id, values) in &other.values {
             self.values.entry(id).or_default().extend(values);
         }
-        let empty = Values::default();
+        let split: FxHashSet<IdentifierId> = self
+            .arrays
+            .iter()
+            .chain(&self.indexed)
+            .chain(&other.arrays)
+            .chain(&other.indexed)
+            .copied()
+            .collect();
+        let generic: FxHashMap<IdentifierId, (Values, Values)> = split
+            .iter()
+            .map(|&object| (object, (self.generic_unknown(object), other.generic_unknown(object))))
+            .collect();
         for (&object, properties) in &other.properties {
-            let named =
-                (self.arrays.contains(&object) || other.arrays.contains(&object)).then(|| {
-                    (
-                        self.named_unknown.get(&object).cloned().unwrap_or_default(),
-                        other.named_unknown.get(&object).unwrap_or(&empty),
-                    )
-                });
             merge_properties_in(
                 self.properties.entry(object).or_default(),
                 properties,
-                named.as_ref().map(|(into, other)| (into, *other)),
+                generic.get(&object).map(|(into, other)| (into, other)),
             );
         }
+        for (object, (mut into, other)) in generic {
+            into.extend(&other);
+            self.named_unknown.insert(object, into);
+        }
+        self.indexed.extend(&other.indexed);
         self.present.retain(|object, keys| {
             let Some(other) = other.present.get(object) else { return false };
             keys.retain(|key| other.contains(key));
@@ -1797,9 +1828,6 @@ impl CallableState {
         self.array_lengths.retain(|id, length| other.array_lengths.get(id) == Some(length));
         self.arrays.extend(&other.arrays);
         self.exact_objects.extend(&other.exact_objects);
-        for (&object, values) in &other.named_unknown {
-            self.named_unknown.entry(object).or_default().extend(values);
-        }
         for (&id, contents) in &other.collections {
             self.collections.entry(id).or_default().extend(contents);
         }
@@ -1840,6 +1868,23 @@ impl CallableState {
             }
         }
         result
+    }
+
+    /// The union of the properties of every object `identifier` may hold,
+    /// joined by the same domain rule as control-flow merges. Also returns
+    /// the union's generic unknown-key writes and whether any object split them.
+    fn split_properties(&self, identifier: IdentifierId) -> (Properties, Values, bool) {
+        let mut result = Properties::default();
+        let mut generic = Values::default();
+        let mut split = false;
+        for object in self.values(identifier).identities {
+            let Some(properties) = self.properties.get(&object) else { continue };
+            let own = self.generic_unknown(object);
+            merge_properties_in(&mut result, properties, Some((&generic, &own)));
+            generic.extend(&own);
+            split |= self.split_domain(object);
+        }
+        (result, generic, split)
     }
 
     fn load(&mut self, object: IdentifierId, key: Option<String>, into: IdentifierId) {
@@ -1892,6 +1937,35 @@ impl CallableState {
         properties.get(key).or_else(|| self.unknown_fallback(object, properties, key))
     }
 
+    /// Whether the object's unknown-key bucket may hold index-only values, so
+    /// its generic unknown-key writes are tracked apart in `named_unknown`.
+    fn split_domain(&self, object: IdentifierId) -> bool {
+        self.arrays.contains(&object) || self.indexed.contains(&object)
+    }
+
+    /// Unknown-key writes that may have named any property of `object`.
+    fn generic_unknown(&self, object: IdentifierId) -> Values {
+        if self.split_domain(object) {
+            self.named_unknown.get(&object).cloned().unwrap_or_default()
+        } else {
+            self.properties
+                .get(&object)
+                .and_then(|properties| properties.get(&None))
+                .cloned()
+                .unwrap_or_default()
+        }
+    }
+
+    /// Lets a plain object take index-only values: its unknown-key writes so
+    /// far were generic, so they become its named fallback.
+    fn split_unknown(&mut self, object: IdentifierId) {
+        if !self.split_domain(object) {
+            let generic = self.generic_unknown(object);
+            self.named_unknown.insert(object, generic);
+            self.indexed.insert(object);
+        }
+    }
+
     /// What an absent `key` may read through earlier unknown-key writes.
     fn unknown_fallback<'p>(
         &'p self,
@@ -1900,7 +1974,7 @@ impl CallableState {
         key: &Option<String>,
     ) -> Option<&'p Values> {
         let named = key.as_ref().is_some_and(|key| array_index(key).is_none());
-        if named && self.arrays.contains(&object) {
+        if named && self.split_domain(object) {
             self.named_unknown.get(&object)
         } else {
             properties.get(&None)
@@ -2052,9 +2126,11 @@ impl CallableState {
         let mut result = Values::default();
         for source in sources {
             if let Some(elements) = rest_arguments.get(&source.object) {
-                if source.key.is_some() {
-                    if let Some(values) = elements.get(&source.key).or_else(|| elements.get(&None))
-                    {
+                if let Some(key) = &source.key {
+                    // A rest parameter holds only positional arguments, so its
+                    // unknown positions answer index reads, never named ones.
+                    let unknown = || elements.get(&None).filter(|_| array_index(key).is_some());
+                    if let Some(values) = elements.get(&source.key).or_else(unknown) {
                         result.extend(values);
                     }
                 } else {
@@ -2387,7 +2463,7 @@ impl CallableState {
                     property.extend(&values);
                 }
                 properties.entry(None).or_default().extend(&values);
-                if self.arrays.contains(&object) {
+                if self.split_domain(object) {
                     self.named_unknown.entry(object).or_default().extend(&values);
                 }
             } else if let (true, Some(name)) = (definite, &key) {
@@ -2447,12 +2523,17 @@ impl CallableState {
                             self.load(source, key, property.place.identifier);
                         }
                         ObjectPropertyOrSpread::Spread(spread) => {
-                            let mut properties = self.properties(source);
+                            let (mut properties, generic, split) = self.split_properties(source);
                             properties.retain(|key, _| {
                                 key.as_ref().is_none_or(|key| !excluded.contains(key))
                             });
-                            self.allocate(spread.place.identifier);
-                            self.properties.insert(spread.place.identifier, properties);
+                            let rest = spread.place.identifier;
+                            self.allocate(rest);
+                            self.properties.insert(rest, properties);
+                            if split {
+                                self.indexed.insert(rest);
+                                self.named_unknown.insert(rest, generic);
+                            }
                         }
                     }
                 }
@@ -2477,7 +2558,10 @@ impl CallableState {
                                     Some((key, values))
                                 })
                                 .collect();
+                            // An array rest copies positions only, so no
+                            // generic unknown-key write reaches its named keys.
                             self.allocate(spread.place.identifier);
+                            self.arrays.insert(spread.place.identifier);
                             self.properties.insert(spread.place.identifier, properties);
                         }
                         ArrayPatternElement::Hole => {}
