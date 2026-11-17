@@ -701,12 +701,6 @@ impl CollectionContents {
     }
 }
 
-fn remove_identity(values: &mut Values, identity: IdentifierId) {
-    values.identities.remove(&identity);
-    values.contexts.remove(&identity);
-    values.iterators.remove(&identity);
-}
-
 /// A primitive's type and its property-key spelling. Property access only
 /// uses `text`, while Map keys also compare `kind`, so `1` and `"1"` differ.
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -1323,7 +1317,6 @@ impl CallableState {
         let definite = self.singleton(&objects);
         let mut result = None;
         for object in &objects.identities {
-            let removable = self.removable_identity(*object, &key);
             let Some(contents) = self.collections.get_mut(object) else { continue };
             match (name.as_str(), contents.map) {
                 ("add", false) => {
@@ -1352,12 +1345,11 @@ impl CallableState {
                         contents.rebuild_map_values();
                     }
                 }
-                ("delete", false) if definite => {
-                    if let Some(identity) = removable {
-                        remove_identity(&mut contents.keys, identity);
-                        remove_identity(&mut contents.values, identity);
-                    }
-                }
+                // `Set.delete(value)` keeps every member: an allocation
+                // identity stands for every runtime object minted at that
+                // site (a loop, a factory called twice), and a value that may
+                // be null or untracked carries no identity at all, so no
+                // member is ever proven equal to the deleted value.
                 ("get", true) => {
                     let values = result.get_or_insert_with(Values::default);
                     match key_name.as_ref().and_then(|key_name| contents.keyed.get(key_name)) {
@@ -1388,28 +1380,6 @@ impl CallableState {
             "clear" | "delete" => self.refresh_pending(&objects, Some(&"forEach".to_string())),
             _ => {}
         }
-    }
-
-    /// `Set.delete(value)` removes `value` only when it is one function
-    /// identity that no other member can also carry, such as a bound copy.
-    fn removable_identity(&self, set: IdentifierId, key: &Values) -> Option<IdentifierId> {
-        let contents = self.collections.get(&set)?;
-        let mut identities = key.identities.iter();
-        let identity = *identities.next()?;
-        if identities.next().is_some() || !key.contexts.contains_key(&identity) {
-            return None;
-        }
-        contents
-            .values
-            .identities
-            .iter()
-            .all(|&other| {
-                other == identity
-                    || contents.values.contexts.contains_key(&other)
-                    || self.properties.contains_key(&other)
-                    || self.collections.contains_key(&other)
-            })
-            .then_some(identity)
     }
 
     /// Points `map` at the `[key, value]` pair minted for `site`, holding the
