@@ -129,3 +129,23 @@ fn skips_node_modules() {
 
     Tester::new(Purity::NAME, Purity::PLUGIN, pass, vec![]).test();
 }
+
+/// Components the compiler discovers without a top-level component or hook
+/// declaration still get compiler findings.
+#[test]
+fn reports_components_found_by_compiler_discovery() {
+    use crate::tester::Tester;
+
+    let fail = vec![
+        "import {memo} from 'react'; export const App = memo(() => <div>{Math.random()}</div>);",
+        "import {memo} from 'react'; export const helper = memo(() => <div>{Math.random()}</div>);",
+        "import {forwardRef} from 'react'; export const App = forwardRef((props, ref) => <div ref={ref}>{Math.random()}</div>);",
+        "import React from 'react'; export const App = React.memo(function () { return <div>{Math.random()}</div>; });",
+        "import {memo} from 'react'; export default memo(() => <div>{Math.random()}</div>);",
+        "import {memo} from 'react'; export const App = memo(() => <div>{Math.random()}</div>) as unknown as typeof Other;",
+        "export function mount() { function Probe() { return <div>{Math.random()}</div>; } return Probe; }",
+        "function render() { 'use memo'; return <div>{Math.random()}</div>; }",
+    ];
+
+    Tester::new(Purity::NAME, Purity::PLUGIN, vec![], fail).test();
+}

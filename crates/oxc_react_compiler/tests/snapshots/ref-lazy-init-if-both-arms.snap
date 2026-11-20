@@ -1,0 +1,18 @@
+---
+source: crates/oxc_react_compiler/tests/snapshot.rs
+assertion_line: 57
+input_file: crates/oxc_react_compiler/fixtures/ref-lazy-init-if-both-arms.js
+---
+import { useRef } from "react";
+function Component(t0) {
+	const { flag } = t0;
+	const ref = useRef(null);
+	if (ref.current == null) {
+		if (flag) {
+			ref.current = 1;
+		} else {
+			ref.current = 2;
+		}
+	}
+	return null;
+}

@@ -551,6 +551,12 @@ pub(super) struct AsyncCallables {
     pub returned: ReturnedCallables,
     pub pending_before: FxHashMap<InstructionId, AsyncInvocation>,
     pub pending_at_exit: FxHashMap<BlockId, AsyncInvocation>,
+    /// Async callables, each with the bindings it captures, that reach an
+    /// operation this model does not follow. They may run at any later time.
+    pub escaped: FxHashMap<IdentifierId, FxHashSet<IdentifierId>>,
+    /// Every heap identity reachable from such an operation, including the
+    /// entry identities of this function's parameters and context bindings.
+    pub escaped_identities: FxHashSet<IdentifierId>,
 }
 
 #[derive(Clone, Default, PartialEq, Eq)]
@@ -569,6 +575,46 @@ pub(super) struct ReturnedCallables {
     projections: Projections,
     deferred_calls: DeferredCalls,
     parameter_values: Captures,
+    /// Per parameter, whether no value received there reaches an operation
+    /// this model does not follow.
+    params_modeled: Vec<bool>,
+    /// Parameters passed directly to a call of a captured binding or another
+    /// parameter, which the caller resolves to decide whether they escape.
+    forwarded: FxHashSet<Forward>,
+}
+
+/// Parameter `parameter` is passed at `argument` to a call whose callee is
+/// the entry value of `callee`, a context binding or another parameter.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct Forward {
+    parameter: usize,
+    callee: IdentifierId,
+    argument: usize,
+}
+
+/// Entry identities of the function under analysis.
+struct Frame {
+    /// Context bindings and non-rest parameters, whose objects are unknown.
+    opaque: FxHashSet<IdentifierId>,
+    params: Vec<IdentifierId>,
+}
+
+impl ReturnedCallables {
+    /// Whether an argument at `index` (every position from `index` on when it
+    /// is spread) stays within this model inside the function.
+    fn accepts(&self, index: usize, spread: bool) -> bool {
+        let rest = self.params.last().is_some_and(|&(_, rest)| rest);
+        let modeled = |position: usize| match self.params_modeled.get(position) {
+            Some(&modeled) => modeled,
+            // Extra arguments are unreachable without a rest parameter.
+            None => !rest || self.params_modeled.last() == Some(&true),
+        };
+        if spread {
+            (index..self.params_modeled.len().max(index + 1)).all(modeled)
+        } else {
+            modeled(index)
+        }
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -822,6 +868,7 @@ struct CallableState {
     // changing one that may already be stored elsewhere.
     map_entries: FxHashMap<IdentifierId, FxHashSet<IdentifierId>>,
     entry_ids: EntryIds,
+    map_literals: Rc<MapLiterals>,
     /// Identities allocated by an instruction of this function that runs at
     /// most once per call. Parameters, captures, callee-returned objects and
     /// allocations in a loop may each stand for several runtime objects.
@@ -1239,7 +1286,27 @@ impl CallableState {
                         }
                     }
                 }
-                if map {
+                let literal = match args.first() {
+                    Some(PlaceOrSpread::Place(place)) if args.len() == 1 => {
+                        self.map_literals.entries.get(&place.identifier)
+                    }
+                    _ => None,
+                };
+                if let (true, Some(pairs)) = (map, literal) {
+                    // Later pairs replace earlier ones with the same key.
+                    for pair in pairs {
+                        let (key, value) = self.map_literals.pairs[pair];
+                        contents.keys.extend(&self.values(key));
+                        let value = self.values(value);
+                        match self.keys.get(&key) {
+                            Some(key) => {
+                                contents.keyed.insert(key.clone(), value);
+                            }
+                            None => contents.unkeyed.extend(&value),
+                        }
+                    }
+                    contents.rebuild_map_values();
+                } else if map {
                     contents.keys.extend(&self.project(&items, &Some("0".to_string())));
                     contents.unkeyed.extend(&self.project(&items, &Some("1".to_string())));
                     contents.rebuild_map_values();
@@ -1269,6 +1336,415 @@ impl CallableState {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Async callables reachable from `values`: directly, through object,
+    /// array and collection contents, and through the captures and bound
+    /// arguments of reachable closures. Each is recorded with its captures.
+    fn reachable_async(
+        &self,
+        values: Values,
+        captured_contexts: &Captures,
+        into: &mut FxHashMap<IdentifierId, FxHashSet<IdentifierId>>,
+        seen_identities: &mut FxHashSet<IdentifierId>,
+    ) {
+        let mut pending = vec![values];
+        let mut visited = FxHashSet::default();
+        let mut seen_callables = FxHashSet::default();
+        while let Some(values) = pending.pop() {
+            for (&function, callable) in values.contexts.iter().chain(&values.iterators) {
+                if !seen_callables.insert(function) {
+                    continue;
+                }
+                let bindings: FxHashSet<IdentifierId> =
+                    captured_contexts.get(&function).cloned().unwrap_or_else(|| {
+                        callable
+                            .eager_captures
+                            .iter()
+                            .chain(&callable.deferred_captures)
+                            .chain(&callable.snapshot_captures)
+                            .chain(callable.capture_reads.keys())
+                            .copied()
+                            .collect()
+                    });
+                for binding in &bindings {
+                    for &value in callable.context_values.get(binding).into_iter().flatten() {
+                        pending.push(Values::single(value));
+                    }
+                }
+                pending.extend(callable.bound_arguments.elements.values().cloned());
+                if callable.is_async {
+                    into.entry(function).or_default().extend(bindings);
+                }
+            }
+            for &identity in &values.identities {
+                seen_identities.insert(identity);
+                if !visited.insert(identity) {
+                    continue;
+                }
+                pending.push(self.values(identity));
+                if let Some(properties) = self.properties.get(&identity) {
+                    pending.extend(properties.values().cloned());
+                }
+                if let Some(contents) = self.collections.get(&identity) {
+                    pending.push(contents.keys.clone());
+                    pending.push(contents.values.clone());
+                }
+                if let Some(values) = self.named_unknown.get(&identity) {
+                    pending.push(values.clone());
+                }
+                for &entry in self.map_entries.get(&identity).into_iter().flatten() {
+                    pending.push(Values::single(entry));
+                }
+            }
+        }
+    }
+
+    /// Arguments of a call to `callees` whose values leave this model: every
+    /// argument unless each callee is a known function without bound
+    /// arguments whose matching parameter keeps its value within the model.
+    /// `offset` is the parameter position of the first argument.
+    fn unmodeled_arguments(
+        &self,
+        callees: &Values,
+        args: &[PlaceOrSpread],
+        offset: usize,
+    ) -> Vec<IdentifierId> {
+        let known = !callees.contexts.is_empty()
+            && callees.identities.iter().all(|id| callees.contexts.contains_key(id));
+        args.iter()
+            .enumerate()
+            .filter_map(|(index, arg)| {
+                let (place, spread) = match arg {
+                    PlaceOrSpread::Place(place) => (place, false),
+                    PlaceOrSpread::Spread(spread) => (&spread.place, true),
+                };
+                let spread_before =
+                    args[..index].iter().any(|arg| matches!(arg, PlaceOrSpread::Spread(_)));
+                let modeled = known
+                    && callees.contexts.values().all(|callable| {
+                        self.callable_accepts(
+                            callable,
+                            args,
+                            offset,
+                            offset + index,
+                            spread || spread_before,
+                            0,
+                        )
+                    });
+                (!modeled).then_some(place.identifier)
+            })
+            .collect()
+    }
+
+    /// Whether `callable`, called with `args` starting at parameter `offset`,
+    /// keeps the argument at parameter `index` within this model, resolving
+    /// the calls it forwards that parameter to.
+    fn callable_accepts(
+        &self,
+        callable: &Callable,
+        args: &[PlaceOrSpread],
+        offset: usize,
+        index: usize,
+        spread: bool,
+        depth: usize,
+    ) -> bool {
+        const MAX_FORWARD_DEPTH: usize = 8;
+        let Some(summary) = &callable.returned else { return false };
+        if !callable.bound_arguments.elements.is_empty() || !summary.accepts(index, spread) {
+            return false;
+        }
+        summary.forwarded.iter().filter(|forward| forward.parameter == index).all(|forward| {
+            if spread || depth >= MAX_FORWARD_DEPTH {
+                return false;
+            }
+            let callees = if let Some(position) =
+                summary.params.iter().position(|&(id, _)| id == forward.callee)
+            {
+                match position.checked_sub(offset).and_then(|position| args.get(position)) {
+                    Some(PlaceOrSpread::Place(place)) => self.values(place.identifier),
+                    _ => return false,
+                }
+            } else {
+                let mut callees = Values::default();
+                match callable.context_values.get(&forward.callee) {
+                    Some(values) => {
+                        for &value in values {
+                            callees.extend(&self.values(value));
+                        }
+                    }
+                    None => return false,
+                }
+                callees
+            };
+            !callees.contexts.is_empty()
+                && callees.identities.iter().all(|id| callees.contexts.contains_key(id))
+                && callees.contexts.values().all(|inner| {
+                    // The forwarded value is the only argument resolved here;
+                    // the inner call's other arguments are the callee's own.
+                    self.callable_accepts(inner, &[], 0, forward.argument, false, depth + 1)
+                })
+        })
+    }
+
+    /// Values passed in the callback position of a built-in that invokes its
+    /// callback: the first argument, or every element of a leading spread.
+    fn callback_values(&self, args: &[PlaceOrSpread]) -> Values {
+        match args.first() {
+            Some(PlaceOrSpread::Place(place)) => self.values(place.identifier),
+            Some(PlaceOrSpread::Spread(spread)) => {
+                let mut values = Values::default();
+                for identity in self.values(spread.place.identifier).identities {
+                    for elements in self.properties(identity).values() {
+                        values.extend(elements);
+                    }
+                }
+                values
+            }
+            None => Values::default(),
+        }
+    }
+
+    /// Whether `Object.prototype.toString`, `Array.prototype.join` and their
+    /// relatives on `values` run no user code: every reachable object is
+    /// tracked and stores no stringification hook.
+    fn stringifies_natively(&self, values: &Values, opaque: &FxHashSet<IdentifierId>) -> bool {
+        let mut pending = vec![values.clone()];
+        let mut visited = FxHashSet::default();
+        while let Some(values) = pending.pop() {
+            for &identity in &values.identities {
+                if !visited.insert(identity) || values.contexts.contains_key(&identity) {
+                    continue;
+                }
+                if opaque.contains(&identity)
+                    || self.named_unknown.get(&identity).is_some_and(|values| !values.is_empty())
+                {
+                    return false;
+                }
+                // The unknown-key bucket of an array or array-derived object
+                // holds index writes only; named writes go to `named_unknown`.
+                let index_only =
+                    self.arrays.contains(&identity) || self.indexed.contains(&identity);
+                let properties = self.properties(identity);
+                if properties.keys().any(|key| match key.as_deref() {
+                    Some(key) => matches!(key, "toString" | "toLocaleString" | "valueOf" | "join"),
+                    None => !index_only,
+                }) {
+                    return false;
+                }
+                if self.arrays.contains(&identity) {
+                    pending.extend(properties.into_values());
+                }
+            }
+        }
+        true
+    }
+
+    /// Operands whose contents leave this model at `instruction`: passed to
+    /// unknown code, or to a built-in whose result is not tracked. Copies,
+    /// literals, property access, closure captures, direct calls and the
+    /// modeled collection and array built-ins keep their values tracked.
+    fn escaping_operands(
+        &self,
+        instruction: &Instruction<'_>,
+        env: &Environment<'_>,
+        frame: &Frame,
+        forwarded: &mut FxHashSet<Forward>,
+    ) -> Vec<IdentifierId> {
+        let every_operand = || {
+            each_instruction_value_operand(&instruction.value, env)
+                .iter()
+                .map(|place| place.identifier)
+                .collect()
+        };
+        match &instruction.value {
+            InstructionValue::FunctionExpression { .. }
+            | InstructionValue::ObjectMethod { .. }
+            | InstructionValue::Primitive { .. }
+            | InstructionValue::LoadLocal { .. }
+            | InstructionValue::LoadContext { .. }
+            | InstructionValue::LoadGlobal { .. }
+            | InstructionValue::TypeCastExpression { .. }
+            | InstructionValue::StoreLocal { .. }
+            | InstructionValue::StoreContext { .. }
+            | InstructionValue::DeclareLocal { .. }
+            | InstructionValue::DeclareContext { .. }
+            | InstructionValue::ObjectExpression { .. }
+            | InstructionValue::ArrayExpression { .. }
+            | InstructionValue::PropertyLoad { .. }
+            | InstructionValue::ComputedLoad { .. }
+            | InstructionValue::PropertyStore { .. }
+            | InstructionValue::ComputedStore { .. }
+            | InstructionValue::PropertyDelete { .. }
+            | InstructionValue::ComputedDelete { .. }
+            | InstructionValue::PrefixUpdateContext { .. }
+            | InstructionValue::PostfixUpdateContext { .. } => Vec::new(),
+            // Array patterns read indexed properties; iterating a Set or Map
+            // yields contents this destructuring does not read.
+            InstructionValue::Destructure { value, .. } => {
+                if self
+                    .values(value.identifier)
+                    .identities
+                    .iter()
+                    .any(|identity| self.collections.contains_key(identity))
+                {
+                    vec![value.identifier]
+                } else {
+                    Vec::new()
+                }
+            }
+            InstructionValue::CallExpression { callee, args, .. } => {
+                let callees = self.values(callee.identifier);
+                let mut escaping = self.unmodeled_arguments(&callees, args, 0);
+                // A call of a captured binding or parameter is resolved by the
+                // caller; record the parameters passed to it unchanged.
+                if callees.contexts.is_empty()
+                    && callees.identities.len() == 1
+                    && let Some(&target) = callees.identities.iter().next()
+                    && (frame.opaque.contains(&target) || frame.params.contains(&target))
+                    && !args.iter().any(|arg| matches!(arg, PlaceOrSpread::Spread(_)))
+                {
+                    escaping.retain(|&operand| {
+                        let values = self.values(operand);
+                        let parameter = (values.identities.len() == 1 && values.contexts.is_empty())
+                            .then(|| values.identities.iter().next().copied())
+                            .flatten()
+                            .and_then(|id| frame.params.iter().position(|&param| param == id));
+                        let Some(parameter) = parameter else { return true };
+                        let Some(argument) = args.iter().position(|arg| {
+                            matches!(arg, PlaceOrSpread::Place(place) if place.identifier == operand)
+                        }) else {
+                            return true;
+                        };
+                        forwarded.insert(Forward { parameter, callee: target, argument });
+                        false
+                    });
+                }
+                escaping
+            }
+            InstructionValue::NewExpression { callee, args, .. } => {
+                let ty = &env.types[env.identifiers[callee.identifier].type_];
+                let collection =
+                    env.get_function_signature(ty).ok().flatten().is_some_and(|signature| {
+                        matches!(signature.canonical_name.as_deref(), Some("Set" | "Map"))
+                    });
+                if collection && args.len() <= 1 { Vec::new() } else { every_operand() }
+            }
+            InstructionValue::MethodCall { receiver, property, args, .. } => {
+                if let Some(method) = self.builtin_function_methods.get(&property.identifier) {
+                    let callees = self.values(receiver.identifier);
+                    return match method.as_str() {
+                        "next" => Vec::new(),
+                        // `this` is unsupported, so the receiver argument is unread.
+                        "call" | "bind" if !args.is_empty() => {
+                            self.unmodeled_arguments(&callees, &args[1..], 0)
+                        }
+                        _ => self.unmodeled_arguments(&Values::default(), args, 0),
+                    };
+                }
+                let callees = self.values(property.identifier);
+                if !callees.is_empty() {
+                    return self.unmodeled_arguments(&callees, args, 0);
+                }
+                let escaping_call = || {
+                    let mut escaping = vec![receiver.identifier];
+                    escaping.extend(self.unmodeled_arguments(&Values::default(), args, 0));
+                    escaping
+                };
+                let Some(name) = self.members.get(&property.identifier) else {
+                    return escaping_call();
+                };
+                if let Some(global) = self.globals.get(&receiver.identifier) {
+                    let modeled = match (global.as_str(), name.as_str()) {
+                        ("Array", "of") | ("Object", "assign") => true,
+                        ("Array", "from") => args.len() <= 1,
+                        _ => false,
+                    };
+                    return if modeled { Vec::new() } else { escaping_call() };
+                }
+                let receiver_values = self.values(receiver.identifier);
+                let receivers = &receiver_values.identities;
+                let collection = !receivers.is_empty()
+                    && receivers.iter().all(|id| self.collections.contains_key(id));
+                let array =
+                    !receivers.is_empty() && receivers.iter().all(|id| self.arrays.contains(id));
+                if matches!(name.as_str(), "toString" | "toLocaleString")
+                    || (array && name == "join")
+                {
+                    return if args.is_empty()
+                        && self.stringifies_natively(&receiver_values, &frame.opaque)
+                    {
+                        Vec::new()
+                    } else {
+                        escaping_call()
+                    };
+                }
+                let invokes_callback = (collection && name == "forEach")
+                    || (array
+                        && matches!(
+                            name.as_str(),
+                            "forEach"
+                                | "every"
+                                | "some"
+                                | "findIndex"
+                                | "filter"
+                                | "find"
+                                | "map"
+                                | "flatMap"
+                        ));
+                if invokes_callback {
+                    // Known callbacks run during the call and cannot read the
+                    // `this` argument; the receiver escapes when the result
+                    // carries its elements, which this model does not follow.
+                    let callbacks = self.callback_values(args);
+                    let mut escaping = Vec::new();
+                    if matches!(name.as_str(), "filter" | "find" | "map" | "flatMap") {
+                        escaping.push(receiver.identifier);
+                    }
+                    if callbacks.identities.is_empty()
+                        || !callbacks
+                            .identities
+                            .iter()
+                            .all(|id| callbacks.contexts.contains_key(id))
+                    {
+                        escaping.extend(self.unmodeled_arguments(&Values::default(), args, 0));
+                    }
+                    return escaping;
+                }
+                let modeled = (collection
+                    && matches!(name.as_str(), "add" | "set" | "get" | "has" | "delete" | "clear"))
+                    || (array
+                        && matches!(
+                            name.as_str(),
+                            "push"
+                                | "fill"
+                                | "unshift"
+                                | "shift"
+                                | "pop"
+                                | "reverse"
+                                | "sort"
+                                | "copyWithin"
+                                | "splice"
+                                | "flat"
+                                | "concat"
+                                | "toSpliced"
+                                | "with"
+                                | "slice"
+                                | "toReversed"
+                                | "toSorted"
+                                | "at"
+                                | "includes"
+                                | "indexOf"
+                                | "lastIndexOf"
+                        ));
+                if modeled { Vec::new() } else { escaping_call() }
+            }
+            InstructionValue::TaggedTemplateExpression { tag, subexprs, .. } => {
+                let args: Vec<_> = subexprs.iter().cloned().map(PlaceOrSpread::Place).collect();
+                self.unmodeled_arguments(&self.values(tag.identifier), &args, 1)
+            }
+            _ => every_operand(),
         }
     }
 
@@ -2810,6 +3286,65 @@ impl CallableState {
 
 /// Identities assigned by instructions in blocks outside every CFG cycle, so
 /// each names at most one runtime object per call of `func`.
+/// Inline `new Map([[key, value], ...])` arguments. Each listed temporary has
+/// exactly one use in the function, the enclosing literal or the constructor,
+/// so nothing can alias or mutate a pair before the Map copies it.
+#[derive(Default, PartialEq, Eq)]
+struct MapLiterals {
+    /// The entries array literal and the pair literals it lists.
+    entries: FxHashMap<IdentifierId, Vec<IdentifierId>>,
+    /// A pair literal and its key and value operands.
+    pairs: FxHashMap<IdentifierId, (IdentifierId, IdentifierId)>,
+}
+
+fn map_literals(func: &HirFunction, env: &Environment<'_>) -> MapLiterals {
+    let mut uses: FxHashMap<IdentifierId, usize> = FxHashMap::default();
+    let mut arrays = Vec::new();
+    for block in func.body.blocks.values() {
+        for phi in &block.phis {
+            for operand in phi.operands.values() {
+                *uses.entry(operand.identifier).or_default() += 1;
+            }
+        }
+        for &instruction_id in &block.instructions {
+            let instruction = &func.instructions[instruction_id.index()];
+            for place in each_instruction_value_operand(&instruction.value, env) {
+                *uses.entry(place.identifier).or_default() += 1;
+            }
+            if let InstructionValue::ArrayExpression { elements, .. } = &instruction.value {
+                let places: Option<Vec<_>> = elements
+                    .iter()
+                    .map(|element| match element {
+                        ArrayElement::Place(place) => Some(place.identifier),
+                        ArrayElement::Spread(_) | ArrayElement::Hole => None,
+                    })
+                    .collect();
+                if let Some(places) = places {
+                    arrays.push((instruction.lvalue.identifier, places));
+                }
+            }
+        }
+        for place in each_terminal_operand(&block.terminal) {
+            *uses.entry(place.identifier).or_default() += 1;
+        }
+    }
+    let single = |id: &IdentifierId| uses.get(id) == Some(&1);
+    let mut literals = MapLiterals::default();
+    for (id, places) in &arrays {
+        if let [key, value, ..] = places.as_slice()
+            && single(id)
+        {
+            literals.pairs.insert(*id, (*key, *value));
+        }
+    }
+    for (id, places) in arrays {
+        if single(&id) && places.iter().all(|pair| literals.pairs.contains_key(pair)) {
+            literals.entries.insert(id, places);
+        }
+    }
+    literals
+}
+
 fn single_allocations(func: &HirFunction) -> FxHashSet<IdentifierId> {
     let mut once = FxHashSet::default();
     for (&block_id, block) in &func.body.blocks {
@@ -2849,6 +3384,7 @@ pub(super) fn infer_async_callable_contexts(
     hoisted: &FxHashMap<IdentifierId, IdentifierId>,
     function_returns: &FxHashMap<IdentifierId, ReturnedCallables>,
     env: &Environment<'_>,
+    nested: bool,
 ) -> AsyncCallables {
     let mut result = AsyncCallables {
         identifiers: FxHashSet::default(),
@@ -2857,20 +3393,57 @@ pub(super) fn infer_async_callable_contexts(
         returned: ReturnedCallables::default(),
         pending_before: FxHashMap::default(),
         pending_at_exit: FxHashMap::default(),
+        escaped: FxHashMap::default(),
+        escaped_identities: FxHashSet::default(),
     };
     let parameters = parameter_bindings(func, env);
+    let frame = Frame {
+        opaque: func
+            .context
+            .iter()
+            .map(|place| place.identifier)
+            .chain(func.params.iter().filter_map(|param| match param {
+                ParamPattern::Place(place) => Some(place.identifier),
+                ParamPattern::Spread(_) => None,
+            }))
+            .collect(),
+        params: func
+            .params
+            .iter()
+            .map(|param| match param {
+                ParamPattern::Place(place) => place.identifier,
+                ParamPattern::Spread(spread) => spread.place.identifier,
+            })
+            .collect(),
+    };
     let captured_bindings = captured_contexts.values().flatten().copied().collect();
     let mut states: FxHashMap<BlockId, CallableState> = FxHashMap::default();
+    // State on the exceptional edge of a `MaybeThrow` block: the join of the
+    // state before each instruction and after the last. An instruction that
+    // throws may not have applied its writes, so the handler must keep the
+    // provenance those writes would have killed.
+    let mut handler_states: FxHashMap<BlockId, CallableState> = FxHashMap::default();
     let entry_ids = EntryIds::new(env.identifiers.len());
     let once = Rc::new(single_allocations(func));
+    let map_literals = Rc::new(map_literals(func, env));
     loop {
         let mut changed = false;
         for (&block_id, block) in &func.body.blocks {
-            let mut predecessors =
-                block.preds.iter().filter_map(|predecessor| states.get(predecessor));
+            let incoming = |predecessor: &BlockId| {
+                let exceptional = func.body.blocks.get(predecessor).is_some_and(|block| {
+                    matches!(
+                        block.terminal,
+                        Terminal::MaybeThrow { handler: Some(handler), continuation, .. }
+                            if handler == block_id && continuation != block_id
+                    )
+                });
+                if exceptional { handler_states.get(predecessor) } else { states.get(predecessor) }
+            };
+            let mut predecessors = block.preds.iter().filter_map(incoming);
             let mut state = predecessors.next().cloned().unwrap_or_else(|| {
                 let mut state = CallableState {
                     entry_ids: entry_ids.clone(),
+                    map_literals: Rc::clone(&map_literals),
                     once: Rc::clone(&once),
                     ..CallableState::default()
                 };
@@ -2895,7 +3468,7 @@ pub(super) fn infer_async_callable_contexts(
                 let mut values = Values::default();
                 let mut keys = Vec::new();
                 for (predecessor, operand) in &phi.operands {
-                    if let Some(predecessor) = states.get(predecessor) {
+                    if let Some(predecessor) = incoming(predecessor) {
                         values.extend(&predecessor.values(operand.identifier));
                         keys.push(predecessor.keys.get(&operand.identifier));
                     }
@@ -2909,8 +3482,16 @@ pub(super) fn infer_async_callable_contexts(
                     state.keys.remove(&phi.place.identifier);
                 }
             }
+            let may_throw = matches!(block.terminal, Terminal::MaybeThrow { handler: Some(_), .. });
+            let mut exceptional: Option<CallableState> = None;
             for &instruction_id in &block.instructions {
                 let instruction = &func.instructions[instruction_id.index()];
+                if may_throw {
+                    match &mut exceptional {
+                        Some(exceptional) => exceptional.merge(&state),
+                        None => exceptional = Some(state.clone()),
+                    }
+                }
                 if let InstructionValue::LoadLocal { place, .. }
                 | InstructionValue::LoadContext { place, .. } = &instruction.value
                     && parameters.contains(&place.identifier)
@@ -2964,6 +3545,19 @@ pub(super) fn infer_async_callable_contexts(
                 if matches!(instruction.value, InstructionValue::Await { .. }) {
                     result.pending_before.insert(instruction_id, state.pending_observation());
                 }
+                for operand in state.escaping_operands(
+                    instruction,
+                    env,
+                    &frame,
+                    &mut result.returned.forwarded,
+                ) {
+                    state.reachable_async(
+                        state.values(operand),
+                        captured_contexts,
+                        &mut result.escaped,
+                        &mut result.escaped_identities,
+                    );
+                }
                 state.apply(
                     instruction,
                     hoisted,
@@ -2984,8 +3578,54 @@ pub(super) fn infer_async_callable_contexts(
                     MethodOverride::None => state.update_builtins(instruction, env),
                 }
             }
+            // Call results of a nested function carry returned callables but
+            // not the contents of returned objects, arrays and collections.
+            // The outermost function's return is checked after render instead.
+            if let (true, Terminal::Return { value, .. }) = (nested, &block.terminal) {
+                let returned = state.values(value.identifier);
+                let mut contents = Values::default();
+                for identity in &returned.identities {
+                    if returned.contexts.contains_key(identity) {
+                        continue;
+                    }
+                    for values in state.properties(*identity).values() {
+                        contents.extend(values);
+                    }
+                    if let Some(collection) = state.collections.get(identity) {
+                        contents.extend(&collection.keys);
+                        contents.extend(&collection.values);
+                    }
+                    if let Some(values) = state.named_unknown.get(identity) {
+                        contents.extend(values);
+                    }
+                    for &entry in state.map_entries.get(identity).into_iter().flatten() {
+                        contents.extend(&Values::single(entry));
+                    }
+                }
+                state.reachable_async(
+                    contents,
+                    captured_contexts,
+                    &mut result.escaped,
+                    &mut result.escaped_identities,
+                );
+            }
+            if let Terminal::Throw { value, .. } = &block.terminal {
+                state.reachable_async(
+                    state.values(value.identifier),
+                    captured_contexts,
+                    &mut result.escaped,
+                    &mut result.escaped_identities,
+                );
+            }
             if matches!(block.terminal, Terminal::Return { .. } | Terminal::Throw { .. }) {
                 result.pending_at_exit.insert(block_id, state.pending_observation());
+            }
+            if let Some(mut exceptional) = exceptional {
+                exceptional.merge(&state);
+                if handler_states.get(&block_id) != Some(&exceptional) {
+                    handler_states.insert(block_id, exceptional);
+                    changed = true;
+                }
             }
             if states.get(&block_id) != Some(&state) {
                 states.insert(block_id, state);
@@ -3008,6 +3648,15 @@ pub(super) fn infer_async_callable_contexts(
             result.returned.values.extend(&states[&block_id].values(value.identifier));
         }
     }
+    result.returned.params_modeled = func
+        .params
+        .iter()
+        .map(|param| match param {
+            ParamPattern::Place(place) => place,
+            ParamPattern::Spread(spread) => &spread.place,
+        })
+        .map(|place| !result.escaped_identities.contains(&place.identifier))
+        .collect();
     result.returned.generator = func.generator;
     result.returned.external_contexts.extend(func.context.iter().map(|place| place.identifier));
     result.returned.params.extend(func.params.iter().map(|param| match param {

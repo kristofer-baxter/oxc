@@ -1,10 +1,6 @@
 use std::borrow::Cow;
 
 use lazy_regex::Regex;
-use oxc_ast::ast::{
-    Argument, BindingPattern, Declaration, ExportDefaultDeclarationKind, Expression, FunctionType,
-    Program, Statement,
-};
 use oxc_diagnostics::OxcCode;
 use oxc_react_compiler::{
     CompilerOutputMode, EnvironmentConfig, ErrorCategory, ExhaustiveEffectDepsMode, LintDiagnostic,
@@ -118,94 +114,20 @@ pub fn build_react_compiler_results(host: &ContextHost) -> ReactCompilerResults 
 }
 
 /// Shared `should_run` for the React Compiler family: match the upstream
-/// `node_modules` source filter and [`may_contain_react_code`] gate, and skip files
-/// with multiple `<script>` sections (vue/astro/svelte). The latter is required for
-/// correctness, not just speed — the cache on [`ContextHost`] is per file, so it
-/// would replay the first script section's findings for every later section.
+/// `node_modules` source filter, and skip files with multiple `<script>`
+/// sections (vue/astro/svelte). The latter is required for correctness, not
+/// just speed: the cache on [`ContextHost`] is per file, so it would replay the
+/// first script section's findings for every later section.
+///
+/// There is no syntactic component or hook precheck. The compiler's own
+/// discovery decides which functions to compile, and it recognizes components
+/// that a top-level scan misses (wrapped, cast, nested, or opted in by a
+/// directive), so a narrower gate here would silently drop their findings.
 pub fn should_run_react_compiler(ctx: &ContextHost) -> bool {
     !ctx.file_path().to_string_lossy().contains("node_modules")
         && !ctx
             .file_extension()
             .is_some_and(|ext| LINT_PARTIAL_LOADER_EXTENSIONS.iter().any(|e| e == &ext))
-        && may_contain_react_code(ctx.semantic().nodes().program())
-}
-
-/// Port of `mayContainReactCode` in `eslint-plugin-react-hooks`'s
-/// `src/shared/RunReactCompiler.ts`: only compile files with a top-level function
-/// named like a component or hook, or an anonymous default-exported function.
-///
-/// Unlike upstream, a `memo(...)` or `forwardRef(...)` wrapper around a function
-/// also counts. The compiler treats those callbacks as components, so skipping
-/// a file whose only component is `export const Button = memo(() => ...)` would
-/// silently drop its findings.
-fn may_contain_react_code(program: &Program) -> bool {
-    program.body.iter().any(is_top_level_react_code)
-}
-
-fn is_top_level_react_code(statement: &Statement) -> bool {
-    match statement {
-        Statement::ExportDeclaration(export) => is_react_declaration(&export.declaration),
-        Statement::ExportDefaultDeclaration(export) => match &export.declaration {
-            ExportDefaultDeclarationKind::FunctionDeclaration(func) => {
-                func.r#type == FunctionType::FunctionDeclaration
-                    && func.id.as_ref().is_none_or(|id| is_component_or_hook_name(&id.name))
-            }
-            declaration => declaration.as_expression().is_some_and(is_component_initializer),
-        },
-        _ => statement.as_declaration().is_some_and(is_react_declaration),
-    }
-}
-
-fn is_react_declaration(declaration: &Declaration) -> bool {
-    match declaration {
-        Declaration::FunctionDeclaration(func) => {
-            func.r#type == FunctionType::FunctionDeclaration
-                && func.id.as_ref().is_some_and(|id| is_component_or_hook_name(&id.name))
-        }
-        Declaration::VariableDeclaration(declaration) => {
-            declaration.declarations.iter().any(|declarator| {
-                matches!(&declarator.id, BindingPattern::BindingIdentifier(id) if is_component_or_hook_name(&id.name))
-                    && declarator.init.as_ref().is_some_and(is_component_initializer)
-            })
-        }
-        _ => false,
-    }
-}
-
-/// A function expression, or one wrapped (at any depth) in `memo`, `forwardRef`,
-/// `React.memo` or `React.forwardRef`.
-fn is_component_initializer(expr: &Expression) -> bool {
-    match expr.without_parentheses() {
-        Expression::ArrowFunctionExpression(_) | Expression::FunctionExpression(_) => true,
-        Expression::CallExpression(call) => {
-            is_component_wrapper(&call.callee)
-                && call
-                    .arguments
-                    .first()
-                    .and_then(Argument::as_expression)
-                    .is_some_and(is_component_initializer)
-        }
-        _ => false,
-    }
-}
-
-fn is_component_wrapper(callee: &Expression) -> bool {
-    match callee.without_parentheses() {
-        Expression::Identifier(id) => matches!(id.name.as_str(), "memo" | "forwardRef"),
-        Expression::StaticMemberExpression(member) => {
-            matches!(&member.object, Expression::Identifier(object) if object.name == "React")
-                && matches!(member.property.name.as_str(), "memo" | "forwardRef")
-        }
-        _ => false,
-    }
-}
-
-/// `/^[A-Z]/` or `/^use[A-Z0-9]/`.
-fn is_component_or_hook_name(name: &str) -> bool {
-    let bytes = name.as_bytes();
-    bytes.first().is_some_and(u8::is_ascii_uppercase)
-        || (bytes.starts_with(b"use")
-            && bytes.get(3).is_some_and(|b| b.is_ascii_uppercase() || b.is_ascii_digit()))
 }
 
 /// Shared `run_once` body for the React Compiler family of rules: report the

@@ -44,6 +44,60 @@ struct ReassignmentResult {
     returned_contexts: FxHashSet<IdentifierId>,
     returned_context_loads: FxHashSet<IdentifierId>,
     returned_callables: ReturnedCallables,
+    /// Bindings of an enclosing function captured, directly or through local
+    /// values, by an async callable that escaped this function's model. The
+    /// enclosing function checks them against every value they may hold.
+    escaped_contexts: FxHashSet<IdentifierId>,
+}
+
+/// Every value each context binding may hold anywhere in the function,
+/// ignoring order: the binding's own identity, every stored value, and every
+/// value reaching a block exit.
+fn all_context_values(
+    func: &HirFunction,
+    initial_context_values: &ContextValues,
+    context_values_by_block: &FxHashMap<BlockId, ContextValues>,
+    hoisted_function_values: &HoistedFunctionValues,
+) -> ContextValues {
+    let mut values = initial_context_values.clone();
+    for block_values in context_values_by_block.values() {
+        merge_context_values(&mut values, block_values);
+    }
+    for (_, block) in &func.body.blocks {
+        for &instruction_id in &block.instructions {
+            let instr = &func.instructions[instruction_id.index()];
+            if let InstructionValue::StoreContext { lvalue, value, .. } = &instr.value {
+                values.entry(lvalue.place.identifier).or_default().insert(value.identifier);
+            }
+        }
+    }
+    for (&binding, &value) in hoisted_function_values {
+        values.entry(binding).or_default().insert(value);
+    }
+    values
+}
+
+/// Every binding and value `identifier` may observe through its captures and
+/// the values those captures may hold, including `identifier` itself.
+fn reachable_values(
+    identifier: IdentifierId,
+    all_values: &ContextValues,
+    captured_contexts: &CapturedContexts,
+) -> FxHashSet<IdentifierId> {
+    let mut visited = FxHashSet::default();
+    let mut pending = vec![identifier];
+    while let Some(current) = pending.pop() {
+        if !visited.insert(current) {
+            continue;
+        }
+        if let Some(values) = all_values.get(&current) {
+            pending.extend(values.iter().copied());
+        }
+        if let Some(contexts) = captured_contexts.get(&current) {
+            pending.extend(contexts.iter().copied());
+        }
+    }
+    visited
 }
 
 /// Validates that local variables cannot be reassigned after render.
@@ -941,6 +995,7 @@ fn get_context_reassignment(
         &hoisted_function_values,
         &function_returns,
         env,
+        is_function_expression,
     );
     async_function_values = async_callables.identifiers;
     let async_invocations = async_callables.invocations;
@@ -1033,10 +1088,78 @@ fn get_context_reassignment(
     }
     propagate_captured_contexts(&mut returned_value_loads, &propagation_edges);
 
+    // An async callable that leaves the invocation model may run at any later
+    // point, so check it as of its definition: against every value its
+    // captures can hold. Bindings owned by an enclosing function are checked
+    // there, where their stores are visible.
+    let mut escaped_contexts: Vec<IdentifierId> = Vec::new();
+    for (&callable, bindings) in &async_callables.escaped {
+        if captured_contexts.contains_key(&callable) {
+            escaped_contexts.push(callable);
+        } else {
+            escaped_contexts.extend(bindings.iter().copied());
+        }
+    }
+    // Bindings a nested function let escape may hold any value; they matter
+    // only when they can reach an async function.
+    let mut forwarded_contexts: Vec<IdentifierId> = nested_reassignments
+        .values()
+        .flat_map(|(nested, _)| nested.escaped_contexts.iter().copied())
+        .chain(
+            func.context
+                .iter()
+                .map(|place| place.identifier)
+                .filter(|id| async_callables.escaped_identities.contains(id)),
+        )
+        .collect();
+    let mut external_escaped_contexts = FxHashSet::default();
+    if !escaped_contexts.is_empty() || !forwarded_contexts.is_empty() {
+        let all_values = all_context_values(
+            func,
+            &initial_context_values,
+            &context_values_by_block,
+            &hoisted_function_values,
+        );
+        let external: FxHashSet<IdentifierId> =
+            func.context.iter().map(|place| place.identifier).collect();
+        forwarded_contexts.sort_unstable();
+        forwarded_contexts.dedup();
+        for identifier in forwarded_contexts {
+            let reachable = reachable_values(identifier, &all_values, &captured_contexts);
+            if reachable.iter().any(|id| async_function_values.contains(id)) {
+                escaped_contexts.push(identifier);
+            } else if external.contains(&identifier) {
+                external_escaped_contexts.insert(identifier);
+            }
+        }
+        escaped_contexts.sort_unstable();
+        escaped_contexts.dedup();
+        for identifier in escaped_contexts {
+            if let Some(reassignment_place) = find_reassignment_for_operand(
+                identifier,
+                &all_values,
+                &context_values_by_block,
+                &reassigning_functions,
+                &captured_contexts,
+                &correlated_values,
+            ) {
+                record_async_reassignment(reassignment_place, identifiers, diagnostics);
+                return ReassignmentResult::default();
+            }
+            external_escaped_contexts.extend(
+                reachable_values(identifier, &all_values, &captured_contexts)
+                    .into_iter()
+                    .filter(|id| external.contains(id)),
+            );
+        }
+    }
+
     // With the complete fixed-point map, validate uses in source CFG order so
     // diagnostics retain their existing ordering.
+    let returned_callables = async_callables.returned;
     let mut result = ReassignmentResult {
-        returned_callables: async_callables.returned,
+        returned_callables,
+        escaped_contexts: external_escaped_contexts,
         ..ReassignmentResult::default()
     };
     for (&block_id, block) in &func.body.blocks {

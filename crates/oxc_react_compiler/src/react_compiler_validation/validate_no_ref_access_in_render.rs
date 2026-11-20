@@ -486,6 +486,63 @@ fn nullish_lazy_ref_init_ref_id(
     if stores_same_ref { Some(*ref_id) } else { None }
 }
 
+/// A lazy ref initialization window opened by a guard on `ref_id`. A store
+/// before `fallthrough` is the ref's initialization when it lies in the same
+/// guard arm as the first initializing store and no store in `initialized`
+/// can reach it. Exclusive branches inside one arm each initialize once; a
+/// store in the other arm, or a second store on the same path, is a write.
+struct SafeWindow {
+    fallthrough: BlockId,
+    ref_id: RefId,
+    arms: [BlockId; 2],
+    initializing_arms: Option<[bool; 2]>,
+    initialized: Vec<BlockId>,
+}
+
+impl SafeWindow {
+    fn new(fallthrough: BlockId, ref_id: RefId, arms: [BlockId; 2]) -> Self {
+        Self { fallthrough, ref_id, arms, initializing_arms: None, initialized: Vec::new() }
+    }
+
+    /// Records `block` as an initializing store if it is one.
+    fn try_initialize(&mut self, func: &HirFunction, block: BlockId) -> bool {
+        let arms = self.arms.map(|arm| reaches_within(func, arm, block, self.fallthrough));
+        if self.initializing_arms.is_some_and(|initializing| initializing != arms)
+            || self
+                .initialized
+                .iter()
+                .any(|&initialized| reaches_within(func, initialized, block, self.fallthrough))
+        {
+            return false;
+        }
+        self.initializing_arms = Some(arms);
+        self.initialized.push(block);
+        true
+    }
+}
+
+/// Whether control can flow from the end of `from` (or stay in it) to `to`
+/// without passing through `stop`.
+fn reaches_within(func: &HirFunction, from: BlockId, to: BlockId, stop: BlockId) -> bool {
+    if from == to {
+        return true;
+    }
+    let mut visited = FxHashSet::default();
+    let mut pending = vec![from];
+    while let Some(block_id) = pending.pop() {
+        let Some(block) = func.body.blocks.get(&block_id) else { continue };
+        for successor in each_terminal_successor(&block.terminal) {
+            if successor == to {
+                return true;
+            }
+            if successor != stop && visited.insert(successor) {
+                pending.push(successor);
+            }
+        }
+    }
+    false
+}
+
 /// Whether `identifier` holds the value of a `current` property load, following
 /// local copies and type assertions back to the load.
 fn loads_ref_current(func: &HirFunction, identifier: IdentifierId) -> bool {
@@ -693,10 +750,14 @@ fn validate_no_ref_access_in_render_impl(
         }
         ref_env.reset_changed();
         return_values.clear();
-        let mut safe_blocks: Vec<(BlockId, RefId)> = Vec::new();
+        // Each guard opens a window up to its fallthrough block. A store to the
+        // guarded ref is the initialization when no earlier initializing store
+        // in the window can reach it, so mutually exclusive branches each
+        // initialize once while sequential writes are still rejected.
+        let mut safe_blocks: Vec<SafeWindow> = Vec::new();
 
         for (_, block) in &func.body.blocks {
-            safe_blocks.retain(|(block_id, _)| *block_id != block.id);
+            safe_blocks.retain(|window| window.fallthrough != block.id);
 
             // Process phis
             for phi in &block.phis {
@@ -1070,9 +1131,10 @@ fn validate_no_ref_access_in_render_impl(
                         let mut found_safe = false;
                         if matches!(&instr.value, InstructionValue::PropertyStore { .. })
                             && let Some(RefAccessType::Ref { ref_id }) = &target
-                            && let Some(pos) = safe_blocks.iter().position(|(_, r)| r == ref_id)
+                            && let Some(window) =
+                                safe_blocks.iter_mut().find(|window| window.ref_id == *ref_id)
+                            && window.try_initialize(func, block.id)
                         {
-                            safe_blocks.remove(pos);
                             found_safe = true;
                         }
                         if !found_safe {
@@ -1225,11 +1287,11 @@ fn validate_no_ref_access_in_render_impl(
             }
 
             // Check if terminal is an `if` — push safe block for guard
-            if let Terminal::If { test, fallthrough, .. } = &block.terminal
+            if let Terminal::If { test, consequent, alternate, fallthrough, .. } = &block.terminal
                 && let Some(RefAccessType::Guard { ref_id }) = ref_env.get(test.identifier)
-                && !safe_blocks.iter().any(|(_, r)| r == ref_id)
+                && !safe_blocks.iter().any(|window| window.ref_id == *ref_id)
             {
-                safe_blocks.push((*fallthrough, *ref_id));
+                safe_blocks.push(SafeWindow::new(*fallthrough, *ref_id, [*consequent, *alternate]));
             }
 
             // `ref.current ?? (ref.current = init)` / `ref.current ??= init`:
@@ -1246,11 +1308,11 @@ fn validate_no_ref_access_in_render_impl(
                 &block.terminal,
                 ref_env,
             );
-            if let (Some(ref_id), Terminal::Branch { fallthrough, .. }) =
+            if let (Some(ref_id), Terminal::Branch { consequent, alternate, fallthrough, .. }) =
                 (lazy_ref_init, &block.terminal)
-                && !safe_blocks.iter().any(|(_, r)| r == &ref_id)
+                && !safe_blocks.iter().any(|window| window.ref_id == ref_id)
             {
-                safe_blocks.push((*fallthrough, ref_id));
+                safe_blocks.push(SafeWindow::new(*fallthrough, ref_id, [*consequent, *alternate]));
             }
 
             // Process terminal operands

@@ -1,7 +1,7 @@
 import { useState } from "react";
 
-// No top-level component or hook, so the file is skipped like in
-// `eslint-plugin-react-hooks`.
+// No top-level component or hook. The compiler still finds the nested
+// component, so the file is linted.
 export function mountProbe(): number | null {
   let result: number | null = null;
   function Probe() {

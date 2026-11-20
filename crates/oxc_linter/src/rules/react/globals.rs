@@ -82,8 +82,11 @@ function Component() {
   return <div />;
 }
 ",
-        // A `memo` wrapper bound to a non-component name does not open the
-        // React Compiler gate, matching upstream.
+    ];
+
+    let fail = vec![
+        // Compiler discovery treats a `memo` callback as a component even when
+        // it is bound to a non-component name.
         "
 let someGlobal = false;
 export const helper = memo(() => {
@@ -91,9 +94,6 @@ export const helper = memo(() => {
   return <div />;
 });
 ",
-    ];
-
-    let fail = vec![
         // Derived from crates/oxc_react_compiler/fixtures cases.
         "
 let someGlobal = false;

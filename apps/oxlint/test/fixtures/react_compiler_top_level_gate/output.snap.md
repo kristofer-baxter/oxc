@@ -16,6 +16,18 @@
   note: React Compiler skipped optimizing this component or hook. Additional guidance: https://react.dev/reference/eslint-plugin-react-hooks/lints/globals
 
   x react(globals): Cannot reassign variables declared outside of the component/hook
+   ,-[files/memo-only.jsx:8:3]
+ 7 | export const helper = React.memo(function (props) {
+ 8 |   someGlobal = true;
+   :   ^^^^^|^^^^
+   :        `-- `someGlobal` cannot be reassigned
+ 9 |   return <div>{props.text}</div>;
+   `----
+  help: Variable `someGlobal` is declared outside of the component/hook. Reassigning this value during render is a side effect which can cause unpredictable behavior. If this variable is used in
+        rendering, use useState instead. Otherwise, update it in an effect
+  note: React Compiler skipped optimizing this component or hook. Additional guidance: https://react.dev/reference/eslint-plugin-react-hooks/lints/globals
+
+  x react(globals): Cannot reassign variables declared outside of the component/hook
    ,-[files/module-level-probe.test.tsx:7:3]
  6 | export function Probe() {
  7 |   result = useState(1)[0];
@@ -27,7 +39,19 @@
         rendering, use useState instead. Otherwise, update it in an effect
   note: React Compiler skipped optimizing this component or hook. Additional guidance: https://react.dev/reference/eslint-plugin-react-hooks/lints/globals
 
-Found 0 warnings and 2 errors.
+  x react(globals): Cannot reassign variables declared outside of the component/hook
+   ,-[files/nested-probe.test.tsx:8:5]
+ 7 |   function Probe() {
+ 8 |     result = useState(1)[0];
+   :     ^^^|^^
+   :        `-- `result` cannot be reassigned
+ 9 |     return null;
+   `----
+  help: Variable `result` is declared outside of the component/hook. Reassigning this value during render is a side effect which can cause unpredictable behavior. If this variable is used in
+        rendering, use useState instead. Otherwise, update it in an effect
+  note: React Compiler skipped optimizing this component or hook. Additional guidance: https://react.dev/reference/eslint-plugin-react-hooks/lints/globals
+
+Found 0 warnings and 4 errors.
 Finished in Xms on 4 files with 2 rules using X threads.
 ```
 
