@@ -242,6 +242,13 @@ pub struct Codegen<'a> {
 
     /// Where nodes were printed, when asked for.
     printed_nodes: Option<Vec<PrintedNode>>,
+    /// Whether a comment that the options leave out keeps its lines, blank:
+    /// see [`Codegen::with_blank_unprinted_comments`].
+    pub(crate) blank_unprinted_comments: bool,
+    /// Where a blank block comment that code follows on its line ends: what is printed
+    /// next is printed after it as after the `/` that the comment ends with when it is
+    /// printed.
+    pub(crate) blank_comment_end: Option<usize>,
     /// The references to record, as a set of bits by reference id.
     printed_references: Vec<u64>,
     /// The module declarations being printed, outermost first, and where the keyword of
@@ -322,6 +329,8 @@ impl<'a> Codegen<'a> {
             #[cfg(feature = "sourcemap")]
             sourcemap_builder: None,
             printed_nodes: None,
+            blank_unprinted_comments: false,
+            blank_comment_end: None,
             printed_references: Vec::new(),
             printed_declarations: Vec::new(),
             printed_flags: (0, 0),
@@ -336,6 +345,19 @@ impl<'a> Codegen<'a> {
     pub fn with_printed_nodes(mut self, references: Vec<u64>) -> Self {
         self.printed_nodes = Some(Vec::new());
         self.printed_references = references;
+        self
+    }
+
+    /// Prints each comment that the options leave out as its line breaks alone, and as
+    /// spaces of its width where code follows it on its line, so that
+    /// the code is on the lines and at the columns where it is when every comment is
+    /// printed, with none of what those comments say. A comment that the options print is
+    /// printed as it is. A pure or no-side-effects annotation is printed or left out as
+    /// the options say, and so is a legal comment that they print elsewhere than in place.
+    /// Off, the printed code is unchanged.
+    #[must_use]
+    pub fn with_blank_unprinted_comments(mut self) -> Self {
+        self.blank_unprinted_comments = true;
         self
     }
 
@@ -1629,5 +1651,239 @@ mod printed_nodes_tests {
                 "export { q } from 'c';"
             ]
         );
+    }
+}
+
+/// What [`Codegen::with_blank_unprinted_comments`] prints.
+#[cfg(test)]
+mod blank_comments_tests {
+    use oxc_allocator::Allocator;
+    use oxc_parser::Parser;
+    use oxc_span::SourceType;
+
+    use super::{Codegen, CodegenOptions, CommentOptions, LegalComment};
+
+    fn print(source: &str, comments: &CommentOptions, blank: bool) -> String {
+        let allocator = Allocator::default();
+        let parsed = Parser::new(&allocator, source, SourceType::mjs()).parse();
+        assert!(parsed.diagnostics.is_empty(), "{source}: {:?}", parsed.diagnostics);
+        let codegen = Codegen::new().with_options(CodegenOptions {
+            comments: comments.clone(),
+            ..CodegenOptions::default()
+        });
+        let codegen = if blank { codegen.with_blank_unprinted_comments() } else { codegen };
+        codegen.build(&parsed.program).code
+    }
+
+    const SOURCES: [&str; 8] = [
+        "// plain line\nimport { a } from 'a';\n/* plain block */\na();\n",
+        "/* plain\n   plain over\n   plain lines */\nconst x = 1;\n/*! legal */\n/** documented */\nexport function f() {}\n",
+        "function f() {\n  // plain inside\n  return /* @__PURE__ */ g();\n}\n// plain last\n",
+        "const o = {\n  // plain member\n  a: 1,\n  /* plain\n     plain member */\n  b: 2,\n};\n",
+        "class C {\n  // plain member\n  m() {}\n  /** documented member */\n  n() {}\n}\n",
+        "const load = () => import(/* webpackChunkName: \"x\" */ 'x');\n// plain\nload();\n",
+        "switch (x) {\n  // plain case\n  case 1:\n    /* plain */ break;\n}\n",
+        "a();\n//# sourceMappingURL=data:application/json;base64,plain\n//# sourceURL=plain.js\n",
+    ];
+
+    /// With every comment printed, the code has the lines of the module. Blank, it has the
+    /// same lines: those without a plain comment are the same text, and no plain comment
+    /// is left in the others.
+    #[test]
+    fn a_blank_comment_keeps_its_lines_and_nothing_else() {
+        let kept = CommentOptions { normal: false, ..CommentOptions::default() };
+        for source in SOURCES {
+            let every = print(source, &CommentOptions::default(), false);
+            let blank = print(source, &kept, true);
+            assert!(!blank.contains("plain"), "{source}:\n{blank}");
+            let (every, blank): (Vec<&str>, Vec<&str>) =
+                (every.split('\n').collect(), blank.split('\n').collect());
+            assert_eq!(every.len(), blank.len(), "{source}:\n{every:?}\n{blank:?}");
+            for (every, blank) in every.iter().zip(&blank) {
+                if !every.contains("plain") {
+                    assert_eq!(every, blank, "{source}");
+                }
+            }
+            let allocator = Allocator::default();
+            let text = blank.join("\n");
+            let parsed = Parser::new(&allocator, &text, SourceType::mjs()).parse();
+            assert!(parsed.diagnostics.is_empty(), "{text}: {:?}", parsed.diagnostics);
+        }
+    }
+
+    /// A kind of comment that the options leave out is blank whichever kind it is, and one
+    /// that they print is printed.
+    #[test]
+    fn every_kind_that_the_options_leave_out_is_blank() {
+        let source =
+            "/*! legal */\n/** documented */\n// plain\nexport const x = /* @__PURE__ */ f();\n";
+        let none = CommentOptions {
+            normal: false,
+            legal: LegalComment::None,
+            jsdoc: false,
+            annotation: true,
+        };
+        let blank = print(source, &none, true);
+        for gone in ["legal", "documented", "plain"] {
+            assert!(!blank.contains(gone), "{blank}");
+        }
+        assert!(blank.contains("@__PURE__"), "{blank}");
+        assert_eq!(
+            blank.matches('\n').count(),
+            print(source, &CommentOptions::default(), false).matches('\n').count()
+        );
+    }
+
+    /// Code that follows a blank comment on its line is at the column where it is when
+    /// the comment is printed.
+    #[test]
+    fn code_after_a_blank_comment_keeps_its_column() {
+        let kept = CommentOptions { normal: false, ..CommentOptions::default() };
+        for source in [
+            "/* plain */ globalThis.out = new Error('marker');\n",
+            "/* plain \u{1f600} */ globalThis.out = new Error('marker');\n",
+            "function f() {\n  /* plain\n     plain */ return new Error('marker');\n}\n",
+            "a(/* plain */ new Error('marker'));\n",
+            "a(/* plain </script> </SCRIPT> */ new Error('marker'));\n",
+        ] {
+            let every = print(source, &CommentOptions::default(), false);
+            let blank = print(source, &kept, true);
+            let at = |text: &str| {
+                let line = text.lines().find(|line| line.contains("new Error")).expect("the line");
+                let before = &line[..line.find("new Error").expect("the call")];
+                (text.lines().position(|other| other == line), before.encode_utf16().count())
+            };
+            assert_eq!(at(&every).1, at(&blank).1, "{source}:\n{every}\n{blank}");
+            assert_eq!(every.matches('\n').count(), blank.matches('\n').count(), "{source}");
+            assert!(!blank.contains("plain"), "{blank}");
+        }
+    }
+
+    /// A regular expression that follows a blank comment on its line is where it is when
+    /// the comment is printed, minified or not: a printed comment ends with a `/`, which a
+    /// regular expression after it is kept apart from.
+    #[test]
+    fn a_regular_expression_after_a_blank_comment_keeps_its_column() {
+        let kept = CommentOptions { normal: false, jsdoc: false, ..CommentOptions::default() };
+        for source in [
+            "/* plain */ /marker/;\n",
+            "/** plain */ /marker/.test(a);\n",
+            "a(/* plain */ /marker/);\n",
+            "x = b(c, /* plain */ /marker/g.exec(d)[0]);\n",
+            "x = b / /* plain */ /marker/;\n",
+            "if (a) { /* plain\n   plain */ /marker/.test(b); }\n",
+            "x = [/* plain */ /marker/, /* plain */ 1];\n",
+        ] {
+            for minify in [false, true] {
+                let printed = |comments: &CommentOptions, blank: bool| {
+                    let allocator = Allocator::default();
+                    let parsed = Parser::new(&allocator, source, SourceType::mjs()).parse();
+                    assert!(parsed.diagnostics.is_empty(), "{source}: {:?}", parsed.diagnostics);
+                    let codegen = Codegen::new().with_options(CodegenOptions {
+                        comments: comments.clone(),
+                        minify,
+                        ..CodegenOptions::default()
+                    });
+                    let codegen =
+                        if blank { codegen.with_blank_unprinted_comments() } else { codegen };
+                    codegen.build(&parsed.program).code
+                };
+                let every = printed(&CommentOptions::default(), false);
+                let blank = printed(&kept, true);
+                let at = |text: &str| {
+                    let (line, text) = text
+                        .lines()
+                        .enumerate()
+                        .find(|(_, line)| line.contains("/marker/"))
+                        .expect("the line");
+                    (
+                        line,
+                        text[..text.find("/marker/").expect("the expression")]
+                            .encode_utf16()
+                            .count(),
+                    )
+                };
+                assert_eq!(at(&every), at(&blank), "{source} (minify {minify}):\n{every}\n{blank}");
+                assert!(!blank.contains("plain"), "{blank}");
+                let allocator = Allocator::default();
+                let parsed = Parser::new(&allocator, &blank, SourceType::mjs()).parse();
+                assert!(parsed.diagnostics.is_empty(), "{blank}: {:?}", parsed.diagnostics);
+            }
+        }
+    }
+
+    /// With every kind left out the lines are kept all the same, and a legal comment that
+    /// the options print at the end of the file is printed there.
+    #[test]
+    #[expect(clippy::disallowed_methods, reason = "test-only string comparison")]
+    fn blank_comments_keep_their_lines_whatever_the_options_print() {
+        let source = "// plain\nfoo();\n/* plain */\nbar();\n";
+        let blank = print(source, &CommentOptions::disabled(), true);
+        assert_eq!(blank, "\nfoo();\n\nbar();\n");
+        let eof =
+            CommentOptions { normal: false, legal: LegalComment::Eof, ..CommentOptions::default() };
+        let source = "/*! @license held */\nconst x = 1;\n// plain\nx;\n";
+        let blank = print(source, &eof, true);
+        assert!(blank.contains("/*! @license held */"), "{blank}");
+        assert!(!blank.contains("plain"), "{blank}");
+        assert_eq!(
+            blank,
+            print(source, &eof, false).replace("const x = 1;\nx;", "const x = 1;\n\nx;")
+        );
+    }
+
+    /// An `import()` is laid out around its comments, and around blank ones as around
+    /// printed ones whichever kinds the options print: the statement after it is on the
+    /// line where it is when every comment is printed, and the specifier at its column.
+    #[test]
+    fn an_import_is_laid_out_around_its_blank_comments_whatever_the_options_print() {
+        let kinds = [
+            CommentOptions::disabled(),
+            CommentOptions { normal: false, ..CommentOptions::default() },
+            CommentOptions { annotation: false, ..CommentOptions::default() },
+            CommentOptions { normal: false, annotation: false, ..CommentOptions::default() },
+        ];
+        for source in [
+            "const p = import(/* plain */ 'x');\nthrow new Error('marker');\n",
+            "const p = import(/* webpackChunkName: \"plain\" */ 'x');\nthrow new Error('marker');\n",
+            "const p = import('x' /* plain */);\nthrow new Error('marker');\n",
+            "const p = import(/* plain */ 'x' /* plain */);\nthrow new Error('marker');\n",
+            "const p = import(/* plain */ 'x', /* plain */ { with: {} });\nthrow new Error('marker');\n",
+            "const p = import(\n  // plain\n  'x'\n);\nthrow new Error('marker');\n",
+            "const p = import(/* plain\n  plain */ 'x');\nthrow new Error('marker');\n",
+        ] {
+            let every = print(source, &CommentOptions::default(), false);
+            let at = |text: &str, what: &str| {
+                let line = text.lines().position(|line| line.contains(what)).expect("the line");
+                let text = text.lines().nth(line).expect("the line");
+                (line, text[..text.find(what).expect("the text")].encode_utf16().count())
+            };
+            for kept in &kinds {
+                let blank = print(source, kept, true);
+                assert_eq!(
+                    at(&every, "new Error"),
+                    at(&blank, "new Error"),
+                    "{source}:\n{every}\n{blank}"
+                );
+                assert_eq!(at(&every, "\"x\""), at(&blank, "\"x\""), "{source}:\n{every}\n{blank}");
+                assert_eq!(every.matches('\n').count(), blank.matches('\n').count(), "{source}");
+                let allocator = Allocator::default();
+                let parsed = Parser::new(&allocator, &blank, SourceType::mjs()).parse();
+                assert!(parsed.diagnostics.is_empty(), "{blank}: {:?}", parsed.diagnostics);
+            }
+        }
+    }
+
+    /// Off, nothing changes: the options alone decide.
+    #[test]
+    fn without_it_a_comment_that_is_left_out_leaves_no_line() {
+        let kept = CommentOptions { normal: false, ..CommentOptions::default() };
+        for source in SOURCES {
+            let blank = print(source, &kept, true);
+            let plain = print(source, &kept, false);
+            assert!(!plain.contains("plain"), "{plain}");
+            assert!(plain.len() <= blank.len(), "{source}");
+        }
+        assert_eq!(print(SOURCES[0], &kept, false), "import { a } from \"a\";\na();\n");
     }
 }

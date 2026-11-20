@@ -1551,7 +1551,9 @@ impl Gen for RegExpLiteral<'_> {
         p.add_source_mapping(self.span);
         // Avoid forming a single-line comment or "</script" sequence
         let last = p.last_byte();
+        // A blank comment is a `/` at its end as the printed one is.
         if last == Some(b'/')
+            || p.blank_comment_end == Some(p.code().len())
             || (last == Some(b'<')
                 && self
                     .regex
@@ -2419,10 +2421,12 @@ impl GenExpr for ImportExpression<'_> {
     fn gen_expr(&self, p: &mut Codegen, precedence: Precedence, ctx: Context) {
         let wrap = precedence >= Precedence::New || ctx.intersects(Context::FORBID_CALL);
 
-        let has_comment_before_right_paren = p.options.print_annotation_comment()
-            && self.span.end > 0
-            && p.has_comment(self.span.end - 1);
-        let has_comment = p.options.print_annotation_comment()
+        // Blank comments keep the layout that printed ones have, whatever the options
+        // print.
+        let lays_out = p.options.print_annotation_comment() || p.blank_unprinted_comments;
+        let has_comment_before_right_paren =
+            lays_out && self.span.end > 0 && p.has_comment(self.span.end - 1);
+        let has_comment = lays_out
             && (has_comment_before_right_paren
                 || p.has_comment(self.source.span().start)
                 || self

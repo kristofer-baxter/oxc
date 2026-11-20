@@ -6,7 +6,7 @@ use oxc_ast_visit::{VisitJsMut, walk_js_mut};
 use oxc_data_structures::stack::NonEmptyStack;
 use oxc_semantic::{ScopeFlags, ScopeId};
 use oxc_span::{SPAN, Span};
-use oxc_str::{Ident, static_ident};
+use oxc_str::Ident;
 use oxc_syntax::{
     constant_value::ConstantValue,
     number::NumberBase,
@@ -541,23 +541,23 @@ impl<'a> TypeScriptEnum {
         Expression::new_numeric_literal(SPAN, value, None, NumberBase::Decimal, ctx)
     }
 
-    fn get_initializer_expr(value: f64, ctx: &mut TraverseCtx<'a>) -> Expression<'a> {
-        let is_negative = value < 0.0;
-
-        // Infinity
-        let expr = if value.is_infinite() {
-            let infinity = static_ident!("Infinity");
-            let infinity_symbol_id = ctx.scoping().find_binding(ctx.current_scope_id(), infinity);
-            ctx.create_ident_expr(SPAN, infinity, infinity_symbol_id, ReferenceFlags::Read)
+    fn get_initializer_expr(value: f64, ctx: &TraverseCtx<'a>) -> Expression<'a> {
+        if !value.is_finite() {
+            // Neither the enum's scope nor an inlined member's use site owns the name of
+            // the folded value. Emit arithmetic, not a reference to `Infinity` or `NaN`.
+            let numerator = if value.is_nan() { 0.0 } else { value.signum() };
+            Expression::new_binary_expression(
+                SPAN,
+                Self::get_number_literal_expression(numerator, ctx),
+                BinaryOperator::Division,
+                Expression::new_number_0(SPAN, ctx),
+                ctx,
+            )
+        } else if value < 0.0 {
+            let magnitude = Self::get_number_literal_expression(-value, ctx);
+            Expression::new_unary_expression(SPAN, UnaryOperator::UnaryNegation, magnitude, ctx)
         } else {
-            let value = if is_negative { -value } else { value };
             Self::get_number_literal_expression(value, ctx)
-        };
-
-        if is_negative {
-            Expression::new_unary_expression(SPAN, UnaryOperator::UnaryNegation, expr, ctx)
-        } else {
-            expr
         }
     }
 

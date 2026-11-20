@@ -72,7 +72,8 @@ impl AnnotationKind {
 
 impl Codegen<'_> {
     pub(crate) fn build_comments(&mut self, comments: &[Comment]) {
-        if self.options.comments == CommentOptions::disabled() {
+        // Blank comments keep their lines whatever the options print.
+        if !self.blank_unprinted_comments && self.options.comments == CommentOptions::disabled() {
             return;
         }
         // Each retained comment can create at most one map entry. Reserving
@@ -94,10 +95,8 @@ impl Codegen<'_> {
 
             let mut add = false;
             if comment.is_leading() {
-                add = (comment.is_legal() && self.options.print_legal_comment())
-                    || (comment.is_jsdoc() && self.options.print_jsdoc_comment())
-                    || (comment.is_annotation() && self.options.print_annotation_comment())
-                    || (comment.is_normal() && self.options.print_normal_comment());
+                // A comment that the options leave out is kept to be printed blank.
+                add = self.options_print(comment) || self.blanks(comment);
             }
 
             if add {
@@ -113,6 +112,23 @@ impl Codegen<'_> {
     }
 
     #[inline]
+    /// Whether the options print `comment`, a leading comment.
+    fn options_print(&self, comment: &Comment) -> bool {
+        (comment.is_legal() && self.options.print_legal_comment())
+            || (comment.is_jsdoc() && self.options.print_jsdoc_comment())
+            || (comment.is_annotation() && self.options.print_annotation_comment())
+            || (comment.is_normal() && self.options.print_normal_comment())
+    }
+
+    /// Whether `comment`, a leading comment, is printed blank: one
+    /// that the options leave out. A legal comment that the options print elsewhere than
+    /// in place (at the end of the file, linked or external) is left to them.
+    fn blanks(&self, comment: &Comment) -> bool {
+        self.blank_unprinted_comments
+            && !self.options_print(comment)
+            && (!comment.is_legal() || self.options.comments.legal.is_none())
+    }
+
     pub(crate) fn has_comment(&self, start: u32) -> bool {
         !self.comments.is_empty() && self.comments.contains_key(&start)
     }
@@ -422,6 +438,49 @@ impl Codegen<'_> {
             return;
         };
         let comment_source = comment.span.source_text(source_text);
+        // A comment that the options leave out keeps its line breaks, and where code
+        // follows it on its line, its width in spaces, so that the code after it is on the
+        // line and at the column where it is when every comment is printed.
+        // Columns are counted in UTF-16 code units.
+        if self.blanks(comment) {
+            let pad = |codegen: &mut Self, text: &str| {
+                if !comment.followed_by_newline() {
+                    // As it is printed: `</script` is printed `<\/script`.
+                    let escaped = text
+                        .as_bytes()
+                        .windows(8)
+                        .filter(|window| crate::str::is_script_close_tag(window))
+                        .count();
+                    for _ in 0..text.encode_utf16().count() + escaped {
+                        codegen.print_str(" ");
+                    }
+                }
+            };
+            match comment.kind {
+                CommentKind::Line | CommentKind::HtmlOpen | CommentKind::HtmlClose => {}
+                CommentKind::SingleLineBlock => pad(self, comment_source),
+                CommentKind::MultiLineBlock => {
+                    for line in LineTerminatorSplitter::new(comment_source) {
+                        if line.ends_with("*/") {
+                            if !line.starts_with("/*") && !comment.followed_by_newline() {
+                                self.print_indent();
+                            }
+                            pad(self, line.trim_start());
+                        } else {
+                            self.print_hard_newline();
+                        }
+                    }
+                }
+            }
+            if !matches!(
+                comment.kind,
+                CommentKind::Line | CommentKind::HtmlOpen | CommentKind::HtmlClose
+            ) && !comment.followed_by_newline()
+            {
+                self.blank_comment_end = Some(self.code.len());
+            }
+            return;
+        }
         match comment.kind {
             CommentKind::Line | CommentKind::HtmlOpen | CommentKind::SingleLineBlock => {
                 self.print_str_escaping_script_close_tag(comment_source);
